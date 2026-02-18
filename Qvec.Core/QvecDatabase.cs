@@ -349,26 +349,33 @@ namespace QvecSharp
         {
             int currentElement = _header.EntryPoint;
             float currentScore = CalculateScore(query, currentElement);
-
-            for (int level = _header.EntryPointLevel; level >= 0; level--)
+            int[] neighbors = ArrayPool<int>.Shared.Rent(_header.MaxNeighbors);
+            try
             {
-                bool changed = true;
-                while (changed)
+                for (int level = _header.EntryPointLevel; level >= 0; level--)
                 {
-                    changed = false;
-                    var neighbors = GetNeighborsAtLevel(currentElement, level);
-                    foreach (int neighbor in neighbors)
+                    bool changed = true;
+                    while (changed)
                     {
-                        if (neighbor == -1) break;
-                        float score = CalculateScore(query, neighbor);
-                        if (score > currentScore)
+                        changed = false;
+                        GetNeighborsAtLevel(currentElement, level, neighbors);
+                        for (int j = 0; j < _header.MaxNeighbors; j++)
                         {
-                            currentScore = score;
-                            currentElement = neighbor;
-                            changed = true;
+                            if (neighbors[j] == -1) break;
+                            float score = CalculateScore(query, neighbors[j]);
+                            if (score > currentScore)
+                            {
+                                currentScore = score;
+                                currentElement = neighbors[j];
+                                changed = true;
+                            }
                         }
                     }
                 }
+            }
+            finally
+            {
+                ArrayPool<int>.Shared.Return(neighbors);
             }
             return currentElement;
         }
@@ -404,23 +411,30 @@ namespace QvecSharp
         {
             int current = entryPoint;
             float currentScore = CalculateScore(query, current);
-
-            bool changed = true;
-            while (changed)
+            int[] neighbors = ArrayPool<int>.Shared.Rent(_header.MaxNeighbors);
+            try
             {
-                changed = false;
-                var neighbors = GetNeighborsAtLevel(current, level);
-                foreach (int neighbor in neighbors)
+                bool changed = true;
+                while (changed)
                 {
-                    if (neighbor == -1) break;
-                    float score = CalculateScore(query, neighbor);
-                    if (score > currentScore)
+                    changed = false;
+                    GetNeighborsAtLevel(current, level, neighbors);
+                    for (int j = 0; j < _header.MaxNeighbors; j++)
                     {
-                        currentScore = score;
-                        current = neighbor;
-                        changed = true;
+                        if (neighbors[j] == -1) break;
+                        float score = CalculateScore(query, neighbors[j]);
+                        if (score > currentScore)
+                        {
+                            currentScore = score;
+                            current = neighbors[j];
+                            changed = true;
+                        }
                     }
                 }
+            }
+            finally
+            {
+                ArrayPool<int>.Shared.Return(neighbors);
             }
             return current;
         }
@@ -437,33 +451,42 @@ namespace QvecSharp
             results.Enqueue(entryPoint, entryScore);
             float worstScore = entryScore;
 
-            while (candidates.TryDequeue(out int candidateId, out float negScore))
+            int[] neighborBuffer = ArrayPool<int>.Shared.Rent(_header.MaxNeighbors);
+            try
             {
-                float candidateScore = -negScore;
-                if (candidateScore < worstScore && results.Count >= ef)
-                    break;
-
-                var neighbors = GetNeighborsAtLevel(candidateId, level);
-                foreach (int neighbor in neighbors)
+                while (candidates.TryDequeue(out int candidateId, out float negScore))
                 {
-                    if (neighbor < 0) break;
-                    if (!visited.Add(neighbor)) continue;
+                    float candidateScore = -negScore;
+                    if (candidateScore < worstScore && results.Count >= ef)
+                        break;
 
-                    float score = CalculateScore(query, neighbor);
-
-                    if (results.Count < ef || score > worstScore)
+                    GetNeighborsAtLevel(candidateId, level, neighborBuffer);
+                    for (int j = 0; j < _header.MaxNeighbors; j++)
                     {
-                        candidates.Enqueue(neighbor, -score);
-                        results.Enqueue(neighbor, score);
+                        int neighbor = neighborBuffer[j];
+                        if (neighbor < 0) break;
+                        if (!visited.Add(neighbor)) continue;
 
-                        if (results.Count > ef)
+                        float score = CalculateScore(query, neighbor);
+
+                        if (results.Count < ef || score > worstScore)
                         {
-                            results.Dequeue();
-                        }
+                            candidates.Enqueue(neighbor, -score);
+                            results.Enqueue(neighbor, score);
 
-                        results.TryPeek(out _, out worstScore);
+                            if (results.Count > ef)
+                            {
+                                results.Dequeue();
+                            }
+
+                            results.TryPeek(out _, out worstScore);
+                        }
                     }
                 }
+            }
+            finally
+            {
+                ArrayPool<int>.Shared.Return(neighborBuffer);
             }
 
             var resultArray = new (int Id, float Score)[results.Count];
@@ -517,53 +540,55 @@ namespace QvecSharp
 
         private void AddNeighborConnection(int existingNode, int level, int newNode, float[] newVector)
         {
-            var neighbors = GetNeighborsAtLevel(existingNode, level);
-
-            // Hitta en ledig plats
-            for (int i = 0; i < neighbors.Length; i++)
+            int[] neighbors = ArrayPool<int>.Shared.Rent(_header.MaxNeighbors);
+            try
             {
-                if (neighbors[i] == -1)
+                GetNeighborsAtLevel(existingNode, level, neighbors);
+
+                for (int i = 0; i < _header.MaxNeighbors; i++)
                 {
-                    neighbors[i] = newNode;
+                    if (neighbors[i] == -1)
+                    {
+                        neighbors[i] = newNode;
+                        WriteNeighborsAtLevel(existingNode, level, neighbors);
+                        return;
+                    }
+                }
+
+                float[] existingVector = GetVector(existingNode);
+                float newScore = DotProduct(existingVector, newVector);
+
+                int worstIdx = 0;
+                float worstScore = CalculateScore(existingVector, neighbors[0]);
+                for (int i = 1; i < _header.MaxNeighbors; i++)
+                {
+                    float score = CalculateScore(existingVector, neighbors[i]);
+                    if (score < worstScore)
+                    {
+                        worstScore = score;
+                        worstIdx = i;
+                    }
+                }
+
+                if (newScore > worstScore)
+                {
+                    neighbors[worstIdx] = newNode;
                     WriteNeighborsAtLevel(existingNode, level, neighbors);
-                    return;
                 }
             }
-
-            // Alla platser fulla - ersätt svagaste grannen om den nya är bättre
-            float[] existingVector = GetVector(existingNode);
-            float newScore = DotProduct(existingVector, newVector);
-
-            int worstIdx = 0;
-            float worstScore = CalculateScore(existingVector, neighbors[0]);
-            for (int i = 1; i < neighbors.Length; i++)
+            finally
             {
-                float score = CalculateScore(existingVector, neighbors[i]);
-                if (score < worstScore)
-                {
-                    worstScore = score;
-                    worstIdx = i;
-                }
-            }
-
-            if (newScore > worstScore)
-            {
-                neighbors[worstIdx] = newNode;
-                WriteNeighborsAtLevel(existingNode, level, neighbors);
+                ArrayPool<int>.Shared.Return(neighbors);
             }
         }
 
-        private int[] GetNeighborsAtLevel(int nodeIndex, int level)
+        private void GetNeighborsAtLevel(int nodeIndex, int level, int[] buffer)
         {
-            // Layout på disk: [Node 0: L0, L1, L2...][Node 1: L0, L1, L2...]
-            // Varje lager har 'MaxNeighbors' platser.
             long position = (_graphSectionOffset - HeaderSize) +
                             (long)nodeIndex * _header.MaxLayers * _header.MaxNeighbors * sizeof(int) +
                             (long)level * _header.MaxNeighbors * sizeof(int);
 
-            int[] neighbors = new int[_header.MaxNeighbors];
-            _dataAccessor.ReadArray(position, neighbors, 0, _header.MaxNeighbors);
-            return neighbors;
+            _dataAccessor.ReadArray(position, buffer, 0, _header.MaxNeighbors);
         }
 
         private int RandomLayer()
@@ -628,29 +653,31 @@ namespace QvecSharp
             for (int l = 0; l < _header.MaxLayers; l++) stats[l] = 0;
 
             _lock.EnterReadLock();
+            int[] neighbors = ArrayPool<int>.Shared.Rent(_header.MaxNeighbors);
             try
             {
                 for (int i = 0; i < _header.CurrentCount; i++)
                 {
-                    // Vi kollar varje lager för varje nod
                     for (int level = 0; level < _header.MaxLayers; level++)
                     {
-                        var neighbors = GetNeighborsAtLevel(i, level);
-                        // Om första grannen inte är -1, existerar noden i detta lager
-                        if (neighbors.Length > 0 && neighbors[0] != -1)
+                        GetNeighborsAtLevel(i, level, neighbors);
+                        if (_header.MaxNeighbors > 0 && neighbors[0] != -1)
                         {
                             stats[level]++;
                         }
                         else if (level == 0 && _header.CurrentCount > 0)
                         {
-                            // Bottenlagret räknar vi alltid om det finns data
                             stats[0]++;
                             break;
                         }
                     }
                 }
             }
-            finally { _lock.ExitReadLock(); }
+            finally
+            {
+                ArrayPool<int>.Shared.Return(neighbors);
+                _lock.ExitReadLock();
+            }
 
             return stats;
         }
