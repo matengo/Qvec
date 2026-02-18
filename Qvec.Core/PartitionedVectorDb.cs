@@ -46,7 +46,7 @@ public class PartitionedVectorDb : IDisposable
         // Sök i alla partitioner samtidigt på olika trådar
         return _partitions
             .AsParallel() // PLINQ för att söka i alla filer parallellt
-            .SelectMany(p => p.SearchParallel(query, topK))
+            .SelectMany(p => p.Search(query, topK))
             .OrderByDescending(r => r.Score)
             .Take(topK)
             .ToList();

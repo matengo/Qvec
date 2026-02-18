@@ -26,7 +26,7 @@ searchCommand.SetAction(parseResult =>
     var vectorStr = parseResult.GetValue(queryOption);
     float[] query = vectorStr.Split(',').Select(float.Parse).ToArray();
     using var db = new VectorDatabase(path);
-    var results = db.SearchParallel(query, topK: 3);
+    var results = db.SearchSimpleParallel(query, topK: 3);
 
     foreach (var r in results)
         Console.WriteLine($"ID: {r.Id}, Score: {r.Score:F4}, Meta: {r.Metadata}");

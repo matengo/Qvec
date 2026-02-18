@@ -27,7 +27,7 @@ app.MapPost("/search", (SearchRequest request) =>
     if (request.Vector == null || request.Vector.Length == 0)
         return Results.BadRequest("Vektor saknas");
 
-    var topResults = db.SearchHNSW(request.Vector, request.TopK);
+    var topResults = db.Search(request.Vector, request.TopK);
 
     var response = topResults.Select(r => new SearchResponse
     {

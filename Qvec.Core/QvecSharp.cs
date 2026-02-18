@@ -171,8 +171,14 @@ namespace QvecSharp
 
             _dataAccessor.WriteArray(offset - HeaderSize, emptySlots, 0, totalNeighborSlots);
         }
-        // --- SÖKNING ---
-        public List<(int Id, float Score, string Metadata)> Search(float[] query, int topK, Func<string, bool> filter = null)
+        /// <summary>
+        /// SimpleSearch är en grundläggande linjär sökning som inte utnyttjar HNSW-graf
+        /// </summary>
+        /// <param name="query"></param>
+        /// <param name="topK"></param>
+        /// <param name="filter"></param>
+        /// <returns></returns>
+        public List<(int Id, float Score, string Metadata)> SearchSimple(float[] query, int topK, Func<string, bool> filter = null)
         {
             _lock.EnterReadLock();
             try
@@ -199,7 +205,14 @@ namespace QvecSharp
             }
             finally { _lock.ExitReadLock(); }
         }
-        public unsafe List<(int Id, float Score, string Metadata)> SearchParallel(float[] query, int topK, Func<string, bool> filter = null)
+        /// <summary>
+        /// SearchSimpleParallel är en optimerad version av SearchSimple som utnyttjar alla CPU-kärnor.
+        /// </summary>
+        /// <param name="query"></param>
+        /// <param name="topK"></param>
+        /// <param name="filter"></param>
+        /// <returns></returns>
+        public unsafe List<(int Id, float Score, string Metadata)> SearchSimpleParallel(float[] query, int topK, Func<string, bool> filter = null)
         {
             int count = _header.CurrentCount;
             int dim = _header.VectorDimension;
@@ -247,7 +260,14 @@ namespace QvecSharp
                 .Select(r => (r.Id, r.Score, GetMetadata(r.Id)))
                 .ToList();
         }
-        public List<(int Id, float Score, string Metadata)> SearchHybridHNSW(float[] query, Func<string, bool> filter, int topK = 5)
+        /// <summary>
+        /// HybridHNSW är en sökmetod som kombinerar den snabba HNSW-navigeringen med möjligheten att filtrera på metadata under sökprocessen.
+        /// </summary>
+        /// <param name="query"></param>
+        /// <param name="filter"></param>
+        /// <param name="topK"></param>
+        /// <returns></returns>
+        public List<(int Id, float Score, string Metadata)> Search(float[] query, Func<string, bool> filter, int topK = 5)
         {
             _lock.EnterReadLock();
             try
@@ -323,12 +343,13 @@ namespace QvecSharp
             }
             return -1;
         }
-
-
-
-        private int _entryPoint = 0; // Index på den nod som är högst upp i hierarkin
-
-        public List<(int Id, float Score, string Metadata)> SearchHNSW(float[] query, int topK = 5)
+        /// <summary>
+        /// HNSW search som navigerar genom lagren och returnerar en lista med de bästa matchningarna, inklusive metadata.
+        /// </summary>
+        /// <param name="query"></param>
+        /// <param name="topK"></param>
+        /// <returns></returns>
+        public List<(int Id, float Score, string Metadata)> Search(float[] query, int topK = 5)
         {
             _lock.EnterReadLock();
             try
@@ -541,7 +562,7 @@ namespace QvecSharp
         {
             // Här använder vi vår tidigare optimerade sökloop (NSW/HNSW)
             // men vi returnerar de K bästa träffarna istället för bara en.
-            var results = SearchParallel(query, k);
+            var results = SearchSimpleParallel(query, k);
             return results.Select(r => (r.Id, r.Score)).ToList();
         }
 

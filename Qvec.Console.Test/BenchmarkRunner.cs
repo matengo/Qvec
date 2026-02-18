@@ -10,8 +10,8 @@ namespace Qvec.Console.Test
             System.Console.WriteLine($"--- STARTAR BENCHMARK ({iterations} sökningar) ---");
 
             // 1. VÄRM UPP (Ladda filen i OS-cachen)
-            db.SearchHNSW(queryVector, topK: 1);
-            db.SearchParallel(queryVector, topK: 1);
+            db.Search(queryVector, topK: 1);
+            db.SearchSimpleParallel(queryVector, topK: 1);
 
             //var parallelMs = RunParallelSearchTest(db, queryVector, iterations);
             var hnswMs = RunHNSWSearchTest(db, queryVector, iterations);
@@ -44,7 +44,7 @@ namespace Qvec.Console.Test
             // 3. TESTA SEARCH HNSW (Graf-navigering)
             for (int i = 0; i < iterations; i++)
             {
-                var _ = db.SearchHNSW(queryVector, topK: 5);
+                var _ = db.Search(queryVector, topK: 5);
             }
             sw.Stop();
             double hnswMs = sw.Elapsed.TotalMilliseconds / iterations;
@@ -64,7 +64,7 @@ namespace Qvec.Console.Test
             var sw = Stopwatch.StartNew();
             for (int i = 0; i < iterations; i++)
             {
-                var _ = db.SearchParallel(queryVector, topK: 5);
+                var _ = db.SearchSimpleParallel(queryVector, topK: 5);
             }
             sw.Stop();
             double parallelMs = sw.Elapsed.TotalMilliseconds / iterations;
@@ -91,10 +91,10 @@ namespace Qvec.Console.Test
                 float[] query = Enumerable.Range(0, dim).Select(_ => (float)rand.NextDouble()).ToArray();
 
                 // 2. Hämta FACIT (Linjär sökning hittar ALLTID den absolut närmaste)
-                var truth = db.SearchParallel(query, topK: 1).First();
+                var truth = db.SearchSimpleParallel(query, topK: 1).First();
 
                 // 3. Hämta HNSW-resultat
-                var approx = db.SearchHNSW(query, topK: 1).FirstOrDefault();
+                var approx = db.Search(query, topK: 1).FirstOrDefault();
 
                 // 4. Kolla om de hittade samma ID
                 if (approx.Id == truth.Id)
