@@ -67,7 +67,7 @@ foreach (var r in results) {
 ## Hybrid HNSW Search
 
 ```c#
-var results = db.SearchHybridHNSW(queryVector, meta => {
+var results = db.Search(queryVector, meta => {
     return meta.Contains("\"category\": \"text\"");
 }, topK: 5);
 
