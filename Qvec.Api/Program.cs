@@ -1,0 +1,70 @@
+using Microsoft.AspNetCore.Http.HttpResults;
+using System.Text.Json.Serialization;
+using QvecSharp;
+
+var builder = WebApplication.CreateSlimBuilder(args);
+
+builder.Services.ConfigureHttpJsonOptions(options =>
+{
+    options.SerializerOptions.TypeInfoResolverChain.Insert(0, AppJsonSerializerContext.Default);
+});
+
+// Learn more about configuring OpenAPI at https://aka.ms/aspnet/openapi
+builder.Services.AddOpenApi();
+
+var app = builder.Build();
+
+using var db = new VectorDatabase("vectors.qvec", dim: 1536, max: 10000);
+
+
+if (app.Environment.IsDevelopment())
+{
+    app.MapOpenApi();
+}
+
+app.MapPost("/search", (SearchRequest request) =>
+{
+    if (request.Vector == null || request.Vector.Length == 0)
+        return Results.BadRequest("Vektor saknas");
+
+    var topResults = db.SearchHNSW(request.Vector, request.TopK);
+
+    var response = topResults.Select(r => new SearchResponse
+    {
+        Id = r.Id,
+        Score = r.Score,
+        Metadata = r.Metadata
+    }).ToList();
+
+    return Results.Json(response, AppJsonSerializerContext.Default.ListSearchResponse);
+});
+app.MapGet("/health", () =>
+{
+    bool healthy = db.IsHealthy();
+
+    if (healthy)
+        return Results.Ok(new { status = "Healthy", count = db.GetCount() });
+
+    return Results.Problem("Database corrupt or not loaded", statusCode: 503);
+});
+app.MapGet("/stats", () =>
+{
+    var stats = db.GetStats();
+    return Results.Ok(new
+    {
+        totalVectors = db.GetCount(),
+        entryPointIndex = db.GetEntryPoint(), // Lägg till en enkel getter för _header.EntryPoint
+        layerDistribution = stats.Select(kv => new { Layer = kv.Key, Count = kv.Value }),
+        fileSizeMb = new FileInfo("vectors.qvec").Length / 1024 / 1024
+    });
+});
+app.Run();
+
+
+
+public record SearchRequest(float[] Vector, int TopK = 5);
+public record SearchResponse { public int Id { get; init; } public float Score { get; init; } public string Metadata { get; init; } }
+
+[JsonSerializable(typeof(SearchRequest))]
+[JsonSerializable(typeof(List<SearchResponse>))]
+internal partial class AppJsonSerializerContext : JsonSerializerContext { }
