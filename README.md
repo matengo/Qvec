@@ -25,7 +25,7 @@ Unlike client-server vector DBs, Qvec runs in-process, utilizing **MemoryMappedF
 | **Linear Search** | 4.65 ms | ~215 QPS | 100% |
 | **Qvec HNSW** | **0.0045 ms** | **~220,000 QPS** | **100%** |
 
-*Test conducted on .NET 10 Native AOT (128-dim vectors).*
+*Test conducted on .NET 10 Native AOT (128-dim vectors). Windows 11 ARM64, Qualcomm Snapdragon X Elite (X1E-80100) Surface Laptop*
 
 ---
 
