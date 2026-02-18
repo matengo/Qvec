@@ -54,11 +54,20 @@ using var db = new VectorDatabase("vectors.qvec", dim: 1536, max: 1000000);
 float[] myEmbedding = GetEmbedding("Hello World");
 db.AddEntry(myEmbedding, "{\"id\": 1, \"category\": \"text\"}");
 ```
+## HNSW Vector Search
+
+```c#
+var results = db.Search(queryVector, topK: 5);
+
+foreach (var r in results) {
+    Console.WriteLine($"Found Match: {r.Id} with Score: {r.Score}");
+}
+```
 
 ## Hybrid HNSW Search
 
 ```c#
-var results = db.SearchHybridHNSW(queryVector, meta => {
+var results = db.Search(queryVector, meta => {
     return meta.Contains("\"category\": \"text\"");
 }, topK: 5);
 
