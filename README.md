@@ -76,6 +76,31 @@ foreach (var r in results) {
 }
 ```
 
+## Typed client (AOT)
+
+### 1. for AOT define object serialization
+```c#
+// define a class
+public record Product(int Id, string Name, double Price, bool InStock);
+
+// Source Generator for JSON (needed for AOT)
+[JsonSerializable(typeof(Product))]
+internal partial class ProductJsonContext : JsonSerializerContext { }
+```
+
+### 2. Use typed client
+```c#
+var db = new QvecDatabase("products.qvec", dim: 1536, max: 10000);
+var client = new QvecClient<Product>(db, ProductJsonContext.Default.Product);
+
+// Add entry
+client.AddEntry(myVector, new Product(1, "Laptop", 12000, true));
+
+// Hybrid search
+var results = client.Search(queryVector, p => p.Price < 15000 && p.InStock);
+```
+
+
 ## 🏗 Architecture
 
 1. **Header:** Stores metadata, EntryPoint, and layer distribution.
