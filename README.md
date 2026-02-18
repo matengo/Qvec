@@ -69,23 +69,18 @@ foreach (var r in results) {
 
 ## 🏗 Architecture
 
-1. Header: Stores metadata, EntryPoint, and layer distribution.
-2. Vector Store: Contiguous float arrays stored via MemoryMappedFiles.
-3. Graph Store: Hierarchical adjacency lists (HNSW layers) mapped to disk.
-4. Metadata Store: Fixed-size UTF-8 slots for rapid scalar filtering.
+1. **Header:** Stores metadata, EntryPoint, and layer distribution.
+2. **Vector Store:** Contiguous float arrays stored via MemoryMappedFiles.
+3. **Graph Store:** Hierarchical adjacency lists (HNSW layers) mapped to disk.
+4. **Metadata Store:** Fixed-size UTF-8 slots for rapid scalar filtering.
 
 ## ☁️ Cloud Readiness
 
 Qvec is built for modern cloud environments:
-- Chiseled Containers: Run on ~20MB Docker images for Azure Container Apps.
-- Managed Identity: Connect to Azure Storage without connection strings.
-- Health Checks: Built-in /health endpoints for Kubernetes/Azure liveness probes.
+- **Chiseled Containers:** Run on ~20MB Docker images for Azure Container Apps.
+- **Managed Identity:** Connect to Azure Storage without connection strings.
+- **Health Checks:** Built-in /health endpoints for Kubernetes/Azure liveness probes.
 
 ## 📜 Roadmap
 
-- HNSW Multi-layer Indexing
-- Hybrid Search (Pre-filtering)
-- Native AOT Support
 - Multi-Vector Support (Image + Text in one entry)
-- Product Quantization (PQ) for 4x memory reduction
-- SQLite Extension (Virtual Table)
