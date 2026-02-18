@@ -76,6 +76,31 @@ foreach (var r in results) {
 }
 ```
 
+## Typed client (AOT)
+
+```c#
+// Initiera
+var db = new VectorDatabase("products.qvec", dim: 1536, max: 10000);
+var client = new QvecClient<Product>(db, ProductJsonContext.Default.Product);
+
+// Lägg till
+client.AddEntry(myVector, new Product(1, "Laptop", 12000, true));
+
+// Sök med C#-logik i filtret!
+var results = client.Search(queryVector, p => p.Price < 15000 && p.InStock);
+
+
+
+// class
+public record Product(int Id, string Name, double Price, bool InStock);
+
+// Source Generator for JSON (needed for AOT)
+[JsonSerializable(typeof(Product))]
+internal partial class ProductJsonContext : JsonSerializerContext { }
+
+```
+
+
 ## 🏗 Architecture
 
 1. **Header:** Stores metadata, EntryPoint, and layer distribution.
