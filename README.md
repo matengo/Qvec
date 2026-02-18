@@ -57,7 +57,7 @@ db.AddEntry(myEmbedding, "{\"id\": 1, \"category\": \"text\"}");
 
 ## Hybrid HNSW Search
 
-```code
+```c#
 var results = db.SearchHybridHNSW(queryVector, meta => {
     return meta.Contains("\"category\": \"text\"");
 }, topK: 5);
