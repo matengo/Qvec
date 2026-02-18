@@ -45,7 +45,7 @@ Since Qvec is designed for high-performance embedding, simply include the `Vecto
 
 ## Initialize and Add Data
 
-```code
+```
 using Qvec;
 
 // Initialize DB (1536 dims for OpenAI, max 1M vectors)
