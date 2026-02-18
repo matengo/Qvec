@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Buffers;
 using System.IO.MemoryMappedFiles;
 using System.Numerics;
 using System.Runtime.InteropServices;
@@ -19,6 +20,7 @@ namespace QvecSharp
         public int MaxCount;
         public int MaxNeighbors;
         public int EntryPoint;       // <--- Här sparar vi index för "topp-noden"
+        public int EntryPointLevel;  // Lagret som EntryPoint tillhör
     }
 
     public class QvecDatabase : IDisposable
@@ -34,6 +36,8 @@ namespace QvecSharp
         private readonly long _vectorSectionOffset;
         private readonly long _graphSectionOffset;
         private readonly long _metadataSectionOffset;
+        private readonly int[] _cachedEmptyNeighbors;
+        private readonly byte[] _cachedPadding;
 
 
         public bool IsHealthy()
@@ -49,14 +53,14 @@ namespace QvecSharp
                 return false;
             }
         }
-        public QvecDatabase(string path, int dim = 1536, int max = 1000, int maxNeighbors = 32)
+        public QvecDatabase(string path, int dim = 1536, int max = 1000, int maxNeighbors = 32, int maxLayers = 5)
         {
             bool exists = File.Exists(path);
             _vectorSectionOffset = HeaderSize;
             long vectorSpace = (long)max * dim * sizeof(float);
 
             _graphSectionOffset = _vectorSectionOffset + vectorSpace;
-            long graphSpace = (long)max * maxNeighbors * sizeof(int);
+            long graphSpace = (long)max * maxLayers * maxNeighbors * sizeof(int);
 
             _metadataSectionOffset = _graphSectionOffset + graphSpace;
             long metadataSpace = (long)max * MetadataSize;
@@ -79,26 +83,40 @@ namespace QvecSharp
                     VectorDimension = dim,
                     MaxCount = max,
                     CurrentCount = 0,
-                    MaxNeighbors = maxNeighbors
+                    MaxNeighbors = maxNeighbors,
+                    MaxLayers = maxLayers,
+                    LayerProbability = 1.0 / Math.Log(maxNeighbors),
+                    EntryPoint = 0,
+                    EntryPointLevel = 0
                 };
                 _headerAccessor.Write(0, ref _header);
             }
 
             _dataAccessor = _mmf.CreateViewAccessor(HeaderSize, totalSize - HeaderSize);
+
+            int totalSlots = _header.MaxLayers * _header.MaxNeighbors;
+            _cachedEmptyNeighbors = new int[totalSlots];
+            Array.Fill(_cachedEmptyNeighbors, -1);
+            _cachedPadding = new byte[MetadataSize];
         }
 
         // --- KÄRNA: SIMD MATEMATIK ---
         public static float DotProduct(float[] left, float[] right)
         {
+            return DotProduct(left, right, left.Length);
+        }
+
+        public static float DotProduct(float[] left, float[] right, int count)
+        {
             int i = 0;
             float dot = 0;
             int vectorSize = Vector<float>.Count;
 
-            for (; i <= left.Length - vectorSize; i += vectorSize)
+            for (; i <= count - vectorSize; i += vectorSize)
             {
                 dot += Vector.Dot(new Vector<float>(left, i), new Vector<float>(right, i));
             }
-            for (; i < left.Length; i++) dot += left[i] * right[i];
+            for (; i < count; i++) dot += left[i] * right[i];
             return dot;
         }
 
@@ -111,24 +129,29 @@ namespace QvecSharp
                 if (_header.CurrentCount >= _header.MaxCount) throw new Exception("DB Full");
 
                 int index = _header.CurrentCount;
-
-                // 1. Bestäm vilket lager denna nod ska tillhöra
                 int level = RandomLayer();
 
-                // 2. Skriv Vektor & Metadata (som tidigare)
                 WriteVectorToDisk(index, vector);
                 WriteMetadataToDisk(index, metadata);
-
-                // 3. Initiera Grannar för ALLA lager upp till MaxLayers
                 InitNeighborsOnDisk(index);
 
-                // 4. Uppdatera räknaren
                 _header.CurrentCount++;
 
-                // 5. VIKTIGT: Kolla om detta är vår nya högsta punkt
-                UpdateEntryPointIfHigher(index, level);
+                if (_header.CurrentCount == 1)
+                {
+                    _header.EntryPoint = index;
+                    _header.EntryPointLevel = level;
+                }
+                else
+                {
+                    ConnectNewNode(index, vector, level);
+                    if (level > _header.EntryPointLevel)
+                    {
+                        _header.EntryPoint = index;
+                        _header.EntryPointLevel = level;
+                    }
+                }
 
-                // Spara resten av headern
                 _headerAccessor.Write(0, ref _header);
             }
             finally { _lock.ExitWriteLock(); }
@@ -147,29 +170,18 @@ namespace QvecSharp
             long offset = _metadataSectionOffset + (long)index * MetadataSize;
             byte[] bytes = Encoding.UTF8.GetBytes(metadata);
 
-            // Säkerställ att vi inte skriver för mycket
             int length = Math.Min(bytes.Length, MetadataSize);
-
-            // Skriv byten
             _dataAccessor.WriteArray(offset - HeaderSize, bytes, 0, length);
 
-            // Om metadatan är kortare än Max, fyll resten med nollor (padding)
             if (length < MetadataSize)
             {
-                byte[] padding = new byte[MetadataSize - length];
-                _dataAccessor.WriteArray(offset - HeaderSize + length, padding, 0, padding.Length);
+                _dataAccessor.WriteArray(offset - HeaderSize + length, _cachedPadding, 0, MetadataSize - length);
             }
         }
         private void InitNeighborsOnDisk(int index)
         {
-            // Varje nod har plats för MaxNeighbors i varje lager
-            int totalNeighborSlots = _header.MaxLayers * _header.MaxNeighbors;
-            int[] emptySlots = new int[totalNeighborSlots];
-            Array.Fill(emptySlots, -1); // -1 betyder "ingen granne här"
-
-            long offset = _graphSectionOffset + (long)index * totalNeighborSlots * sizeof(int);
-
-            _dataAccessor.WriteArray(offset - HeaderSize, emptySlots, 0, totalNeighborSlots);
+            long offset = _graphSectionOffset + (long)index * _cachedEmptyNeighbors.Length * sizeof(int);
+            _dataAccessor.WriteArray(offset - HeaderSize, _cachedEmptyNeighbors, 0, _cachedEmptyNeighbors.Length);
         }
         /// <summary>
         /// SimpleSearch är en grundläggande linjär sökning som inte utnyttjar HNSW-graf
@@ -227,7 +239,8 @@ namespace QvecSharp
 
             try
             {
-                float* vectorBasePtr = (float*)basePtr; // Vektorer börjar direkt efter headern i vår förenklade modell
+                basePtr += _dataAccessor.PointerOffset;
+                float* vectorBasePtr = (float*)basePtr;
 
                 // PARALLELL LOOP: Utnyttjar alla CPU-kärnor
                 Parallel.For(0, count, i =>
@@ -267,68 +280,26 @@ namespace QvecSharp
         /// <param name="filter"></param>
         /// <param name="topK"></param>
         /// <returns></returns>
-        public List<(int Id, float Score, string Metadata)> Search(float[] query, Func<string, bool> filter, int topK = 5)
+        public List<(int Id, float Score, string Metadata)> Search(float[] query, Func<string, bool> filter, int topK = 5, int efSearch = 50)
         {
             _lock.EnterReadLock();
             try
             {
-                // 1. Starta från EntryPoint
-                int currentElement = _header.EntryPoint;
-
-                // Kontrollera om EntryPoint matchar filtret, annars sök linjärt efter en giltig startnod
-                if (!filter(GetMetadata(currentElement)))
+                int entryPoint = _header.EntryPoint;
+                for (int level = _header.EntryPointLevel; level >= 1; level--)
                 {
-                    currentElement = FindFirstValidNode(filter);
-                    if (currentElement == -1) return new List<(int, float, string)>(); // Inget matchar filtret i hela DB
+                    entryPoint = GreedyClosest(query, entryPoint, level);
                 }
 
-                float currentScore = CalculateScore(query, currentElement);
+                int ef = Math.Max(topK, efSearch);
+                var nearest = SearchLayerNearest(query, entryPoint, 0, ef);
 
-                // 2. Navigera i lagren med filter-krav
-                for (int level = _header.MaxLayers - 1; level >= 0; level--)
-                {
-                    bool changed = true;
-                    while (changed)
-                    {
-                        changed = false;
-                        var neighbors = GetNeighborsAtLevel(currentElement, level);
-                        foreach (int neighbor in neighbors)
-                        {
-                            if (neighbor == -1) break;
-
-                            // HYBRID-STEGET: Kolla metadata innan vi ens bryr oss om score
-                            string meta = GetMetadata(neighbor);
-                            if (!filter(meta)) continue;
-
-                            float score = CalculateScore(query, neighbor);
-                            if (score > currentScore)
-                            {
-                                currentScore = score;
-                                currentElement = neighbor;
-                                changed = true;
-                            }
-                        }
-                    }
-                }
-
-                // 3. Samla resultat (Top K)
-                var finalResults = new List<(int Id, float Score)>();
-                finalResults.Add((currentElement, currentScore));
-
-                // Fyll på med grannar som också matchar filtret
-                var baseNeighbors = GetNeighborsAtLevel(currentElement, 0);
-                foreach (var n in baseNeighbors)
-                {
-                    if (n == -1) break;
-                    string m = GetMetadata(n);
-                    if (filter(m))
-                        finalResults.Add((n, CalculateScore(query, n)));
-                }
-
-                return finalResults
+                return nearest
+                    .Select(r => (r.Id, r.Score, Meta: GetMetadata(r.Id)))
+                    .Where(r => filter(r.Meta))
                     .OrderByDescending(r => r.Score)
                     .Take(topK)
-                    .Select(r => (r.Id, r.Score, GetMetadata(r.Id)))
+                    .Select(r => (r.Id, r.Score, r.Meta))
                     .ToList();
             }
             finally { _lock.ExitReadLock(); }
@@ -348,30 +319,25 @@ namespace QvecSharp
         /// </summary>
         /// <param name="query"></param>
         /// <param name="topK"></param>
+        /// <param name="efSearch">Sökbredd i bottenlagret. Högre = bättre recall men långsammare. Standard: 200.</param>
         /// <returns></returns>
-        public List<(int Id, float Score, string Metadata)> Search(float[] query, int topK = 5)
+        public List<(int Id, float Score, string Metadata)> Search(float[] query, int topK = 5, int efSearch = 50)
         {
             _lock.EnterReadLock();
             try
             {
-                // 1. Hitta den närmaste noden via lagren (HNSW-navigering)
-                int bestIndex = NavigateLayers(query);
-
-                // 2. För att returnera en lista (likt SearchParallel) hämtar vi 
-                // grannarna till den bästa träffen i bottenlagret för att fylla TopK
-                var neighbors = GetNeighborsAtLevel(bestIndex, 0).ToArray();
-
-                var results = new List<(int Id, float Score)>();
-                results.Add((bestIndex, CalculateScore(query, bestIndex)));
-
-                foreach (var n in neighbors.Where(id => id != -1).Take(topK - 1))
+                int entryPoint = _header.EntryPoint;
+                for (int level = _header.EntryPointLevel; level >= 1; level--)
                 {
-                    results.Add((n, CalculateScore(query, n)));
+                    entryPoint = GreedyClosest(query, entryPoint, level);
                 }
 
-                // 3. Formatera resultatet med metadata
-                return results
+                int ef = Math.Max(topK, efSearch);
+                var nearest = SearchLayerNearest(query, entryPoint, 0, ef);
+
+                return nearest
                     .OrderByDescending(r => r.Score)
+                    .Take(topK)
                     .Select(r => (r.Id, r.Score, GetMetadata(r.Id)))
                     .ToList();
             }
@@ -384,7 +350,7 @@ namespace QvecSharp
             int currentElement = _header.EntryPoint;
             float currentScore = CalculateScore(query, currentElement);
 
-            for (int level = _header.MaxLayers - 1; level >= 0; level--)
+            for (int level = _header.EntryPointLevel; level >= 0; level--)
             {
                 bool changed = true;
                 while (changed)
@@ -406,69 +372,221 @@ namespace QvecSharp
             }
             return currentElement;
         }
-        private void UpdateEntryPointIfHigher(int newIndex, int newLevel)
+        private void ConnectNewNode(int newIndex, float[] newVector, int newLevel)
         {
-            // Vi läser nuvarande EntryPoint nivå (om vi hade sparat nivåer, 
-            // men för enkelhetens skull kollar vi om den nya noden är i ett 
-            // högre lager än vad vi tror är MaxLayers/2 eller om det är första noden)
+            int currentElement = _header.EntryPoint;
 
-            // En enkel men effektiv regel: Om det är första noden, eller om 
-            // nivån är högre än 0, utvärdera om den ska bli ny startpunkt.
-            if (_header.CurrentCount == 1 || newLevel > 0)
+            for (int level = _header.EntryPointLevel; level > newLevel; level--)
             {
-                // I en full HNSW-implementation skulle vi här jämföra newLevel 
-                // mot nivån för den nuvarande EntryPoint.
-                // För din version: Om newLevel är den högsta vi sett hittills, uppdatera.
+                currentElement = GreedyClosest(newVector, currentElement, level);
+            }
 
-                // Just nu sätter vi den helt enkelt som EntryPoint om det är den 
-                // första noden, eller om den når ett respektabelt lager.
-                if (_header.CurrentCount == 1 || newLevel >= (_header.MaxLayers / 2))
+            for (int level = Math.Min(newLevel, _header.MaxLayers - 1); level >= 0; level--)
+            {
+                var nearest = SearchLayerNearest(newVector, currentElement, level, _header.MaxNeighbors);
+
+                WriteNeighborsAtLevel(newIndex, level, nearest);
+
+                foreach (var (neighborId, _) in nearest)
                 {
-                    _header.EntryPoint = newIndex;
-                    // Vi skriver inte headern här, det görs i slutet av AddEntry
+                    if (neighborId < 0) break;
+                    AddNeighborConnection(neighborId, level, newIndex, newVector);
+                }
+
+                if (nearest.Length > 0 && nearest[0].Id >= 0)
+                {
+                    currentElement = nearest[0].Id;
                 }
             }
         }
 
-        private unsafe Span<int> GetNeighborsAtLevel(int nodeIndex, int level)
+        private int GreedyClosest(float[] query, int entryPoint, int level)
         {
-            // Layout på disk: [Node 0: L0, L1, L2...][Node 1: L0, L1, L2...]
-            // Varje lager har 'MaxNeighbors' platser.
-            long position = _graphSectionOffset +
+            int current = entryPoint;
+            float currentScore = CalculateScore(query, current);
+
+            bool changed = true;
+            while (changed)
+            {
+                changed = false;
+                var neighbors = GetNeighborsAtLevel(current, level);
+                foreach (int neighbor in neighbors)
+                {
+                    if (neighbor == -1) break;
+                    float score = CalculateScore(query, neighbor);
+                    if (score > currentScore)
+                    {
+                        currentScore = score;
+                        current = neighbor;
+                        changed = true;
+                    }
+                }
+            }
+            return current;
+        }
+
+        private (int Id, float Score)[] SearchLayerNearest(float[] query, int entryPoint, int level, int ef)
+        {
+            var visited = new HashSet<int> { entryPoint };
+            float entryScore = CalculateScore(query, entryPoint);
+
+            var candidates = new PriorityQueue<int, float>();
+            candidates.Enqueue(entryPoint, -entryScore);
+
+            var results = new PriorityQueue<int, float>();
+            results.Enqueue(entryPoint, entryScore);
+            float worstScore = entryScore;
+
+            while (candidates.TryDequeue(out int candidateId, out float negScore))
+            {
+                float candidateScore = -negScore;
+                if (candidateScore < worstScore && results.Count >= ef)
+                    break;
+
+                var neighbors = GetNeighborsAtLevel(candidateId, level);
+                foreach (int neighbor in neighbors)
+                {
+                    if (neighbor < 0) break;
+                    if (!visited.Add(neighbor)) continue;
+
+                    float score = CalculateScore(query, neighbor);
+
+                    if (results.Count < ef || score > worstScore)
+                    {
+                        candidates.Enqueue(neighbor, -score);
+                        results.Enqueue(neighbor, score);
+
+                        if (results.Count > ef)
+                        {
+                            results.Dequeue();
+                        }
+
+                        results.TryPeek(out _, out worstScore);
+                    }
+                }
+            }
+
+            var resultArray = new (int Id, float Score)[results.Count];
+            int idx = results.Count - 1;
+            while (results.TryDequeue(out int id, out float score))
+            {
+                resultArray[idx--] = (id, score);
+            }
+            return resultArray;
+        }
+
+        private void WriteNeighborsAtLevel(int nodeIndex, int level, (int Id, float Score)[] neighbors)
+        {
+            long position = (_graphSectionOffset - HeaderSize) +
                             (long)nodeIndex * _header.MaxLayers * _header.MaxNeighbors * sizeof(int) +
                             (long)level * _header.MaxNeighbors * sizeof(int);
 
-            byte* ptr = null;
-            _dataAccessor.SafeMemoryMappedViewHandle.AcquirePointer(ref ptr);
-            // Returnera en Span så vi kan läsa/skriva direkt i minnet utan kopiering
-            return new Span<int>(ptr + position, _header.MaxNeighbors);
+            int count = Math.Min(neighbors.Length, _header.MaxNeighbors);
+            int[] toWrite = ArrayPool<int>.Shared.Rent(_header.MaxNeighbors);
+            try
+            {
+                for (int i = 0; i < count; i++) toWrite[i] = neighbors[i].Id;
+                for (int i = count; i < _header.MaxNeighbors; i++) toWrite[i] = -1;
+                _dataAccessor.WriteArray(position, toWrite, 0, _header.MaxNeighbors);
+            }
+            finally
+            {
+                ArrayPool<int>.Shared.Return(toWrite);
+            }
         }
 
-        private static readonly ThreadLocal<Random> _random = new(() => new Random());
+        private void WriteNeighborsAtLevel(int nodeIndex, int level, int[] neighborIds)
+        {
+            long position = (_graphSectionOffset - HeaderSize) +
+                            (long)nodeIndex * _header.MaxLayers * _header.MaxNeighbors * sizeof(int) +
+                            (long)level * _header.MaxNeighbors * sizeof(int);
+
+            int count = Math.Min(neighborIds.Length, _header.MaxNeighbors);
+            int[] toWrite = ArrayPool<int>.Shared.Rent(_header.MaxNeighbors);
+            try
+            {
+                Array.Copy(neighborIds, toWrite, count);
+                for (int i = count; i < _header.MaxNeighbors; i++) toWrite[i] = -1;
+                _dataAccessor.WriteArray(position, toWrite, 0, _header.MaxNeighbors);
+            }
+            finally
+            {
+                ArrayPool<int>.Shared.Return(toWrite);
+            }
+        }
+
+        private void AddNeighborConnection(int existingNode, int level, int newNode, float[] newVector)
+        {
+            var neighbors = GetNeighborsAtLevel(existingNode, level);
+
+            // Hitta en ledig plats
+            for (int i = 0; i < neighbors.Length; i++)
+            {
+                if (neighbors[i] == -1)
+                {
+                    neighbors[i] = newNode;
+                    WriteNeighborsAtLevel(existingNode, level, neighbors);
+                    return;
+                }
+            }
+
+            // Alla platser fulla - ersätt svagaste grannen om den nya är bättre
+            float[] existingVector = GetVector(existingNode);
+            float newScore = DotProduct(existingVector, newVector);
+
+            int worstIdx = 0;
+            float worstScore = CalculateScore(existingVector, neighbors[0]);
+            for (int i = 1; i < neighbors.Length; i++)
+            {
+                float score = CalculateScore(existingVector, neighbors[i]);
+                if (score < worstScore)
+                {
+                    worstScore = score;
+                    worstIdx = i;
+                }
+            }
+
+            if (newScore > worstScore)
+            {
+                neighbors[worstIdx] = newNode;
+                WriteNeighborsAtLevel(existingNode, level, neighbors);
+            }
+        }
+
+        private int[] GetNeighborsAtLevel(int nodeIndex, int level)
+        {
+            // Layout på disk: [Node 0: L0, L1, L2...][Node 1: L0, L1, L2...]
+            // Varje lager har 'MaxNeighbors' platser.
+            long position = (_graphSectionOffset - HeaderSize) +
+                            (long)nodeIndex * _header.MaxLayers * _header.MaxNeighbors * sizeof(int) +
+                            (long)level * _header.MaxNeighbors * sizeof(int);
+
+            int[] neighbors = new int[_header.MaxNeighbors];
+            _dataAccessor.ReadArray(position, neighbors, 0, _header.MaxNeighbors);
+            return neighbors;
+        }
 
         private int RandomLayer()
         {
-            double mL = 0.36;
-            // .Value behövs eftersom det är en ThreadLocal
-            double r = _random.Value.NextDouble();
+            double r = Random.Shared.NextDouble();
             if (r <= 0) r = 0.0001;
 
-            int level = (int)(-Math.Log(r) * mL);
+            int level = (int)(-Math.Log(r) * _header.LayerProbability);
             return Math.Min(level, _header.MaxLayers - 1);
         }
         private float CalculateScore(float[] query, int targetIndex)
         {
-            // Beräkna offset i filen för målvektorn
-            long offset = _vectorSectionOffset + (long)targetIndex * _header.VectorDimension * sizeof(float);
-
-            // Vi läser in vektorn till en temporär buffert (stackalloc är snabbast för AOT)
-            Span<float> targetVector = stackalloc float[_header.VectorDimension];
-
-            // Läs direkt från MemoryMappedFile-accessorn
-            _dataAccessor.ReadArray(offset - HeaderSize, targetVector.ToArray(), 0, _header.VectorDimension);
-
-            // Anropa vår SIMD-optimerade DotProduct
-            return DotProduct(query, targetVector.ToArray());
+            float[] targetVector = ArrayPool<float>.Shared.Rent(_header.VectorDimension);
+            try
+            {
+                long offset = (long)targetIndex * _header.VectorDimension * sizeof(float);
+                _dataAccessor.ReadArray(offset, targetVector, 0, _header.VectorDimension);
+                return DotProduct(query, targetVector, _header.VectorDimension);
+            }
+            finally
+            {
+                ArrayPool<float>.Shared.Return(targetVector);
+            }
         }
         public void RebuildIndex()
         {
@@ -597,10 +715,17 @@ namespace QvecSharp
         }
         private string GetMetadata(int index)
         {
-            byte[] buffer = new byte[MetadataSize];
-            long pos = (_metadataSectionOffset - HeaderSize) + (long)index * MetadataSize;
-            _dataAccessor.ReadArray(pos, buffer, 0, MetadataSize);
-            return Encoding.UTF8.GetString(buffer).TrimEnd('\0');
+            byte[] buffer = ArrayPool<byte>.Shared.Rent(MetadataSize);
+            try
+            {
+                long pos = (_metadataSectionOffset - HeaderSize) + (long)index * MetadataSize;
+                _dataAccessor.ReadArray(pos, buffer, 0, MetadataSize);
+                return Encoding.UTF8.GetString(buffer, 0, MetadataSize).TrimEnd('\0');
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(buffer);
+            }
         }
 
         public void Dispose()

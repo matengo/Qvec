@@ -3,7 +3,7 @@ using QvecSharp;
 using System.Diagnostics;
 
 const int Dim = 128;        // Dimensioner (t.ex. för en mindre modell)
-const int Count = 10000;    // Antal vektorer i databasen
+const int Count = 1000000;    // Antal vektorer i databasen
 const int SearchRounds = 1000; // Hur många sökningar vi ska mäta
 string dbPath = "benchmark.qvec";
 
