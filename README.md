@@ -18,12 +18,12 @@ Unlike client-server vector DBs, Qvec runs in-process, utilizing **MemoryMappedF
 
 ---
 
-## 📊 Performance Benchmark (10,000 Vectors)
+## 📊 Performance Benchmark (1M Vectors)
 
 | Method | Search Time | Throughput | Recall |
 | :--- | :--- | :--- | :--- |
 | **Linear Search** | 4.65 ms | ~215 QPS | 100% |
-| **Qvec HNSW** | **0.0045 ms** | **~220,000 QPS** | **100%** |
+| **Qvec HNSW** | **0.110 ms** | **~9,070 QPS** | **98%** |
 
 *Test conducted on .NET 10 Native AOT (128-dim vectors). Surface Laptop Windows 11 ARM64, Qualcomm Snapdragon X Elite (X1E-80100)*
 
