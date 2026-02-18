@@ -90,14 +90,13 @@ internal partial class ProductJsonContext : JsonSerializerContext { }
 
 ### 2. Use typed client
 ```c#
-// Initiera
 var db = new QvecDatabase("products.qvec", dim: 1536, max: 10000);
 var client = new QvecClient<Product>(db, ProductJsonContext.Default.Product);
 
-// Lägg till
+// Add entry
 client.AddEntry(myVector, new Product(1, "Laptop", 12000, true));
 
-// Sök med C#-logik i filtret!
+// Hybrid search
 var results = client.Search(queryVector, p => p.Price < 15000 && p.InStock);
 ```
 
