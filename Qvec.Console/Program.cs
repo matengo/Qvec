@@ -11,7 +11,7 @@ initCommand.Options.Add(pathOption);
 initCommand.SetAction(parseResult =>
 {
     var path = parseResult.GetValue(pathOption);
-    using var db = new VectorDatabase(path, dim: 1536, max: 10000);
+    using var db = new QvecDatabase(path, dim: 1536, max: 10000);
     Console.WriteLine($"Databas skapad: {path}");
 });
 
@@ -25,7 +25,7 @@ searchCommand.SetAction(parseResult =>
     var path = parseResult.GetValue(pathOption);
     var vectorStr = parseResult.GetValue(queryOption);
     float[] query = vectorStr.Split(',').Select(float.Parse).ToArray();
-    using var db = new VectorDatabase(path);
+    using var db = new QvecDatabase(path);
     var results = db.SearchSimpleParallel(query, topK: 3);
 
     foreach (var r in results)

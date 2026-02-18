@@ -5,7 +5,7 @@ namespace Qvec.Console.Test
 {
     public static class BenchmarkRunner
     {
-        public static void RunCompare(VectorDatabase db, float[] queryVector, int iterations = 1000)
+        public static void RunCompare(QvecDatabase db, float[] queryVector, int iterations = 1000)
         {
             System.Console.WriteLine($"--- STARTAR BENCHMARK ({iterations} sökningar) ---");
 
@@ -38,7 +38,7 @@ namespace Qvec.Console.Test
             System.Console.WriteLine("------------------------------------------------");
 
         }
-        private static double RunHNSWSearchTest(VectorDatabase db, float[] queryVector, int iterations = 1000)
+        private static double RunHNSWSearchTest(QvecDatabase db, float[] queryVector, int iterations = 1000)
         {
             var sw = Stopwatch.StartNew();
             // 3. TESTA SEARCH HNSW (Graf-navigering)
@@ -59,7 +59,7 @@ namespace Qvec.Console.Test
             System.Console.WriteLine($"SearchHNSW (Graf):      {hnswMs:F4} ms/sökning");
             return hnswMs;
         }
-        private static double RunParallelSearchTest(VectorDatabase db, float[] queryVector, int iterations = 1000)
+        private static double RunParallelSearchTest(QvecDatabase db, float[] queryVector, int iterations = 1000)
         {
             var sw = Stopwatch.StartNew();
             for (int i = 0; i < iterations; i++)
@@ -78,7 +78,7 @@ namespace Qvec.Console.Test
             System.Console.WriteLine($"SearchParallel (Linjär): {parallelMs:F4} ms/sökning");
             return parallelMs;
         }
-        public static void RunRecallTest(VectorDatabase db, int testRounds = 100)
+        public static void RunRecallTest(QvecDatabase db, int testRounds = 100)
         {
             System.Console.WriteLine($"--- STARTAR RECALL-TEST ({testRounds} runder) ---");
             int hits = 0;

@@ -9,7 +9,7 @@ string dbPath = "benchmark.qvec";
 
 if (File.Exists(dbPath)) File.Delete(dbPath);
 
-using var db = new VectorDatabase(dbPath, dim: Dim, max: Count);
+using var db = new QvecDatabase(dbPath, dim: Dim, max: Count);
 var rand = new Random();
 
 // --- 1. POPULERING (Bulk Import) ---

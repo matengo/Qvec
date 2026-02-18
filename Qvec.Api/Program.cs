@@ -8,13 +8,16 @@ builder.Services.ConfigureHttpJsonOptions(options =>
 {
     options.SerializerOptions.TypeInfoResolverChain.Insert(0, AppJsonSerializerContext.Default);
 });
+builder.Services.AddSingleton<QvecDatabase>(sp =>
+{
+    // Här skickar du in dina inställningar (t.ex. från appsettings.json)
+    return new QvecDatabase("vectors.qvec", dim: 1536, max: 100000);
+});
 
 // Learn more about configuring OpenAPI at https://aka.ms/aspnet/openapi
 builder.Services.AddOpenApi();
 
 var app = builder.Build();
-
-using var db = new VectorDatabase("vectors.qvec", dim: 1536, max: 10000);
 
 
 if (app.Environment.IsDevelopment())
@@ -22,7 +25,7 @@ if (app.Environment.IsDevelopment())
     app.MapOpenApi();
 }
 
-app.MapPost("/search", (SearchRequest request) =>
+app.MapPost("/search", (QvecDatabase db, SearchRequest request) =>
 {
     if (request.Vector == null || request.Vector.Length == 0)
         return Results.BadRequest("Vektor saknas");
@@ -38,7 +41,7 @@ app.MapPost("/search", (SearchRequest request) =>
 
     return Results.Json(response, AppJsonSerializerContext.Default.ListSearchResponse);
 });
-app.MapGet("/health", () =>
+app.MapGet("/health", (QvecDatabase db) =>
 {
     bool healthy = db.IsHealthy();
 
@@ -47,7 +50,7 @@ app.MapGet("/health", () =>
 
     return Results.Problem("Database corrupt or not loaded", statusCode: 503);
 });
-app.MapGet("/stats", () =>
+app.MapGet("/stats", (QvecDatabase db) =>
 {
     var stats = db.GetStats();
     return Results.Ok(new

@@ -21,7 +21,7 @@ namespace QvecSharp
         public int EntryPoint;       // <--- Här sparar vi index för "topp-noden"
     }
 
-    public class VectorDatabase : IDisposable
+    public class QvecDatabase : IDisposable
     {
         private readonly MemoryMappedFile _mmf;
         private readonly MemoryMappedViewAccessor _headerAccessor;
@@ -49,7 +49,7 @@ namespace QvecSharp
                 return false;
             }
         }
-        public VectorDatabase(string path, int dim = 1536, int max = 1000, int maxNeighbors = 32)
+        public QvecDatabase(string path, int dim = 1536, int max = 1000, int maxNeighbors = 32)
         {
             bool exists = File.Exists(path);
             _vectorSectionOffset = HeaderSize;

@@ -1,13 +1,13 @@
 ﻿using QvecSharp;
 
-public class PartitionedVectorDb : IDisposable
+public class PartitionedQvecDatabase : IDisposable
 {
-    private readonly List<VectorDatabase> _partitions = new();
+    private readonly List<QvecDatabase> _partitions = new();
     private readonly int _dim;
     private readonly int _partitionSize;
     private readonly string _basePath;
 
-    public PartitionedVectorDb(string basePath, int dim, int partitionSize)
+    public PartitionedQvecDatabase(string basePath, int dim, int partitionSize)
     {
         _basePath = basePath;
         _dim = dim;
@@ -17,7 +17,7 @@ public class PartitionedVectorDb : IDisposable
         int i = 0;
         while (File.Exists(GetPath(i)))
         {
-            _partitions.Add(new VectorDatabase(GetPath(i), dim, partitionSize));
+            _partitions.Add(new QvecDatabase(GetPath(i), dim, partitionSize));
             i++;
         }
     }
@@ -32,16 +32,14 @@ public class PartitionedVectorDb : IDisposable
 
         if (last == null) // Förenklat för demo: lägg alltid i första eller skapa
         {
-            var newPart = new VectorDatabase(GetPath(_partitions.Count), _dim, _partitionSize);
+            var newPart = new QvecDatabase(GetPath(_partitions.Count), _dim, _partitionSize);
             _partitions.Add(newPart);
             last = newPart;
         }
 
         last.AddEntry(vector, metadata);
     }
-
-    // --- OPTIMERAD PARTITIONERAD SÖKNING ---
-    public List<(int Id, float Score, string Metadata)> SearchGlobal(float[] query, int topK)
+    public List<(int Id, float Score, string Metadata)> Search(float[] query, int topK)
     {
         // Sök i alla partitioner samtidigt på olika trådar
         return _partitions
@@ -51,6 +49,15 @@ public class PartitionedVectorDb : IDisposable
             .Take(topK)
             .ToList();
     }
-
+    public List<(int Id, float Score, string Metadata)> Search(float[] query, Func<string, bool> filter, int topK)
+    {
+        // Sök i alla partitioner samtidigt på olika trådar
+        return _partitions
+            .AsParallel() // PLINQ för att söka i alla filer parallellt
+            .SelectMany(p => p.Search(query, filter, topK))
+            .OrderByDescending(r => r.Score)
+            .Take(topK)
+            .ToList();
+    }
     public void Dispose() => _partitions.ForEach(p => p.Dispose());
 }
