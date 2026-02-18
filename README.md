@@ -39,6 +39,7 @@ Since Qvec is designed for high-performance embedding, simply include the `Vecto
   <PublishAot>true</PublishAot>
   <OptimizationPreference>Speed</OptimizationPreference>
 </PropertyGroup>
+```
 
 ## 💻 Quick Start
 
@@ -52,6 +53,7 @@ using var db = new VectorDatabase("vectors.qvec", dim: 1536, max: 1000000);
 
 float[] myEmbedding = GetEmbedding("Hello World");
 db.AddEntry(myEmbedding, "{\"id\": 1, \"category\": \"text\"}");
+```
 
 ## Hybrid HNSW Search
 
@@ -63,6 +65,7 @@ var results = db.SearchHybridHNSW(queryVector, meta => {
 foreach (var r in results) {
     Console.WriteLine($"Found Match: {r.Id} with Score: {r.Score}");
 }
+```
 
 ## 🏗 Architecture
 
