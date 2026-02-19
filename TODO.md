@@ -1,1 +1,16 @@
-- [ ] 
+- [ ] **Guid som dokument-ID** — Implementera `Guid`-baserade dokument-ID:n för att möjliggöra synk mellan databaser. Designdokument: [docs/design-guid-id.md](docs/design-guid-id.md)
+- [ ] Lägg till Guid-sektion i filformatet (16 bytes/post efter metadata-sektionen)
+- [ ] Nya fält: `_guidSectionOffset`, `_guidIndex` dictionary
+- [ ] `WriteGuidToDisk` / `ReadGuidFromDisk` metoder
+- [ ] `RebuildGuidIndex` vid uppstart
+- [ ] Ändra `AddEntry` att returnera `Guid` och stödja `externalId`-parameter
+- [ ] Dedup-logik: hoppa över om Guid redan finns
+- [ ] Ändra alla `Search`-metoder att returnera `Guid` istället för `int` i resultat
+- [ ] `GetByGuid` lookup-metod
+- [ ] `SyncFrom(QvecDatabase source)` metod
+- [ ] Uppdatera `PartitionedQvecDatabase` att propagera Guid
+- [ ] Uppdatera `QvecClient<T>` returtyper
+- [ ] Uppdatera API-endpoints
+- [ ] Bakåtkompatibilitet: auto-migrering av v1-filer
+- [ ] Bumpa `DbHeader.Version` till 2
+- [ ] Uppdatera tester

@@ -129,9 +129,9 @@ Qvec is built as an **embedded** vector database — no server, no network overh
 
 Qvec is built for modern cloud environments:
 - **Chiseled Containers:** Run on ~20MB Docker images for Azure Container Apps.
-- **Managed Identity:** Connect to Azure Storage without connection strings.
 - **Health Checks:** Built-in /health endpoints for Kubernetes/Azure liveness probes.
 
 ## 📜 Roadmap
 
+- **Guid Document IDs** — Replace sequential `int` IDs with `Guid` as the logical document identifier to enable multi-database sync, deduplication, and stable external references. Internal storage remains index-based for zero-overhead disk access. See [design doc](docs/design-guid-id.md).
 - Multi-Vector Support (Image + Text in one entry)
