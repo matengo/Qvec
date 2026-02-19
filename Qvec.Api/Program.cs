@@ -66,7 +66,7 @@ app.Run();
 
 
 public record SearchRequest(float[] Vector, int TopK = 5);
-public record SearchResponse { public int Id { get; init; } public float Score { get; init; } public string Metadata { get; init; } }
+public record SearchResponse { public Guid Id { get; init; } public float Score { get; init; } public string Metadata { get; init; } }
 
 [JsonSerializable(typeof(SearchRequest))]
 [JsonSerializable(typeof(List<SearchResponse>))]

@@ -33,9 +33,12 @@ namespace QvecSharp
         private DbHeader _header;
         private const int HeaderSize = 1024;
         private const int MetadataSize = 512;
+        private const int GuidSize = 16;
         private readonly long _vectorSectionOffset;
         private readonly long _graphSectionOffset;
         private readonly long _metadataSectionOffset;
+        private readonly long _guidSectionOffset;
+        private readonly Dictionary<Guid, int> _guidIndex = new();
         private readonly int[] _cachedEmptyNeighbors;
         private readonly byte[] _cachedPadding;
 
@@ -65,7 +68,10 @@ namespace QvecSharp
             _metadataSectionOffset = _graphSectionOffset + graphSpace;
             long metadataSpace = (long)max * MetadataSize;
 
-            long totalSize = _metadataSectionOffset + metadataSpace;
+            _guidSectionOffset = _metadataSectionOffset + metadataSpace;
+            long guidSpace = (long)max * GuidSize;
+
+            long totalSize = _guidSectionOffset + guidSpace;
 
             _mmf = MemoryMappedFile.CreateFromFile(path, FileMode.OpenOrCreate, null, totalSize);
             _headerAccessor = _mmf.CreateViewAccessor(0, HeaderSize);
@@ -79,7 +85,7 @@ namespace QvecSharp
                 _header = new DbHeader
                 {
                     MagicNumber = 0x5A564543,
-                    Version = 1,
+                    Version = 2,
                     VectorDimension = dim,
                     MaxCount = max,
                     CurrentCount = 0,
@@ -98,6 +104,15 @@ namespace QvecSharp
             _cachedEmptyNeighbors = new int[totalSlots];
             Array.Fill(_cachedEmptyNeighbors, -1);
             _cachedPadding = new byte[MetadataSize];
+
+            if (exists && _header.Version < 2)
+            {
+                MigrateToV2();
+            }
+            else if (exists)
+            {
+                RebuildGuidIndex();
+            }
         }
 
         // --- KÄRNA: SIMD MATEMATIK ---
@@ -121,20 +136,27 @@ namespace QvecSharp
         }
 
         // --- SKRIVNING ---
-        public void AddEntry(float[] vector, string metadata)
+        public Guid AddEntry(float[] vector, string metadata, Guid? externalId = null)
         {
             _lock.EnterWriteLock();
             try
             {
                 if (_header.CurrentCount >= _header.MaxCount) throw new Exception("DB Full");
 
+                Guid docId = externalId ?? Guid.NewGuid();
+
+                if (_guidIndex.ContainsKey(docId))
+                    return docId;
+
                 int index = _header.CurrentCount;
                 int level = RandomLayer();
 
                 WriteVectorToDisk(index, vector);
                 WriteMetadataToDisk(index, metadata);
+                WriteGuidToDisk(index, docId);
                 InitNeighborsOnDisk(index);
 
+                _guidIndex[docId] = index;
                 _header.CurrentCount++;
 
                 if (_header.CurrentCount == 1)
@@ -153,6 +175,7 @@ namespace QvecSharp
                 }
 
                 _headerAccessor.Write(0, ref _header);
+                return docId;
             }
             finally { _lock.ExitWriteLock(); }
         }
@@ -190,14 +213,12 @@ namespace QvecSharp
         /// <param name="topK"></param>
         /// <param name="filter"></param>
         /// <returns></returns>
-        public List<(int Id, float Score, string Metadata)> SearchSimple(float[] query, int topK, Func<string, bool> filter = null)
+        public List<(Guid Id, float Score, string Metadata)> SearchSimple(float[] query, int topK, Func<string, bool> filter = null)
         {
             _lock.EnterReadLock();
             try
             {
-                var candidates = new List<(int Id, float Score)>();
-                // Enkel linjär sökning som fallback för demo, 
-                // men du kan enkelt byta till den NSW-loop vi byggde.
+                var candidates = new List<(int Index, float Score)>();
                 for (int i = 0; i < _header.CurrentCount; i++)
                 {
                     string meta = GetMetadata(i);
@@ -212,7 +233,7 @@ namespace QvecSharp
 
                 return candidates.OrderByDescending(c => c.Score)
                                  .Take(topK)
-                                 .Select(c => (c.Id, c.Score, GetMetadata(c.Id)))
+                                 .Select(c => (ReadGuidFromDisk(c.Index), c.Score, GetMetadata(c.Index)))
                                  .ToList();
             }
             finally { _lock.ExitReadLock(); }
@@ -224,16 +245,13 @@ namespace QvecSharp
         /// <param name="topK"></param>
         /// <param name="filter"></param>
         /// <returns></returns>
-        public unsafe List<(int Id, float Score, string Metadata)> SearchSimpleParallel(float[] query, int topK, Func<string, bool> filter = null)
+        public unsafe List<(Guid Id, float Score, string Metadata)> SearchSimpleParallel(float[] query, int topK, Func<string, bool> filter = null)
         {
             int count = _header.CurrentCount;
             int dim = _header.VectorDimension;
 
-            // Vi skapar en trådsäker behållare för resultaten
-            // ConcurrentBag är bra, men för topp-K är en lokal array per tråd snabbare
-            var partialResults = new (int Id, float Score)[count];
+            var partialResults = new (int Index, float Score)[count];
 
-            // Hämta en rå pekare till början av vektordatan
             byte* basePtr = null;
             _dataAccessor.SafeMemoryMappedViewHandle.AcquirePointer(ref basePtr);
 
@@ -242,7 +260,6 @@ namespace QvecSharp
                 basePtr += _dataAccessor.PointerOffset;
                 float* vectorBasePtr = (float*)basePtr;
 
-                // PARALLELL LOOP: Utnyttjar alla CPU-kärnor
                 Parallel.For(0, count, i =>
                 {
                     string meta = GetMetadata(i);
@@ -252,10 +269,8 @@ namespace QvecSharp
                         return;
                     }
 
-                    // Skapa en Span direkt från minnesadressen (ingen kopiering!)
                     float* currentVecPtr = vectorBasePtr + (i * dim);
 
-                    // SIMD DotProduct direkt mot pekaren
                     float score = DotProductUnsafe(query, currentVecPtr, dim);
                     partialResults[i] = (i, score);
                 });
@@ -265,12 +280,11 @@ namespace QvecSharp
                 _dataAccessor.SafeMemoryMappedViewHandle.ReleasePointer();
             }
 
-            // Sortera och returnera topp-K
             return partialResults
                 .Where(r => r.Score > float.MinValue)
                 .OrderByDescending(r => r.Score)
                 .Take(topK)
-                .Select(r => (r.Id, r.Score, GetMetadata(r.Id)))
+                .Select(r => (ReadGuidFromDisk(r.Index), r.Score, GetMetadata(r.Index)))
                 .ToList();
         }
         /// <summary>
@@ -280,7 +294,7 @@ namespace QvecSharp
         /// <param name="filter"></param>
         /// <param name="topK"></param>
         /// <returns></returns>
-        public List<(int Id, float Score, string Metadata)> Search(float[] query, Func<string, bool> filter, int topK = 5, int efSearch = 50)
+        public List<(Guid Id, float Score, string Metadata)> Search(float[] query, Func<string, bool> filter, int topK = 5, int efSearch = 50)
         {
             _lock.EnterReadLock();
             try
@@ -299,7 +313,7 @@ namespace QvecSharp
                     .Where(r => filter(r.Meta))
                     .OrderByDescending(r => r.Score)
                     .Take(topK)
-                    .Select(r => (r.Id, r.Score, r.Meta))
+                    .Select(r => (ReadGuidFromDisk(r.Id), r.Score, r.Meta))
                     .ToList();
             }
             finally { _lock.ExitReadLock(); }
@@ -321,7 +335,7 @@ namespace QvecSharp
         /// <param name="topK"></param>
         /// <param name="efSearch">Sökbredd i bottenlagret. Högre = bättre recall men långsammare. Standard: 200.</param>
         /// <returns></returns>
-        public List<(int Id, float Score, string Metadata)> Search(float[] query, int topK = 5, int efSearch = 50)
+        public List<(Guid Id, float Score, string Metadata)> Search(float[] query, int topK = 5, int efSearch = 50)
         {
             _lock.EnterReadLock();
             try
@@ -338,7 +352,7 @@ namespace QvecSharp
                 return nearest
                     .OrderByDescending(r => r.Score)
                     .Take(topK)
-                    .Select(r => (r.Id, r.Score, GetMetadata(r.Id)))
+                    .Select(r => (ReadGuidFromDisk(r.Id), r.Score, GetMetadata(r.Id)))
                     .ToList();
             }
             finally { _lock.ExitReadLock(); }
@@ -702,13 +716,14 @@ namespace QvecSharp
             return vector;
         }
 
-        // SearchInternal används vid indexering för att hitta de k-närmaste grannarna
         private List<(int Id, float Score)> SearchInternal(float[] query, int k)
         {
-            // Här använder vi vår tidigare optimerade sökloop (NSW/HNSW)
-            // men vi returnerar de K bästa träffarna istället för bara en.
             var results = SearchSimpleParallel(query, k);
-            return results.Select(r => (r.Id, r.Score)).ToList();
+            return results.Select(r =>
+            {
+                _guidIndex.TryGetValue(r.Id, out int index);
+                return (index, r.Score);
+            }).ToList();
         }
 
         private void UpdateNeighbors(int nodeIndex, int[] neighbors)
@@ -753,6 +768,73 @@ namespace QvecSharp
             {
                 ArrayPool<byte>.Shared.Return(buffer);
             }
+        }
+
+        private void WriteGuidToDisk(int index, Guid guid)
+        {
+            long offset = (_guidSectionOffset - HeaderSize) + (long)index * GuidSize;
+            byte[] bytes = guid.ToByteArray();
+            _dataAccessor.WriteArray(offset, bytes, 0, GuidSize);
+        }
+
+        private Guid ReadGuidFromDisk(int index)
+        {
+            byte[] bytes = new byte[GuidSize];
+            long offset = (_guidSectionOffset - HeaderSize) + (long)index * GuidSize;
+            _dataAccessor.ReadArray(offset, bytes, 0, GuidSize);
+            return new Guid(bytes);
+        }
+
+        private void RebuildGuidIndex()
+        {
+            _guidIndex.Clear();
+            _guidIndex.EnsureCapacity(_header.CurrentCount);
+            for (int i = 0; i < _header.CurrentCount; i++)
+            {
+                Guid id = ReadGuidFromDisk(i);
+                _guidIndex[id] = i;
+            }
+        }
+
+        private void MigrateToV2()
+        {
+            for (int i = 0; i < _header.CurrentCount; i++)
+            {
+                Guid id = Guid.NewGuid();
+                WriteGuidToDisk(i, id);
+                _guidIndex[id] = i;
+            }
+            _header.Version = 2;
+            _headerAccessor.Write(0, ref _header);
+        }
+
+        public (float[] Vector, string Metadata)? GetByGuid(Guid id)
+        {
+            _lock.EnterReadLock();
+            try
+            {
+                if (!_guidIndex.TryGetValue(id, out int index))
+                    return null;
+                return (GetVector(index), GetMetadata(index));
+            }
+            finally { _lock.ExitReadLock(); }
+        }
+
+        public int SyncFrom(QvecDatabase source)
+        {
+            int synced = 0;
+            for (int i = 0; i < source._header.CurrentCount; i++)
+            {
+                Guid docId = source.ReadGuidFromDisk(i);
+                if (_guidIndex.ContainsKey(docId))
+                    continue;
+
+                float[] vector = source.GetVector(i);
+                string metadata = source.GetMetadata(i);
+                AddEntry(vector, metadata, externalId: docId);
+                synced++;
+            }
+            return synced;
         }
 
         public void Dispose()

@@ -13,15 +13,13 @@ namespace Qvec.Core.Client
             _db = db;
             _jsonInfo = jsonInfo;
         }
-        public void AddEntry(float[] vector, T item)
+        public Guid AddEntry(float[] vector, T item, Guid? externalId = null)
         {
-            // Serialisera objektet till JSON-metadata via Source Generator
             string metadata = JsonSerializer.Serialize(item, _jsonInfo);
-            _db.AddEntry(vector, metadata);
+            return _db.AddEntry(vector, metadata, externalId);
         }
         public List<TypedSearchResult<T>> Search(float[] query, Func<T, bool> filter, int topK = 5)
         {
-            // Använd HybridSearchHNSW med inbyggd deserialisering
             var rawResults = _db.Search(query, meta =>
             {
                 var obj = JsonSerializer.Deserialize(meta, _jsonInfo);
@@ -38,7 +36,7 @@ namespace Qvec.Core.Client
     }
     public class TypedSearchResult<T>
     {
-        public int Id { get; set; }
+        public Guid Id { get; set; }
         public float Score { get; set; }
         public T? Item { get; set; }
     }

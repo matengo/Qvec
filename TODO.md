@@ -1,18 +1,18 @@
-- [ ] **Guid som dokument-ID** — Implementera `Guid`-baserade dokument-ID:n för att möjliggöra synk mellan databaser. Designdokument: [docs/design-guid-id.md](docs/design-guid-id.md)
-- [ ] Lägg till Guid-sektion i filformatet (16 bytes/post efter metadata-sektionen)
-- [ ] Nya fält: `_guidSectionOffset`, `_guidIndex` dictionary
-- [ ] `WriteGuidToDisk` / `ReadGuidFromDisk` metoder
-- [ ] `RebuildGuidIndex` vid uppstart
-- [ ] Ändra `AddEntry` att returnera `Guid` och stödja `externalId`-parameter
-- [ ] Dedup-logik: hoppa över om Guid redan finns
-- [ ] Ändra alla `Search`-metoder att returnera `Guid` istället för `int` i resultat
-- [ ] `GetByGuid` lookup-metod
-- [ ] `SyncFrom(QvecDatabase source)` metod
-- [ ] Uppdatera `PartitionedQvecDatabase` att propagera Guid
-- [ ] Uppdatera `QvecClient<T>` returtyper
-- [ ] Uppdatera API-endpoints
-- [ ] Bakåtkompatibilitet: auto-migrering av v1-filer
-  - [ ] Bumpa `DbHeader.Version` till 2
+- [x] **Guid som dokument-ID** — Implementera `Guid`-baserade dokument-ID:n för att möjliggöra synk mellan databaser. Designdokument: [docs/design-guid-id.md](docs/design-guid-id.md)
+- [x] Lägg till Guid-sektion i filformatet (16 bytes/post efter metadata-sektionen)
+- [x] Nya fält: `_guidSectionOffset`, `_guidIndex` dictionary
+- [x] `WriteGuidToDisk` / `ReadGuidFromDisk` metoder
+- [x] `RebuildGuidIndex` vid uppstart
+- [x] Ändra `AddEntry` att returnera `Guid` och stödja `externalId`-parameter
+- [x] Dedup-logik: hoppa över om Guid redan finns
+- [x] Ändra alla `Search`-metoder att returnera `Guid` istället för `int` i resultat
+- [x] `GetByGuid` lookup-metod
+- [x] `SyncFrom(QvecDatabase source)` metod
+- [x] Uppdatera `PartitionedQvecDatabase` att propagera Guid
+- [x] Uppdatera `QvecClient<T>` returtyper
+- [x] Uppdatera API-endpoints
+- [x] Bakåtkompatibilitet: auto-migrering av v1-filer
+  - [x] Bumpa `DbHeader.Version` till 2
   - [ ] Uppdatera tester
 - [ ] **Delete** — Implementera soft-delete med tombstone-baserad strategi. Designdokument: [docs/design-update-delete.md](docs/design-update-delete.md)
   - [ ] Lägg till tombstone-sektion i filformatet (1 byte/post efter Guid-sektionen)

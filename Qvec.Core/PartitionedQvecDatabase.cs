@@ -24,36 +24,33 @@ public class PartitionedQvecDatabase : IDisposable
 
     private string GetPath(int index) => $"{_basePath}_part_{index}.zvec";
 
-    public void AddEntry(float[] vector, string metadata)
+    public Guid AddEntry(float[] vector, string metadata, Guid? externalId = null)
     {
         // Om senaste partitionen är full, skapa en ny
         var last = _partitions.LastOrDefault();
-        // (Här skulle vi i en riktig app kolla header.CurrentCount via en publik property)
 
-        if (last == null) // Förenklat för demo: lägg alltid i första eller skapa
+        if (last == null)
         {
             var newPart = new QvecDatabase(GetPath(_partitions.Count), _dim, _partitionSize);
             _partitions.Add(newPart);
             last = newPart;
         }
 
-        last.AddEntry(vector, metadata);
+        return last.AddEntry(vector, metadata, externalId);
     }
-    public List<(int Id, float Score, string Metadata)> Search(float[] query, int topK)
+    public List<(Guid Id, float Score, string Metadata)> Search(float[] query, int topK)
     {
-        // Sök i alla partitioner samtidigt på olika trådar
         return _partitions
-            .AsParallel() // PLINQ för att söka i alla filer parallellt
+            .AsParallel()
             .SelectMany(p => p.Search(query, topK))
             .OrderByDescending(r => r.Score)
             .Take(topK)
             .ToList();
     }
-    public List<(int Id, float Score, string Metadata)> Search(float[] query, Func<string, bool> filter, int topK)
+    public List<(Guid Id, float Score, string Metadata)> Search(float[] query, Func<string, bool> filter, int topK)
     {
-        // Sök i alla partitioner samtidigt på olika trådar
         return _partitions
-            .AsParallel() // PLINQ för att söka i alla filer parallellt
+            .AsParallel()
             .SelectMany(p => p.Search(query, filter, topK))
             .OrderByDescending(r => r.Score)
             .Take(topK)

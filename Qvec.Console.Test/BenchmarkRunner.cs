@@ -96,7 +96,7 @@ namespace Qvec.Console.Test
                 // 3. Hämta HNSW-resultat
                 var approx = db.Search(query, topK: 1).FirstOrDefault();
 
-                // 4. Kolla om de hittade samma ID
+                // 4. Kolla om de hittade samma dokument
                 if (approx.Id == truth.Id)
                 {
                     hits++;
