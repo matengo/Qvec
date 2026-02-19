@@ -137,3 +137,12 @@ Qvec is built for modern cloud environments:
 - **Update & Delete** — Tombstone-based soft-delete with HNSW graph repair, in-place metadata updates, and delete+re-insert for vector updates. Includes `Vacuum()` for storage reclamation. See [design doc](docs/design-update-delete.md).
 - **Sync Engine** — Opt-in edge-cloud synchronization. Connect multiple local Qvec databases to a central sync server so all connected instances stay in sync automatically. Offline-first with delta-sync via Azure Append Blob and real-time push via Azure Web PubSub. See [design doc](docs/design-sync-engine.md).
 - Multi-Vector Support (Image + Text in one entry)
+
+## License
+
+This project is licensed under the Apache License 2.0.
+
+## Commercial Use
+
+This software is free to use in commercial applications under the terms of the Apache 2.0 license.
+
