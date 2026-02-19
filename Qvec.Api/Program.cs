@@ -61,13 +61,25 @@ app.MapGet("/stats", (QvecDatabase db) =>
         fileSizeMb = new FileInfo("vectors.qvec").Length / 1024 / 1024
     });
 });
+app.MapDelete("/vectors/{guid}", (QvecDatabase db, Guid guid) =>
+{
+    bool deleted = db.Delete(guid);
+    return deleted ? Results.Ok(new { deleted = true, id = guid }) : Results.NotFound();
+});
+app.MapPut("/vectors/{guid}", (QvecDatabase db, Guid guid, UpdateRequest request) =>
+{
+    bool updated = db.Update(guid, request.Vector, request.Metadata);
+    return updated ? Results.Ok(new { updated = true, id = guid }) : Results.NotFound();
+});
 app.Run();
 
 
 
 public record SearchRequest(float[] Vector, int TopK = 5);
+public record UpdateRequest(float[]? Vector, string? Metadata);
 public record SearchResponse { public Guid Id { get; init; } public float Score { get; init; } public string Metadata { get; init; } }
 
 [JsonSerializable(typeof(SearchRequest))]
+[JsonSerializable(typeof(UpdateRequest))]
 [JsonSerializable(typeof(List<SearchResponse>))]
 internal partial class AppJsonSerializerContext : JsonSerializerContext { }

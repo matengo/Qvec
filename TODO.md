@@ -12,29 +12,29 @@
 - [x] Uppdatera `QvecClient<T>` returtyper
 - [x] Uppdatera API-endpoints
 - [x] Bakåtkompatibilitet: auto-migrering av v1-filer
-  - [x] Bumpa `DbHeader.Version` till 2
-  - [ ] Uppdatera tester
+- [x] Bumpa `DbHeader.Version` till 2
+- [ ] Uppdatera tester
 - [ ] **Delete** — Implementera soft-delete med tombstone-baserad strategi. Designdokument: [docs/design-update-delete.md](docs/design-update-delete.md)
-  - [ ] Lägg till tombstone-sektion i filformatet (1 byte/post efter Guid-sektionen)
-  - [ ] Nytt fält `DeletedCount` i `DbHeader`
-  - [ ] In-memory `_deletedIndices` HashSet, laddas vid uppstart
-  - [ ] `Delete(Guid id)` — markera tombstone, rensa grannreferenser i HNSW-grafen
-  - [ ] `DisconnectNode` — nollställ borttagen nods grannar och ta bort inkommande referenser
-  - [ ] `RemoveNeighborReference` — ta bort specifik nod ur en annan nods grannlista
-  - [ ] Hantera EntryPoint-migration vid delete av EntryPoint-nod
-  - [ ] Filtrera bort tombstones i alla sökmetoder (`Search`, `SearchSimple`, `SearchSimpleParallel`)
-  - [ ] Filtrera bort tombstones i `CalculateScore` / `SearchLayerNearest`
-  - [ ] Uppdatera `PartitionedQvecDatabase` med `Delete`
-  - [ ] Uppdatera `QvecClient<T>` med `DeleteEntry`
-  - [ ] Lägg till `DELETE /vectors/{guid}` endpoint i API
+  - [x] Lägg till tombstone-sektion i filformatet (1 byte/post efter Guid-sektionen)
+  - [x] Nytt fält `DeletedCount` i `DbHeader`
+  - [x] In-memory `_deletedIndices` HashSet, laddas vid uppstart
+  - [x] `Delete(Guid id)` — markera tombstone, rensa grannreferenser i HNSW-grafen
+  - [x] `DisconnectNode` — nollställ borttagen nods grannar och ta bort inkommande referenser
+  - [x] `RemoveNeighborReference` — ta bort specifik nod ur en annan nods grannlista
+  - [x] Hantera EntryPoint-migration vid delete av EntryPoint-nod
+  - [x] Filtrera bort tombstones i alla sökmetoder (`Search`, `SearchSimple`, `SearchSimpleParallel`)
+  - [x] Filtrera bort tombstones i `CalculateScore` / `SearchLayerNearest`
+  - [x] Uppdatera `PartitionedQvecDatabase` med `Delete`
+  - [x] Uppdatera `QvecClient<T>` med `DeleteEntry`
+  - [x] Lägg till `DELETE /vectors/{guid}` endpoint i API
   - [ ] Tester för delete, grannintegritet, EntryPoint-migration
 - [ ] **Update** — Implementera uppdatering av vektor och/eller metadata. Designdokument: [docs/design-update-delete.md](docs/design-update-delete.md)
-  - [ ] `UpdateMetadata(Guid id, string newMetadata)` — in-place överskrivning av metadata-slot
-  - [ ] `UpdateVector(Guid id, float[] newVector)` — soft-delete + re-insert med samma Guid
-  - [ ] `Update(Guid id, float[] newVector, string newMetadata)` — kombinerad metod
-  - [ ] Uppdatera `PartitionedQvecDatabase` med `Update`
-  - [ ] Uppdatera `QvecClient<T>` med `UpdateEntry`
-  - [ ] Lägg till `PUT /vectors/{guid}` endpoint i API
+  - [x] `UpdateMetadata(Guid id, string newMetadata)` — in-place överskrivning av metadata-slot
+  - [x] `UpdateVector(Guid id, float[] newVector)` — soft-delete + re-insert med samma Guid
+  - [x] `Update(Guid id, float[] newVector, string newMetadata)` — kombinerad metod
+  - [x] Uppdatera `PartitionedQvecDatabase` med `Update`
+  - [x] Uppdatera `QvecClient<T>` med `UpdateEntry`
+  - [x] Lägg till `PUT /vectors/{guid}` endpoint i API
   - [ ] Tester för metadata-update, vektor-update, kombinerad update
 - [ ] **Vacuum / Kompaktering** — Återvinn lagring efter många deletes. Designdokument: [docs/design-update-delete.md](docs/design-update-delete.md)
   - [ ] `Vacuum()` — skapa ny fil, kopiera aktiva poster, bygg om HNSW-graf

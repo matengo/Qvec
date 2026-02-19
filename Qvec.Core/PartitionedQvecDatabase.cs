@@ -56,5 +56,41 @@ public class PartitionedQvecDatabase : IDisposable
             .Take(topK)
             .ToList();
     }
+    public bool Delete(Guid id)
+    {
+        foreach (var partition in _partitions)
+        {
+            if (partition.Delete(id))
+                return true;
+        }
+        return false;
+    }
+    public bool UpdateMetadata(Guid id, string newMetadata)
+    {
+        foreach (var partition in _partitions)
+        {
+            if (partition.UpdateMetadata(id, newMetadata))
+                return true;
+        }
+        return false;
+    }
+    public bool UpdateVector(Guid id, float[] newVector)
+    {
+        foreach (var partition in _partitions)
+        {
+            if (partition.UpdateVector(id, newVector))
+                return true;
+        }
+        return false;
+    }
+    public bool Update(Guid id, float[] newVector, string newMetadata)
+    {
+        foreach (var partition in _partitions)
+        {
+            if (partition.Update(id, newVector, newMetadata))
+                return true;
+        }
+        return false;
+    }
     public void Dispose() => _partitions.ForEach(p => p.Dispose());
 }

@@ -21,6 +21,7 @@ namespace QvecSharp
         public int MaxNeighbors;
         public int EntryPoint;       // <--- Här sparar vi index för "topp-noden"
         public int EntryPointLevel;  // Lagret som EntryPoint tillhör
+        public int DeletedCount;     // Antal soft-deleted dokument
     }
 
     public class QvecDatabase : IDisposable
@@ -38,7 +39,9 @@ namespace QvecSharp
         private readonly long _graphSectionOffset;
         private readonly long _metadataSectionOffset;
         private readonly long _guidSectionOffset;
+        private readonly long _tombstoneSectionOffset;
         private readonly Dictionary<Guid, int> _guidIndex = new();
+        private readonly HashSet<int> _deletedIndices = new();
         private readonly int[] _cachedEmptyNeighbors;
         private readonly byte[] _cachedPadding;
 
@@ -71,7 +74,10 @@ namespace QvecSharp
             _guidSectionOffset = _metadataSectionOffset + metadataSpace;
             long guidSpace = (long)max * GuidSize;
 
-            long totalSize = _guidSectionOffset + guidSpace;
+            _tombstoneSectionOffset = _guidSectionOffset + guidSpace;
+            long tombstoneSpace = (long)max;
+
+            long totalSize = _tombstoneSectionOffset + tombstoneSpace;
 
             _mmf = MemoryMappedFile.CreateFromFile(path, FileMode.OpenOrCreate, null, totalSize);
             _headerAccessor = _mmf.CreateViewAccessor(0, HeaderSize);
@@ -85,7 +91,7 @@ namespace QvecSharp
                 _header = new DbHeader
                 {
                     MagicNumber = 0x5A564543,
-                    Version = 2,
+                    Version = 3,
                     VectorDimension = dim,
                     MaxCount = max,
                     CurrentCount = 0,
@@ -93,7 +99,8 @@ namespace QvecSharp
                     MaxLayers = maxLayers,
                     LayerProbability = 1.0 / Math.Log(maxNeighbors),
                     EntryPoint = 0,
-                    EntryPointLevel = 0
+                    EntryPointLevel = 0,
+                    DeletedCount = 0
                 };
                 _headerAccessor.Write(0, ref _header);
             }
@@ -112,6 +119,10 @@ namespace QvecSharp
             else if (exists)
             {
                 RebuildGuidIndex();
+            }
+            if (exists)
+            {
+                LoadTombstones();
             }
         }
 
@@ -221,6 +232,7 @@ namespace QvecSharp
                 var candidates = new List<(int Index, float Score)>();
                 for (int i = 0; i < _header.CurrentCount; i++)
                 {
+                    if (_deletedIndices.Contains(i)) continue;
                     string meta = GetMetadata(i);
                     if (filter != null && !filter(meta)) continue;
 
@@ -262,6 +274,11 @@ namespace QvecSharp
 
                 Parallel.For(0, count, i =>
                 {
+                    if (_deletedIndices.Contains(i))
+                    {
+                        partialResults[i] = (i, float.MinValue);
+                        return;
+                    }
                     string meta = GetMetadata(i);
                     if (filter != null && !filter(meta))
                     {
@@ -324,6 +341,7 @@ namespace QvecSharp
         {
             for (int i = 0; i < _header.CurrentCount; i++)
             {
+                if (_deletedIndices.Contains(i)) continue;
                 if (filter(GetMetadata(i))) return i;
             }
             return -1;
@@ -436,6 +454,7 @@ namespace QvecSharp
                     for (int j = 0; j < _header.MaxNeighbors; j++)
                     {
                         if (neighbors[j] == -1) break;
+                        if (_deletedIndices.Contains(neighbors[j])) continue;
                         float score = CalculateScore(query, neighbors[j]);
                         if (score > currentScore)
                         {
@@ -480,6 +499,7 @@ namespace QvecSharp
                         int neighbor = neighborBuffer[j];
                         if (neighbor < 0) break;
                         if (!visited.Add(neighbor)) continue;
+                        if (_deletedIndices.Contains(neighbor)) continue;
 
                         float score = CalculateScore(query, neighbor);
 
@@ -672,6 +692,7 @@ namespace QvecSharp
             {
                 for (int i = 0; i < _header.CurrentCount; i++)
                 {
+                    if (_deletedIndices.Contains(i)) continue;
                     for (int level = 0; level < _header.MaxLayers; level++)
                     {
                         GetNeighborsAtLevel(i, level, neighbors);
@@ -825,6 +846,8 @@ namespace QvecSharp
             int synced = 0;
             for (int i = 0; i < source._header.CurrentCount; i++)
             {
+                if (source._deletedIndices.Contains(i)) continue;
+
                 Guid docId = source.ReadGuidFromDisk(i);
                 if (_guidIndex.ContainsKey(docId))
                     continue;
@@ -835,6 +858,238 @@ namespace QvecSharp
                 synced++;
             }
             return synced;
+        }
+
+        public bool Delete(Guid id)
+        {
+            _lock.EnterWriteLock();
+            try
+            {
+                if (!_guidIndex.TryGetValue(id, out int index))
+                    return false;
+
+                SoftDelete(index);
+                _guidIndex.Remove(id);
+
+                _header.DeletedCount++;
+                _headerAccessor.Write(0, ref _header);
+                return true;
+            }
+            finally { _lock.ExitWriteLock(); }
+        }
+
+        private void SoftDelete(int index)
+        {
+            WriteTombstone(index, 1);
+            _deletedIndices.Add(index);
+            DisconnectNode(index);
+
+            if (_header.EntryPoint == index)
+            {
+                FindNewEntryPoint();
+            }
+        }
+
+        private void DisconnectNode(int deletedIndex)
+        {
+            int[] neighbors = ArrayPool<int>.Shared.Rent(_header.MaxNeighbors);
+            try
+            {
+                for (int level = 0; level < _header.MaxLayers; level++)
+                {
+                    GetNeighborsAtLevel(deletedIndex, level, neighbors);
+
+                    for (int j = 0; j < _header.MaxNeighbors; j++)
+                    {
+                        if (neighbors[j] == -1) break;
+                        RemoveNeighborReference(neighbors[j], level, deletedIndex);
+                    }
+
+                    InitNeighborsAtLevel(deletedIndex, level);
+                }
+            }
+            finally
+            {
+                ArrayPool<int>.Shared.Return(neighbors);
+            }
+        }
+
+        private void RemoveNeighborReference(int nodeIndex, int level, int targetToRemove)
+        {
+            int[] neighbors = ArrayPool<int>.Shared.Rent(_header.MaxNeighbors);
+            try
+            {
+                GetNeighborsAtLevel(nodeIndex, level, neighbors);
+
+                for (int i = 0; i < _header.MaxNeighbors; i++)
+                {
+                    if (neighbors[i] == targetToRemove)
+                    {
+                        for (int k = i; k < _header.MaxNeighbors - 1; k++)
+                            neighbors[k] = neighbors[k + 1];
+                        neighbors[_header.MaxNeighbors - 1] = -1;
+                        WriteNeighborsAtLevel(nodeIndex, level, neighbors);
+                        return;
+                    }
+                }
+            }
+            finally
+            {
+                ArrayPool<int>.Shared.Return(neighbors);
+            }
+        }
+
+        private void InitNeighborsAtLevel(int nodeIndex, int level)
+        {
+            long position = (_graphSectionOffset - HeaderSize) +
+                            (long)nodeIndex * _header.MaxLayers * _header.MaxNeighbors * sizeof(int) +
+                            (long)level * _header.MaxNeighbors * sizeof(int);
+
+            int[] empty = ArrayPool<int>.Shared.Rent(_header.MaxNeighbors);
+            try
+            {
+                Array.Fill(empty, -1, 0, _header.MaxNeighbors);
+                _dataAccessor.WriteArray(position, empty, 0, _header.MaxNeighbors);
+            }
+            finally
+            {
+                ArrayPool<int>.Shared.Return(empty);
+            }
+        }
+
+        private void FindNewEntryPoint()
+        {
+            for (int i = 0; i < _header.CurrentCount; i++)
+            {
+                if (!_deletedIndices.Contains(i))
+                {
+                    _header.EntryPoint = i;
+                    _header.EntryPointLevel = 0;
+                    return;
+                }
+            }
+            _header.EntryPoint = 0;
+            _header.EntryPointLevel = 0;
+        }
+
+        private void WriteTombstone(int index, byte value)
+        {
+            long offset = (_tombstoneSectionOffset - HeaderSize) + index;
+            _dataAccessor.Write(offset, value);
+        }
+
+        private byte ReadTombstone(int index)
+        {
+            long offset = (_tombstoneSectionOffset - HeaderSize) + index;
+            return _dataAccessor.ReadByte(offset);
+        }
+
+        private void LoadTombstones()
+        {
+            _deletedIndices.Clear();
+            for (int i = 0; i < _header.CurrentCount; i++)
+            {
+                if (ReadTombstone(i) != 0)
+                {
+                    _deletedIndices.Add(i);
+                    _guidIndex.Remove(ReadGuidFromDisk(i));
+                }
+            }
+        }
+
+        public bool UpdateMetadata(Guid id, string newMetadata)
+        {
+            _lock.EnterWriteLock();
+            try
+            {
+                if (!_guidIndex.TryGetValue(id, out int index))
+                    return false;
+
+                WriteMetadataToDisk(index, newMetadata);
+                return true;
+            }
+            finally { _lock.ExitWriteLock(); }
+        }
+
+        public bool UpdateVector(Guid id, float[] newVector)
+        {
+            _lock.EnterWriteLock();
+            try
+            {
+                if (!_guidIndex.TryGetValue(id, out int oldIndex))
+                    return false;
+
+                string metadata = GetMetadata(oldIndex);
+                _guidIndex.Remove(id);
+                SoftDelete(oldIndex);
+                _header.DeletedCount++;
+
+                AddEntryInternal(newVector, metadata, id);
+                return true;
+            }
+            finally { _lock.ExitWriteLock(); }
+        }
+
+        public bool Update(Guid id, float[] newVector, string newMetadata)
+        {
+            _lock.EnterWriteLock();
+            try
+            {
+                if (!_guidIndex.TryGetValue(id, out int oldIndex))
+                    return false;
+
+                if (newVector == null)
+                {
+                    WriteMetadataToDisk(oldIndex, newMetadata);
+                    return true;
+                }
+
+                string metadata = newMetadata ?? GetMetadata(oldIndex);
+                _guidIndex.Remove(id);
+                SoftDelete(oldIndex);
+                _header.DeletedCount++;
+
+                AddEntryInternal(newVector, metadata, id);
+                return true;
+            }
+            finally { _lock.ExitWriteLock(); }
+        }
+
+        private Guid AddEntryInternal(float[] vector, string metadata, Guid docId)
+        {
+            if (_header.CurrentCount >= _header.MaxCount) throw new Exception("DB Full");
+
+            if (_guidIndex.ContainsKey(docId))
+                return docId;
+
+            int index = _header.CurrentCount;
+            int level = RandomLayer();
+
+            WriteVectorToDisk(index, vector);
+            WriteMetadataToDisk(index, metadata);
+            WriteGuidToDisk(index, docId);
+            InitNeighborsOnDisk(index);
+
+            _guidIndex[docId] = index;
+            _header.CurrentCount++;
+
+            if (_header.CurrentCount - _header.DeletedCount == 1)
+            {
+                _header.EntryPoint = index;
+                _header.EntryPointLevel = level;
+            }
+            else
+            {
+                ConnectNewNode(index, vector, level);
+                if (level > _header.EntryPointLevel)
+                {
+                    _header.EntryPoint = index;
+                    _header.EntryPointLevel = level;
+                }
+            }
+
+            _headerAccessor.Write(0, ref _header);
+            return docId;
         }
 
         public void Dispose()

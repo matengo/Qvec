@@ -33,6 +33,20 @@ namespace Qvec.Core.Client
                 Item = JsonSerializer.Deserialize(r.Metadata, _jsonInfo)
             }).ToList();
         }
+        public bool DeleteEntry(Guid id)
+        {
+            return _db.Delete(id);
+        }
+        public bool UpdateEntry(Guid id, float[] newVector, T newItem)
+        {
+            string metadata = JsonSerializer.Serialize(newItem, _jsonInfo);
+            return _db.Update(id, newVector, metadata);
+        }
+        public bool UpdateMetadata(Guid id, T newItem)
+        {
+            string metadata = JsonSerializer.Serialize(newItem, _jsonInfo);
+            return _db.UpdateMetadata(id, metadata);
+        }
     }
     public class TypedSearchResult<T>
     {
