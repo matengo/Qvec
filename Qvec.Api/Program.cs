@@ -116,7 +116,7 @@ app.MapGet("/stats", (QvecDatabase db) =>
     return Results.Json(new StatsResponse(
         db.GetCount(),
         db.GetEntryPoint(),
-        stats.Select(kv => new { Layer = kv.Key, Count = kv.Value }),
+        stats.Select(kv => new LayerCount(kv.Key, kv.Value)),
         new FileInfo("vectors.qvec").Length / 1024 / 1024
     ), AppJsonSerializerContext.Default.StatsResponse);
 });
@@ -130,7 +130,8 @@ public record UpdateEntryRequest(float[] Vector, string Metadata);
 public record SearchResponse { public int Id { get; init; } public float Score { get; init; } public required string Metadata { get; init; } }
 public record MessageResponse(string Message);
 public record HealthResponse(string Status, int Count);
-public record StatsResponse(int TotalVectors, int EntryPointIndex, object LayerDistribution, long FileSizeMb);
+public record LayerCount(int Layer, int Count);
+public record StatsResponse(int TotalVectors, int EntryPointIndex, IEnumerable<LayerCount> LayerDistribution, long FileSizeMb);
 
 [JsonSerializable(typeof(SearchRequest))]
 [JsonSerializable(typeof(AddEntryRequest))]

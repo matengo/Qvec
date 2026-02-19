@@ -33,6 +33,7 @@ namespace QvecSharp
         private DbHeader _header;
         private const int HeaderSize = 1024;
         private const int MetadataSize = 512;
+        private const string DeletedMarker = "__DELETED__";
         private readonly long _vectorSectionOffset;
         private readonly long _graphSectionOffset;
         private readonly long _metadataSectionOffset;
@@ -162,8 +163,9 @@ namespace QvecSharp
             _lock.EnterWriteLock();
             try
             {
-                if (index < 0 || index >= _header.CurrentCount)
-                    throw new ArgumentOutOfRangeException(nameof(index), "Index out of range");
+                ValidateIndex(index);
+                if (IsDeleted(index))
+                    throw new InvalidOperationException($"Cannot update deleted entry at index {index}");
 
                 // Update vector and metadata
                 WriteVectorToDisk(index, vector);
@@ -181,11 +183,12 @@ namespace QvecSharp
             _lock.EnterWriteLock();
             try
             {
-                if (index < 0 || index >= _header.CurrentCount)
-                    throw new ArgumentOutOfRangeException(nameof(index), "Index out of range");
+                ValidateIndex(index);
+                if (IsDeleted(index))
+                    throw new InvalidOperationException($"Entry at index {index} is already deleted");
 
                 // Mark as deleted by clearing the metadata with a special marker
-                WriteMetadataToDisk(index, "__DELETED__");
+                WriteMetadataToDisk(index, DeletedMarker);
 
                 // Clear the vector to zeros
                 float[] zeroVector = new float[_header.VectorDimension];
@@ -198,6 +201,12 @@ namespace QvecSharp
                 RemoveNodeFromGraph(index);
             }
             finally { _lock.ExitWriteLock(); }
+        }
+
+        private void ValidateIndex(int index)
+        {
+            if (index < 0 || index >= _header.CurrentCount)
+                throw new ArgumentOutOfRangeException(nameof(index), "Index out of range");
         }
         private void WriteVectorToDisk(int index, float[] vector)
         {
@@ -230,7 +239,7 @@ namespace QvecSharp
         private bool IsDeleted(int index)
         {
             string meta = GetMetadata(index);
-            return meta.StartsWith("__DELETED__");
+            return meta.StartsWith(DeletedMarker);
         }
         /// <summary>
         /// SimpleSearch är en grundläggande linjär sökning som inte utnyttjar HNSW-graf

@@ -360,4 +360,7 @@ MigrationBackup/
 .ionide/
 
 # Fody - auto-generated XML schema
-FodyWeavers.xsd*.qvec
+FodyWeavers.xsd
+
+# Qvec database files
+*.qvec
