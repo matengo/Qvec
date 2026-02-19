@@ -29,18 +29,6 @@ Unlike client-server vector DBs, Qvec runs in-process, utilizing **MemoryMappedF
 
 ---
 
-## 🛠 Installation
-
-Since Qvec is designed for high-performance embedding, simply include the `VectorDatabase.cs` core in your .NET 10 project.
-
-```xml
-<PropertyGroup>
-  <TargetFramework>net10.0</TargetFramework>
-  <PublishAot>true</PublishAot>
-  <OptimizationPreference>Speed</OptimizationPreference>
-</PropertyGroup>
-```
-
 ## 💻 Quick Start
 
 ## Initialize and Add Data
