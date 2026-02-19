@@ -46,19 +46,7 @@ namespace QvecSharp
         private readonly byte[] _cachedPadding;
 
 
-        public bool IsHealthy()
-        {
-            try
-            {
-                _headerAccessor.Read(0, out DbHeader currentHeader);
-                // Kontrollera Magic Number (0x5A564543) och att dimensionen är giltig
-                return currentHeader.MagicNumber == 0x5A564543 && currentHeader.VectorDimension > 0;
-            }
-            catch
-            {
-                return false;
-            }
-        }
+        
         public QvecDatabase(string path, int dim = 1536, int max = 1000, int maxNeighbors = 32, int maxLayers = 5)
         {
             bool exists = File.Exists(path);
@@ -438,7 +426,6 @@ namespace QvecSharp
                 }
             }
         }
-
         private int GreedyClosest(float[] query, int entryPoint, int level)
         {
             int current = entryPoint;
@@ -471,7 +458,6 @@ namespace QvecSharp
             }
             return current;
         }
-
         private (int Id, float Score)[] SearchLayerNearest(float[] query, int entryPoint, int level, int ef)
         {
             var visited = new HashSet<int> { entryPoint };
@@ -679,6 +665,19 @@ namespace QvecSharp
             finally
             {
                 _lock.ExitReadLock();
+            }
+        }
+        public bool IsHealthy()
+        {
+            try
+            {
+                _headerAccessor.Read(0, out DbHeader currentHeader);
+                // Kontrollera Magic Number (0x5A564543) och att dimensionen är giltig
+                return currentHeader.MagicNumber == 0x5A564543 && currentHeader.VectorDimension > 0;
+            }
+            catch
+            {
+                return false;
             }
         }
         public Dictionary<int, int> GetStats()
