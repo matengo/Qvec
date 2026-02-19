@@ -134,4 +134,5 @@ Qvec is built for modern cloud environments:
 ## 📜 Roadmap
 
 - **Guid Document IDs** — Replace sequential `int` IDs with `Guid` as the logical document identifier to enable multi-database sync, deduplication, and stable external references. Internal storage remains index-based for zero-overhead disk access. See [design doc](docs/design-guid-id.md).
+- **Update & Delete** — Tombstone-based soft-delete with HNSW graph repair, in-place metadata updates, and delete+re-insert for vector updates. Includes `Vacuum()` for storage reclamation. See [design doc](docs/design-update-delete.md).
 - Multi-Vector Support (Image + Text in one entry)

@@ -12,5 +12,31 @@
 - [ ] Uppdatera `QvecClient<T>` returtyper
 - [ ] Uppdatera API-endpoints
 - [ ] Bakåtkompatibilitet: auto-migrering av v1-filer
-- [ ] Bumpa `DbHeader.Version` till 2
-- [ ] Uppdatera tester
+  - [ ] Bumpa `DbHeader.Version` till 2
+  - [ ] Uppdatera tester
+- [ ] **Delete** — Implementera soft-delete med tombstone-baserad strategi. Designdokument: [docs/design-update-delete.md](docs/design-update-delete.md)
+  - [ ] Lägg till tombstone-sektion i filformatet (1 byte/post efter Guid-sektionen)
+  - [ ] Nytt fält `DeletedCount` i `DbHeader`
+  - [ ] In-memory `_deletedIndices` HashSet, laddas vid uppstart
+  - [ ] `Delete(Guid id)` — markera tombstone, rensa grannreferenser i HNSW-grafen
+  - [ ] `DisconnectNode` — nollställ borttagen nods grannar och ta bort inkommande referenser
+  - [ ] `RemoveNeighborReference` — ta bort specifik nod ur en annan nods grannlista
+  - [ ] Hantera EntryPoint-migration vid delete av EntryPoint-nod
+  - [ ] Filtrera bort tombstones i alla sökmetoder (`Search`, `SearchSimple`, `SearchSimpleParallel`)
+  - [ ] Filtrera bort tombstones i `CalculateScore` / `SearchLayerNearest`
+  - [ ] Uppdatera `PartitionedQvecDatabase` med `Delete`
+  - [ ] Uppdatera `QvecClient<T>` med `DeleteEntry`
+  - [ ] Lägg till `DELETE /vectors/{guid}` endpoint i API
+  - [ ] Tester för delete, grannintegritet, EntryPoint-migration
+- [ ] **Update** — Implementera uppdatering av vektor och/eller metadata. Designdokument: [docs/design-update-delete.md](docs/design-update-delete.md)
+  - [ ] `UpdateMetadata(Guid id, string newMetadata)` — in-place överskrivning av metadata-slot
+  - [ ] `UpdateVector(Guid id, float[] newVector)` — soft-delete + re-insert med samma Guid
+  - [ ] `Update(Guid id, float[] newVector, string newMetadata)` — kombinerad metod
+  - [ ] Uppdatera `PartitionedQvecDatabase` med `Update`
+  - [ ] Uppdatera `QvecClient<T>` med `UpdateEntry`
+  - [ ] Lägg till `PUT /vectors/{guid}` endpoint i API
+  - [ ] Tester för metadata-update, vektor-update, kombinerad update
+- [ ] **Vacuum / Kompaktering** — Återvinn lagring efter många deletes. Designdokument: [docs/design-update-delete.md](docs/design-update-delete.md)
+  - [ ] `Vacuum()` — skapa ny fil, kopiera aktiva poster, bygg om HNSW-graf
+  - [ ] Auto-vacuum trigger vid `DeletedCount / CurrentCount > threshold`
+  - [ ] Tester för vacuum, verifiering av data-integritet efter kompaktering
