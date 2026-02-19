@@ -1,4 +1,9 @@
 <Solution>
+  <Folder Name="/Files/">
+    <File Path="README.md" />
+    <File Path="SyncEngineplan.md" />
+    <File Path="TODO.md" />
+  </Folder>
   <Project Path="Qvec.Api/Qvec.Api.csproj" Id="deeefb8b-bf4d-4a3a-a8eb-ef59bd50f54b" />
   <Project Path="Qvec.Console.Test/Qvec.Console.Test.csproj" Id="07307dc3-afe3-4fcf-8341-9cf951665a75" />
   <Project Path="Qvec.Console/Qvec.Console.csproj" Id="5a92a05d-d3e9-4ca4-9e06-89b48ce62fbb" />

@@ -101,6 +101,23 @@ var results = client.Search(queryVector, p => p.Price < 15000 && p.InStock);
 ```
 
 
+## 🎯 Use Cases
+
+Qvec is built as an **embedded** vector database — no server, no network overhead, just a library running in your process. This makes it ideal for scenarios where low latency, offline capability, and small footprint matter:
+
+| Scenario | Why Qvec? |
+| :--- | :--- |
+| **AI Agents on the Edge** | Run RAG-powered agents on IoT gateways, factory floors, or retail kiosks without depending on cloud connectivity. |
+| **Agent Memory** | Give autonomous agents persistent, searchable long-term memory that lives alongside the agent process. |
+| **Embedded / Industrial Software** | Native AOT + MemoryMappedFiles keeps the footprint tiny — perfect for instruments, PLCs, and headless services. |
+| **Mobile & Tablet Apps** | Ship a local vector store inside .NET MAUI or Uno Platform apps for offline semantic search. |
+| **Desktop Copilots & Plugins** | Add similarity search to WPF / WinUI / Avalonia apps — no Docker, no external service. |
+| **Serverless & Functions** | Cold-start friendly: a single-file AOT binary boots instantly in Azure Functions or AWS Lambda. |
+| **Privacy-Sensitive Workloads** | Keep embeddings on-device for healthcare, legal, or finance apps where data must never leave the machine. |
+| **Rapid Prototyping** | One NuGet reference, zero infrastructure — go from idea to working vector search in minutes. |
+
+---
+
 ## 🏗 Architecture
 
 1. **Header:** Stores metadata, EntryPoint, and layer distribution.
