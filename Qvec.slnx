@@ -1,7 +1,11 @@
 <Solution>
+  <Folder Name="/docs/">
+    <File Path="docs/design-guid-id.md" />
+    <File Path="docs/design-sync-engine.md" />
+    <File Path="docs/design-update-delete.md" />
+  </Folder>
   <Folder Name="/Files/">
     <File Path="README.md" />
-    <File Path="SyncEngineplan.md" />
     <File Path="TODO.md" />
   </Folder>
   <Project Path="Qvec.Api/Qvec.Api.csproj" Id="deeefb8b-bf4d-4a3a-a8eb-ef59bd50f54b" />
