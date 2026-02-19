@@ -40,3 +40,26 @@
   - [ ] `Vacuum()` — skapa ny fil, kopiera aktiva poster, bygg om HNSW-graf
   - [ ] Auto-vacuum trigger vid `DeletedCount / CurrentCount > threshold`
   - [ ] Tester för vacuum, verifiering av data-integritet efter kompaktering
+- [ ] **Sync Engine** — Opt-in edge-cloud synkronisering för flera lokala Qvec-databaser. Designdokument: [docs/design-sync-engine.md](docs/design-sync-engine.md)
+  - [ ] Nytt projekt `Qvec.Sync` (klient-sida, refererar `Qvec.Core`)
+    - [ ] `SyncEvent` / `SyncEventHeader` — binärt eventformat (Add, UpdateVector, UpdateMetadata, Delete)
+    - [ ] `SyncState` — lokal offset-tracking, persisteras till disk
+    - [ ] `SyncOptions` — konfiguration (ServerUrl, TransportType, ConnectionString, StateFilePath)
+    - [ ] `ISyncTransport` — abstrakt transport-interface (Send, Subscribe, PullDelta)
+    - [ ] `WebPubSubTransport` — Azure Web PubSub implementation
+    - [ ] `SseTransport` — Server-Sent Events implementation
+    - [ ] `WebSocketTransport` — Raw WebSocket implementation
+    - [ ] `QvecSyncAgent` — huvudklass som wrappar `QvecDatabase`
+      - [ ] `StartAsync` — initial catch-up (PullDelta) + starta realtidsprenumeration
+      - [ ] `AddEntryAsync` — lokal skrivning + outbound event till server
+      - [ ] `UpdateAsync` — lokal uppdatering + outbound event till server
+      - [ ] `DeleteAsync` — lokal delete + outbound event till server
+      - [ ] `OnRemoteEvent` — applicera inkommande events lokalt (idempotent via Guid)
+      - [ ] Outbound event queue med retry-logik för offline-scenarier
+    - [ ] Tester för SyncAgent, delta-sync, reconnect catch-up, dedup
+  - [ ] Nytt projekt `Qvec.Sync.Server` (server-sida, Azure Function relay)
+    - [ ] `POST /events` — ta emot event, skriva till Append Blob, notifiera via Web PubSub
+    - [ ] `GET /delta?from={offset}` — returnera events sedan offset via Range Request
+    - [ ] `GET /status` — blob-storlek och antal anslutna klienter
+    - [ ] Konfliktstrategi: Last-Write-Wins (LWW) baserat på Append Blob-ordning
+    - [ ] Tester för server-endpoints, concurrent appends, delta-requests

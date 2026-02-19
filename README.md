@@ -135,4 +135,5 @@ Qvec is built for modern cloud environments:
 
 - **Guid Document IDs** — Replace sequential `int` IDs with `Guid` as the logical document identifier to enable multi-database sync, deduplication, and stable external references. Internal storage remains index-based for zero-overhead disk access. See [design doc](docs/design-guid-id.md).
 - **Update & Delete** — Tombstone-based soft-delete with HNSW graph repair, in-place metadata updates, and delete+re-insert for vector updates. Includes `Vacuum()` for storage reclamation. See [design doc](docs/design-update-delete.md).
+- **Sync Engine** — Opt-in edge-cloud synchronization. Connect multiple local Qvec databases to a central sync server so all connected instances stay in sync automatically. Offline-first with delta-sync via Azure Append Blob and real-time push via Azure Web PubSub. See [design doc](docs/design-sync-engine.md).
 - Multi-Vector Support (Image + Text in one entry)
