@@ -10,7 +10,7 @@ builder.Services.ConfigureHttpJsonOptions(options =>
 });
 builder.Services.AddSingleton<QvecDatabase>(sp =>
 {
-    // Här skickar du in dina inställningar (t.ex. från appsettings.json)
+    // Hï¿½r skickar du in dina instï¿½llningar (t.ex. frï¿½n appsettings.json)
     return new QvecDatabase("vectors.qvec", dim: 1536, max: 100000);
 });
 
@@ -41,6 +41,66 @@ app.MapPost("/search", (QvecDatabase db, SearchRequest request) =>
 
     return Results.Json(response, AppJsonSerializerContext.Default.ListSearchResponse);
 });
+
+app.MapPost("/entry", (QvecDatabase db, AddEntryRequest request) =>
+{
+    if (request.Vector == null || request.Vector.Length == 0)
+        return Results.BadRequest("Vektor saknas");
+    
+    if (string.IsNullOrEmpty(request.Metadata))
+        return Results.BadRequest("Metadata saknas");
+
+    try
+    {
+        db.AddEntry(request.Vector, request.Metadata);
+        return Results.Ok(new { message = "Entry added successfully" });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem($"Failed to add entry: {ex.Message}", statusCode: 500);
+    }
+});
+
+app.MapPut("/entry/{id}", (QvecDatabase db, int id, UpdateEntryRequest request) =>
+{
+    if (request.Vector == null || request.Vector.Length == 0)
+        return Results.BadRequest("Vektor saknas");
+    
+    if (string.IsNullOrEmpty(request.Metadata))
+        return Results.BadRequest("Metadata saknas");
+
+    try
+    {
+        db.UpdateEntry(id, request.Vector, request.Metadata);
+        return Results.Ok(new { message = "Entry updated successfully" });
+    }
+    catch (ArgumentOutOfRangeException)
+    {
+        return Results.NotFound(new { message = $"Entry with id {id} not found" });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem($"Failed to update entry: {ex.Message}", statusCode: 500);
+    }
+});
+
+app.MapDelete("/entry/{id}", (QvecDatabase db, int id) =>
+{
+    try
+    {
+        db.DeleteEntry(id);
+        return Results.Ok(new { message = "Entry deleted successfully" });
+    }
+    catch (ArgumentOutOfRangeException)
+    {
+        return Results.NotFound(new { message = $"Entry with id {id} not found" });
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem($"Failed to delete entry: {ex.Message}", statusCode: 500);
+    }
+});
+
 app.MapGet("/health", (QvecDatabase db) =>
 {
     bool healthy = db.IsHealthy();
@@ -56,7 +116,7 @@ app.MapGet("/stats", (QvecDatabase db) =>
     return Results.Ok(new
     {
         totalVectors = db.GetCount(),
-        entryPointIndex = db.GetEntryPoint(), // Lägg till en enkel getter för _header.EntryPoint
+        entryPointIndex = db.GetEntryPoint(), // Lï¿½gg till en enkel getter fï¿½r _header.EntryPoint
         layerDistribution = stats.Select(kv => new { Layer = kv.Key, Count = kv.Value }),
         fileSizeMb = new FileInfo("vectors.qvec").Length / 1024 / 1024
     });
@@ -66,8 +126,12 @@ app.Run();
 
 
 public record SearchRequest(float[] Vector, int TopK = 5);
-public record SearchResponse { public int Id { get; init; } public float Score { get; init; } public string Metadata { get; init; } }
+public record AddEntryRequest(float[] Vector, string Metadata);
+public record UpdateEntryRequest(float[] Vector, string Metadata);
+public record SearchResponse { public int Id { get; init; } public float Score { get; init; } public required string Metadata { get; init; } }
 
 [JsonSerializable(typeof(SearchRequest))]
+[JsonSerializable(typeof(AddEntryRequest))]
+[JsonSerializable(typeof(UpdateEntryRequest))]
 [JsonSerializable(typeof(List<SearchResponse>))]
 internal partial class AppJsonSerializerContext : JsonSerializerContext { }

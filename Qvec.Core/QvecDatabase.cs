@@ -156,6 +156,49 @@ namespace QvecSharp
             }
             finally { _lock.ExitWriteLock(); }
         }
+
+        public void UpdateEntry(int index, float[] vector, string metadata)
+        {
+            _lock.EnterWriteLock();
+            try
+            {
+                if (index < 0 || index >= _header.CurrentCount)
+                    throw new ArgumentOutOfRangeException(nameof(index), "Index out of range");
+
+                // Update vector and metadata
+                WriteVectorToDisk(index, vector);
+                WriteMetadataToDisk(index, metadata);
+
+                // Rebuild connections for this node with the new vector
+                int level = GetNodeLevel(index);
+                RebuildNodeConnections(index, vector, level);
+            }
+            finally { _lock.ExitWriteLock(); }
+        }
+
+        public void DeleteEntry(int index)
+        {
+            _lock.EnterWriteLock();
+            try
+            {
+                if (index < 0 || index >= _header.CurrentCount)
+                    throw new ArgumentOutOfRangeException(nameof(index), "Index out of range");
+
+                // Mark as deleted by clearing the metadata with a special marker
+                WriteMetadataToDisk(index, "__DELETED__");
+
+                // Clear the vector to zeros
+                float[] zeroVector = new float[_header.VectorDimension];
+                WriteVectorToDisk(index, zeroVector);
+
+                // Clear all neighbor connections
+                InitNeighborsOnDisk(index);
+
+                // Remove this node from neighbors of other nodes
+                RemoveNodeFromGraph(index);
+            }
+            finally { _lock.ExitWriteLock(); }
+        }
         private void WriteVectorToDisk(int index, float[] vector)
         {
             // Beräkna offset: Hoppa över Header, sedan alla tidigare vektorer
@@ -183,6 +226,12 @@ namespace QvecSharp
             long offset = _graphSectionOffset + (long)index * _cachedEmptyNeighbors.Length * sizeof(int);
             _dataAccessor.WriteArray(offset - HeaderSize, _cachedEmptyNeighbors, 0, _cachedEmptyNeighbors.Length);
         }
+
+        private bool IsDeleted(int index)
+        {
+            string meta = GetMetadata(index);
+            return meta.StartsWith("__DELETED__");
+        }
         /// <summary>
         /// SimpleSearch är en grundläggande linjär sökning som inte utnyttjar HNSW-graf
         /// </summary>
@@ -190,7 +239,7 @@ namespace QvecSharp
         /// <param name="topK"></param>
         /// <param name="filter"></param>
         /// <returns></returns>
-        public List<(int Id, float Score, string Metadata)> SearchSimple(float[] query, int topK, Func<string, bool> filter = null)
+        public List<(int Id, float Score, string Metadata)> SearchSimple(float[] query, int topK, Func<string, bool>? filter = null)
         {
             _lock.EnterReadLock();
             try
@@ -200,6 +249,8 @@ namespace QvecSharp
                 // men du kan enkelt byta till den NSW-loop vi byggde.
                 for (int i = 0; i < _header.CurrentCount; i++)
                 {
+                    if (IsDeleted(i)) continue;
+
                     string meta = GetMetadata(i);
                     if (filter != null && !filter(meta)) continue;
 
@@ -224,7 +275,7 @@ namespace QvecSharp
         /// <param name="topK"></param>
         /// <param name="filter"></param>
         /// <returns></returns>
-        public unsafe List<(int Id, float Score, string Metadata)> SearchSimpleParallel(float[] query, int topK, Func<string, bool> filter = null)
+        public unsafe List<(int Id, float Score, string Metadata)> SearchSimpleParallel(float[] query, int topK, Func<string, bool>? filter = null)
         {
             int count = _header.CurrentCount;
             int dim = _header.VectorDimension;
@@ -245,6 +296,12 @@ namespace QvecSharp
                 // PARALLELL LOOP: Utnyttjar alla CPU-kärnor
                 Parallel.For(0, count, i =>
                 {
+                    if (IsDeleted(i))
+                    {
+                        partialResults[i] = (i, float.MinValue);
+                        return;
+                    }
+
                     string meta = GetMetadata(i);
                     if (filter != null && !filter(meta))
                     {
@@ -295,6 +352,7 @@ namespace QvecSharp
                 var nearest = SearchLayerNearest(query, entryPoint, 0, ef);
 
                 return nearest
+                    .Where(r => !IsDeleted(r.Id))
                     .Select(r => (r.Id, r.Score, Meta: GetMetadata(r.Id)))
                     .Where(r => filter(r.Meta))
                     .OrderByDescending(r => r.Score)
@@ -336,6 +394,7 @@ namespace QvecSharp
                 var nearest = SearchLayerNearest(query, entryPoint, 0, ef);
 
                 return nearest
+                    .Where(r => !IsDeleted(r.Id))
                     .OrderByDescending(r => r.Score)
                     .Take(topK)
                     .Select(r => (r.Id, r.Score, GetMetadata(r.Id)))
@@ -752,6 +811,100 @@ namespace QvecSharp
             finally
             {
                 ArrayPool<byte>.Shared.Return(buffer);
+            }
+        }
+
+        private int GetNodeLevel(int index)
+        {
+            // Determine the level of a node by checking which layers have neighbors
+            int[] neighbors = ArrayPool<int>.Shared.Rent(_header.MaxNeighbors);
+            try
+            {
+                for (int level = _header.MaxLayers - 1; level >= 0; level--)
+                {
+                    GetNeighborsAtLevel(index, level, neighbors);
+                    if (neighbors[0] != -1)
+                    {
+                        return level;
+                    }
+                }
+                return 0;
+            }
+            finally
+            {
+                ArrayPool<int>.Shared.Return(neighbors);
+            }
+        }
+
+        private void RebuildNodeConnections(int nodeIndex, float[] vector, int level)
+        {
+            // Clear existing connections
+            InitNeighborsOnDisk(nodeIndex);
+
+            // Rebuild connections similar to adding a new node
+            if (_header.CurrentCount > 1)
+            {
+                int currentElement = _header.EntryPoint;
+
+                for (int lv = _header.EntryPointLevel; lv > level; lv--)
+                {
+                    currentElement = GreedyClosest(vector, currentElement, lv);
+                }
+
+                for (int lv = Math.Min(level, _header.MaxLayers - 1); lv >= 0; lv--)
+                {
+                    var nearest = SearchLayerNearest(vector, currentElement, lv, _header.MaxNeighbors);
+
+                    WriteNeighborsAtLevel(nodeIndex, lv, nearest);
+
+                    foreach (var (neighborId, _) in nearest)
+                    {
+                        if (neighborId < 0 || neighborId == nodeIndex) continue;
+                        AddNeighborConnection(neighborId, lv, nodeIndex, vector);
+                    }
+
+                    if (nearest.Length > 0 && nearest[0].Id >= 0)
+                    {
+                        currentElement = nearest[0].Id;
+                    }
+                }
+            }
+        }
+
+        private void RemoveNodeFromGraph(int nodeToRemove)
+        {
+            // Remove nodeToRemove from all other nodes' neighbor lists
+            for (int i = 0; i < _header.CurrentCount; i++)
+            {
+                if (i == nodeToRemove) continue;
+
+                for (int level = 0; level < _header.MaxLayers; level++)
+                {
+                    int[] neighbors = ArrayPool<int>.Shared.Rent(_header.MaxNeighbors);
+                    try
+                    {
+                        GetNeighborsAtLevel(i, level, neighbors);
+                        bool modified = false;
+
+                        for (int j = 0; j < _header.MaxNeighbors; j++)
+                        {
+                            if (neighbors[j] == nodeToRemove)
+                            {
+                                neighbors[j] = -1;
+                                modified = true;
+                            }
+                        }
+
+                        if (modified)
+                        {
+                            WriteNeighborsAtLevel(i, level, neighbors);
+                        }
+                    }
+                    finally
+                    {
+                        ArrayPool<int>.Shared.Return(neighbors);
+                    }
+                }
             }
         }
 

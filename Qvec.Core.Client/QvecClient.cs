@@ -19,6 +19,19 @@ namespace Qvec.Core.Client
             string metadata = JsonSerializer.Serialize(item, _jsonInfo);
             _db.AddEntry(vector, metadata);
         }
+
+        public void UpdateEntry(int id, float[] vector, T item)
+        {
+            // Serialisera objektet till JSON-metadata via Source Generator
+            string metadata = JsonSerializer.Serialize(item, _jsonInfo);
+            _db.UpdateEntry(id, vector, metadata);
+        }
+
+        public void DeleteEntry(int id)
+        {
+            _db.DeleteEntry(id);
+        }
+
         public List<TypedSearchResult<T>> Search(float[] query, Func<T, bool> filter, int topK = 5)
         {
             // Använd HybridSearchHNSW med inbyggd deserialisering
