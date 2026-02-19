@@ -7,6 +7,12 @@ using System.Text;
 
 namespace QvecSharp
 {
+    public enum DistanceFunction : int
+    {
+        DotProduct = 0,
+        Cosine = 1
+    }
+
     [StructLayout(LayoutKind.Sequential, Pack = 1)]
     public struct DbHeader
     {
@@ -22,6 +28,7 @@ namespace QvecSharp
         public int EntryPoint;       // <--- Här sparar vi index för "topp-noden"
         public int EntryPointLevel;  // Lagret som EntryPoint tillhör
         public int DeletedCount;     // Antal soft-deleted dokument
+        public DistanceFunction DistanceFunction;
     }
 
     public class QvecDatabase : IDisposable
@@ -47,7 +54,7 @@ namespace QvecSharp
 
 
         
-        public QvecDatabase(string path, int dim = 1536, int max = 1000, int maxNeighbors = 32, int maxLayers = 5)
+        public QvecDatabase(string path, int dim = 1536, int max = 1000, int maxNeighbors = 32, int maxLayers = 5, DistanceFunction distanceFunction = DistanceFunction.DotProduct)
         {
             bool exists = File.Exists(path);
             _vectorSectionOffset = HeaderSize;
@@ -88,7 +95,8 @@ namespace QvecSharp
                     LayerProbability = 1.0 / Math.Log(maxNeighbors),
                     EntryPoint = 0,
                     EntryPointLevel = 0,
-                    DeletedCount = 0
+                    DeletedCount = 0,
+                    DistanceFunction = distanceFunction
                 };
                 _headerAccessor.Write(0, ref _header);
             }
@@ -134,6 +142,29 @@ namespace QvecSharp
             return dot;
         }
 
+        /// <summary>
+        /// Normaliserar en vektor till enhetslängd (L2-norm = 1).
+        /// När vektorer är normaliserade blir dot product == cosine similarity.
+        /// </summary>
+        public static void NormalizeVector(float[] vector)
+        {
+            float norm = MathF.Sqrt(DotProduct(vector, vector));
+            if (norm > 0f)
+            {
+                float invNorm = 1f / norm;
+                int i = 0;
+                int vectorSize = Vector<float>.Count;
+                var invNormVec = new Vector<float>(invNorm);
+
+                for (; i <= vector.Length - vectorSize; i += vectorSize)
+                {
+                    var v = new Vector<float>(vector, i);
+                    (v * invNormVec).CopyTo(vector, i);
+                }
+                for (; i < vector.Length; i++) vector[i] *= invNorm;
+            }
+        }
+
         // --- SKRIVNING ---
         public Guid AddEntry(float[] vector, string metadata, Guid? externalId = null)
         {
@@ -149,6 +180,9 @@ namespace QvecSharp
 
                 int index = _header.CurrentCount;
                 int level = RandomLayer();
+
+                if (_header.DistanceFunction == DistanceFunction.Cosine)
+                    NormalizeVector(vector);
 
                 WriteVectorToDisk(index, vector);
                 WriteMetadataToDisk(index, metadata);
@@ -217,6 +251,9 @@ namespace QvecSharp
             _lock.EnterReadLock();
             try
             {
+                if (_header.DistanceFunction == DistanceFunction.Cosine)
+                    NormalizeVector(query);
+
                 var candidates = new List<(int Index, float Score)>();
                 for (int i = 0; i < _header.CurrentCount; i++)
                 {
@@ -224,11 +261,17 @@ namespace QvecSharp
                     string meta = GetMetadata(i);
                     if (filter != null && !filter(meta)) continue;
 
-                    float[] v = new float[_header.VectorDimension];
-                    _dataAccessor.ReadArray((long)i * _header.VectorDimension * sizeof(float), v, 0, _header.VectorDimension);
-
-                    float score = DotProduct(query, v);
-                    candidates.Add((i, score));
+                    float[] v = ArrayPool<float>.Shared.Rent(_header.VectorDimension);
+                    try
+                    {
+                        _dataAccessor.ReadArray((long)i * _header.VectorDimension * sizeof(float), v, 0, _header.VectorDimension);
+                        float score = DotProduct(query, v, _header.VectorDimension);
+                        candidates.Add((i, score));
+                    }
+                    finally
+                    {
+                        ArrayPool<float>.Shared.Return(v);
+                    }
                 }
 
                 return candidates.OrderByDescending(c => c.Score)
@@ -247,6 +290,9 @@ namespace QvecSharp
         /// <returns></returns>
         public unsafe List<(Guid Id, float Score, string Metadata)> SearchSimpleParallel(float[] query, int topK, Func<string, bool> filter = null)
         {
+            if (_header.DistanceFunction == DistanceFunction.Cosine)
+                NormalizeVector(query);
+
             int count = _header.CurrentCount;
             int dim = _header.VectorDimension;
 
@@ -304,6 +350,9 @@ namespace QvecSharp
             _lock.EnterReadLock();
             try
             {
+                if (_header.DistanceFunction == DistanceFunction.Cosine)
+                    NormalizeVector(query);
+
                 int entryPoint = _header.EntryPoint;
                 for (int level = _header.EntryPointLevel; level >= 1; level--)
                 {
@@ -313,9 +362,9 @@ namespace QvecSharp
                 int ef = Math.Max(topK, efSearch);
                 var nearest = SearchLayerNearest(query, entryPoint, 0, ef);
 
-                return nearest
+            return nearest
                     .Select(r => (r.Id, r.Score, Meta: GetMetadata(r.Id)))
-                    .Where(r => filter(r.Meta))
+                    .Where(r => !_deletedIndices.Contains(r.Id) && filter(r.Meta))
                     .OrderByDescending(r => r.Score)
                     .Take(topK)
                     .Select(r => (ReadGuidFromDisk(r.Id), r.Score, r.Meta))
@@ -346,6 +395,9 @@ namespace QvecSharp
             _lock.EnterReadLock();
             try
             {
+                if (_header.DistanceFunction == DistanceFunction.Cosine)
+                    NormalizeVector(query);
+
                 int entryPoint = _header.EntryPoint;
                 for (int level = _header.EntryPointLevel; level >= 1; level--)
                 {
@@ -590,6 +642,8 @@ namespace QvecSharp
                     }
                 }
 
+                ArrayPool<float>.Shared.Return(existingVector);
+
                 if (newScore > worstScore)
                 {
                     neighbors[worstIdx] = newNode;
@@ -642,12 +696,18 @@ namespace QvecSharp
             {
                 // 1. Hämta vektorn för aktuell nod
                 float[] v = GetVector(i);
+                try
+                {
+                    // 2. Gör en djup sökning (efSearch) för att hitta bättre grannar
+                    var bestNeighbors = SearchInternal(v, k: _header.MaxNeighbors);
 
-                // 2. Gör en djup sökning (efSearch) för att hitta bättre grannar
-                var bestNeighbors = SearchInternal(v, k: _header.MaxNeighbors);
-
-                // 3. Uppdatera lagren på disk
-                UpdateNeighbors(i, bestNeighbors.Select(n => n.Id).ToArray());
+                    // 3. Uppdatera lagren på disk
+                    UpdateNeighbors(i, bestNeighbors.Select(n => n.Id).ToArray());
+                }
+                finally
+                {
+                    ArrayPool<float>.Shared.Return(v);
+                }
             });
 
             Console.WriteLine("Indexering klar.");
@@ -730,7 +790,7 @@ namespace QvecSharp
         }
         private float[] GetVector(int index)
         {
-            float[] vector = new float[_header.VectorDimension];
+            float[] vector = ArrayPool<float>.Shared.Rent(_header.VectorDimension);
             long offset = _vectorSectionOffset + (long)index * _header.VectorDimension * sizeof(float);
             _dataAccessor.ReadArray(offset - HeaderSize, vector, 0, _header.VectorDimension);
             return vector;
@@ -799,9 +859,10 @@ namespace QvecSharp
 
         private Guid ReadGuidFromDisk(int index)
         {
-            byte[] bytes = new byte[GuidSize];
+            Span<byte> bytes = stackalloc byte[GuidSize];
             long offset = (_guidSectionOffset - HeaderSize) + (long)index * GuidSize;
-            _dataAccessor.ReadArray(offset, bytes, 0, GuidSize);
+            for (int i = 0; i < GuidSize; i++)
+                bytes[i] = _dataAccessor.ReadByte(offset + i);
             return new Guid(bytes);
         }
 
@@ -835,7 +896,10 @@ namespace QvecSharp
             {
                 if (!_guidIndex.TryGetValue(id, out int index))
                     return null;
-                return (GetVector(index), GetMetadata(index));
+                float[] rented = GetVector(index);
+                float[] vector = rented.AsSpan(0, _header.VectorDimension).ToArray();
+                ArrayPool<float>.Shared.Return(rented);
+                return (vector, GetMetadata(index));
             }
             finally { _lock.ExitReadLock(); }
         }
@@ -852,9 +916,16 @@ namespace QvecSharp
                     continue;
 
                 float[] vector = source.GetVector(i);
-                string metadata = source.GetMetadata(i);
-                AddEntry(vector, metadata, externalId: docId);
-                synced++;
+                try
+                {
+                    string metadata = source.GetMetadata(i);
+                    AddEntry(vector.AsSpan(0, source._header.VectorDimension).ToArray(), metadata, externalId: docId);
+                    synced++;
+                }
+                finally
+                {
+                    ArrayPool<float>.Shared.Return(vector);
+                }
             }
             return synced;
         }
@@ -1063,6 +1134,9 @@ namespace QvecSharp
 
             int index = _header.CurrentCount;
             int level = RandomLayer();
+
+            if (_header.DistanceFunction == DistanceFunction.Cosine)
+                NormalizeVector(vector);
 
             WriteVectorToDisk(index, vector);
             WriteMetadataToDisk(index, metadata);
