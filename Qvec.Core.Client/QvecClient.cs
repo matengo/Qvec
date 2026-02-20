@@ -46,6 +46,17 @@ namespace Qvec.Core.Client
                 Item = Deserialize(r.Metadata)
             }).ToList();
         }
+        public List<TypedSearchResult<T>> Search(float[] query, int topK = 5)
+        {
+            var rawResults = _db.Search(query, topK);
+
+            return rawResults.Select(r => new TypedSearchResult<T>
+            {
+                Id = r.Id,
+                Score = r.Score,
+                Item = Deserialize(r.Metadata)
+            }).ToList();
+        }
         public bool DeleteEntry(Guid id)
         {
             return _db.Delete(id);
