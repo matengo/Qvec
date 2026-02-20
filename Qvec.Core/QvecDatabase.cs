@@ -53,6 +53,9 @@ namespace Qvec.Core
         private readonly int[] _cachedEmptyNeighbors;
         private readonly byte[] _cachedPadding;
 
+        // Inverterat index: field -> value -> set of entry indices
+        private readonly Dictionary<string, Dictionary<string, HashSet<int>>> _fieldIndex = new();
+
 
         
         public QvecDatabase(string path, int dim = 1536, int max = 1000, int maxNeighbors = 32, int maxLayers = 5, DistanceFunction distanceFunction = DistanceFunction.DotProduct)
@@ -240,6 +243,188 @@ namespace Qvec.Core
             long offset = _graphSectionOffset + (long)index * _cachedEmptyNeighbors.Length * sizeof(int);
             _dataAccessor.WriteArray(offset - HeaderSize, _cachedEmptyNeighbors, 0, _cachedEmptyNeighbors.Length);
         }
+        // --- INVERTERAT INDEX ---
+
+        /// <summary>
+        /// Lägger till en post i det inverterade indexet för ett specifikt fält och värde.
+        /// </summary>
+        public void AddFieldIndex(int entryIndex, IEnumerable<(string Field, string Value)> fields)
+        {
+            foreach (var (field, value) in fields)
+            {
+                if (value == null) continue;
+                if (!_fieldIndex.TryGetValue(field, out var valueMap))
+                {
+                    valueMap = new Dictionary<string, HashSet<int>>();
+                    _fieldIndex[field] = valueMap;
+                }
+                if (!valueMap.TryGetValue(value, out var indices))
+                {
+                    indices = new HashSet<int>();
+                    valueMap[value] = indices;
+                }
+                indices.Add(entryIndex);
+            }
+        }
+
+        /// <summary>
+        /// Tar bort en post från det inverterade indexet.
+        /// </summary>
+        internal void RemoveFieldIndex(int entryIndex)
+        {
+            foreach (var valueMap in _fieldIndex.Values)
+            {
+                foreach (var indices in valueMap.Values)
+                {
+                    indices.Remove(entryIndex);
+                }
+            }
+        }
+
+        /// <summary>
+        /// O(1)-sökning via det inverterade indexet. Kräver att fältet har indexerats vid insert.
+        /// </summary>
+        public List<(Guid Id, string Metadata)> WhereIndexed(string field, string value, int maxResults = 100)
+        {
+            _lock.EnterReadLock();
+            try
+            {
+                if (!_fieldIndex.TryGetValue(field, out var valueMap) ||
+                    !valueMap.TryGetValue(value, out var indices))
+                    return new List<(Guid Id, string Metadata)>();
+
+                return indices
+                    .Where(i => !_deletedIndices.Contains(i))
+                    .Take(maxResults)
+                    .Select(i => (ReadGuidFromDisk(i), GetMetadata(i)))
+                    .ToList();
+            }
+            finally { _lock.ExitReadLock(); }
+        }
+
+        /// <summary>
+        /// O(1)-sökning via det inverterade indexet med flera fält (AND / intersection).
+        /// </summary>
+        public List<(Guid Id, string Metadata)> WhereIndexed(IReadOnlyList<(string Field, string Value)> lookups, int maxResults = 100)
+        {
+            if (lookups.Count == 0) return new List<(Guid Id, string Metadata)>();
+            if (lookups.Count == 1) return WhereIndexed(lookups[0].Field, lookups[0].Value, maxResults);
+
+            _lock.EnterReadLock();
+            try
+            {
+                HashSet<int>? result = null;
+
+                foreach (var (field, value) in lookups)
+                {
+                    if (!_fieldIndex.TryGetValue(field, out var valueMap) ||
+                        !valueMap.TryGetValue(value, out var indices))
+                        return new List<(Guid Id, string Metadata)>();
+
+                    if (result == null)
+                        result = new HashSet<int>(indices);
+                    else
+                        result.IntersectWith(indices);
+
+                    if (result.Count == 0) return new List<(Guid Id, string Metadata)>();
+                }
+
+                return result!
+                    .Where(i => !_deletedIndices.Contains(i))
+                    .Take(maxResults)
+                    .Select(i => (ReadGuidFromDisk(i), GetMetadata(i)))
+                    .ToList();
+            }
+            finally { _lock.ExitReadLock(); }
+        }
+
+        /// <summary>
+        /// Bygger om det inverterade indexet från disk. Anropas vid uppstart om extractor finns.
+        /// </summary>
+        public void RebuildFieldIndex(Func<string, IEnumerable<(string Field, string Value)>> extractor)
+        {
+            _lock.EnterWriteLock();
+            try
+            {
+                _fieldIndex.Clear();
+                for (int i = 0; i < _header.CurrentCount; i++)
+                {
+                    if (_deletedIndices.Contains(i)) continue;
+                    string meta = GetMetadata(i);
+                    var fields = extractor(meta);
+                    AddFieldIndex(i, fields);
+                }
+            }
+            finally { _lock.ExitWriteLock(); }
+        }
+
+        /// <summary>
+        /// Returnerar kandidat-index från det inverterade indexet för en eller flera fält (AND).
+        /// Returnerar null om något fält saknar matchning.
+        /// </summary>
+        public HashSet<int>? GetIndexedCandidates(IReadOnlyList<(string Field, string Value)> lookups)
+        {
+            if (lookups.Count == 0) return null;
+
+            HashSet<int>? result = null;
+
+            foreach (var (field, value) in lookups)
+            {
+                if (!_fieldIndex.TryGetValue(field, out var valueMap) ||
+                    !valueMap.TryGetValue(value, out var indices))
+                    return new HashSet<int>();
+
+                if (result == null)
+                    result = new HashSet<int>(indices);
+                else
+                    result.IntersectWith(indices);
+
+                if (result.Count == 0) return result;
+            }
+
+            return result;
+        }
+
+        /// <summary>
+        /// Vektorsökning enbart över förfiltrerade kandidat-index.
+        /// Beräknar similarity enbart för poster i candidates — ingen HNSW, ingen full scan.
+        /// </summary>
+        public List<(Guid Id, float Score, string Metadata)> SearchWithCandidates(float[] query, HashSet<int> candidates, int topK)
+        {
+            _lock.EnterReadLock();
+            try
+            {
+                if (_header.DistanceFunction == DistanceFunction.Cosine)
+                    NormalizeVector(query);
+
+                var scored = new List<(int Index, float Score)>(candidates.Count);
+                float[] v = ArrayPool<float>.Shared.Rent(_header.VectorDimension);
+                try
+                {
+                    foreach (int i in candidates)
+                    {
+                        if (_deletedIndices.Contains(i)) continue;
+
+                        long offset = (long)i * _header.VectorDimension * sizeof(float);
+                        _dataAccessor.ReadArray(offset, v, 0, _header.VectorDimension);
+                        float score = DotProduct(query, v, _header.VectorDimension);
+                        scored.Add((i, score));
+                    }
+                }
+                finally
+                {
+                    ArrayPool<float>.Shared.Return(v);
+                }
+
+                return scored
+                    .OrderByDescending(s => s.Score)
+                    .Take(topK)
+                    .Select(s => (ReadGuidFromDisk(s.Index), s.Score, GetMetadata(s.Index)))
+                    .ToList();
+            }
+            finally { _lock.ExitReadLock(); }
+        }
+
         /// <summary>
         /// Filtrerar poster enbart på metadata utan vektorsökning.
         /// Använder parallell scan för stora dataset, sekventiell för små.
@@ -1015,6 +1200,7 @@ namespace Qvec.Core
         {
             WriteTombstone(index, 1);
             _deletedIndices.Add(index);
+            RemoveFieldIndex(index);
             DisconnectNode(index);
 
             if (_header.EntryPoint == index)

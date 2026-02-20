@@ -13,4 +13,5 @@
   <Project Path="Qvec.Console/Qvec.Console.csproj" Id="5a92a05d-d3e9-4ca4-9e06-89b48ce62fbb" />
   <Project Path="Qvec.Core.Client/Qvec.Core.Client.csproj" Id="86f2dcde-4102-4f82-9de3-d3acb2e8eb27" />
   <Project Path="Qvec.Core/Qvec.Core.csproj" Id="d140938d-34d5-4a7a-baf6-05162fe06a03" />
+  <Project Path="Qvec.SourceGen/Qvec.SourceGen.csproj" />
 </Solution>

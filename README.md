@@ -120,6 +120,104 @@ client.AddEntry(myVector, new Product(1, "Laptop", 12000, true));
 var results = client.Search(queryVector, p => p.Price < 15000 && p.InStock);
 ```
 
+## Indexed Filtering with `[QvecIndexed]`
+
+Qvec supports **O(1) metadata filtering** via an in-memory inverted index. Mark properties with `[QvecIndexed]` and Qvec will automatically build and maintain an index — no full scan, no JSON parsing at query time.
+
+### 1. Mark properties to index
+
+```c#
+using Qvec.Core;
+
+public class Product
+{
+    [QvecIndexed]
+    public string Category { get; set; }
+
+    [QvecIndexed]
+    public string Brand { get; set; }
+
+    public string Description { get; set; }  // not indexed — Where falls back to scan
+    public double Price { get; set; }
+}
+```
+
+### 2. Install the source generator
+
+Add a reference to `Qvec.SourceGen` in your project. This will automatically generate a `ProductFieldExtractor` class that implements `IQvecFieldExtractor<Product>`:
+
+```xml
+<ProjectReference Include="..\Qvec.SourceGen\Qvec.SourceGen.csproj"
+                  OutputItemType="Analyzer" ReferenceOutputAssembly="false" />
+```
+
+### 3. Create the client with the extractor
+
+```c#
+var db = new QvecDatabase("products.qvec", dim: 1536, max: 10000);
+var client = new QvecClient<Product>(db, new ProductFieldExtractor());
+```
+
+The inverted index is rebuilt from disk at startup and kept in sync on every insert and delete.
+
+### 4. Query with `Where`
+
+`Where` accepts an `Expression<Func<T, bool>>`. If the expression consists of `==` comparisons on indexed properties, the inverted index is used automatically. Everything else falls back to a full scan — same syntax either way.
+
+```c#
+// O(1) — single indexed field lookup
+var science = client.Where(p => p.Category == "Science");
+
+// O(1) — compound AND, uses HashSet intersection
+var acmeScience = client.Where(p => p.Category == "Science" && p.Brand == "Acme");
+
+// O(1) — captured variables work too
+string cat = "Science";
+var results = client.Where(p => p.Category == cat);
+
+// Automatic fallback to full scan for non-indexed or complex expressions
+var cheap = client.Where(p => p.Description.Contains("quantum"));
+```
+
+| Expression | Strategy | Complexity |
+| :--- | :--- | :--- |
+| `p => p.Category == "Science"` | Inverted index | **O(1)** |
+| `p => p.Category == "Science" && p.Brand == "Acme"` | Index intersection | **O(1)** |
+| `p => p.Price < 100` | Full scan (fallback) | O(N) |
+| `p => p.Description.Contains("x")` | Full scan (fallback) | O(N) |
+
+### Hybrid Search with Indexed Filtering
+
+The same expression analysis works for `Search` (vector + filter). When the filter uses `==` on indexed properties, Qvec pre-filters via the inverted index and computes vector similarity **only on matching entries** — no HNSW post-filtering, no wasted similarity calculations:
+
+```c#
+// Pre-filtered: vector similarity computed only for Category == "Science" entries
+var results = client.Search(queryVector, p => p.Category == "Science", topK: 5);
+
+// Compound: intersection first, then vector ranking over the small candidate set
+var results = client.Search(queryVector,
+    p => p.Category == "Science" && p.Brand == "Acme", topK: 5);
+
+// Non-indexed filter: falls back to HNSW + post-filter automatically
+var results = client.Search(queryVector, p => p.Price < 100, topK: 5);
+```
+
+| Scenario | Without index | With `[QvecIndexed]` |
+| :--- | :--- | :--- |
+| 1M entries, 1% match filter | HNSW finds 50 candidates → filter → **~0 results** | Index → 10K candidates → rank → **5 perfect results** |
+| 1M entries, 50% match filter | HNSW + post-filter works OK | Index → 500K candidates (fallback to HNSW is better) |
+
+### Combining with AOT
+
+Pass both the JSON type info and the extractor:
+
+```c#
+var client = new QvecClient<Product>(
+    db,
+    ProductJsonContext.Default.Product,
+    new ProductFieldExtractor());
+```
+
 
 ## 🎯 Use Cases
 

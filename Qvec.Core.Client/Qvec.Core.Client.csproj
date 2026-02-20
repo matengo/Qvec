@@ -9,6 +9,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\Qvec.Core\Qvec.Core.csproj" />
+    <ProjectReference Include="..\Qvec.SourceGen\Qvec.SourceGen.csproj" OutputItemType="Analyzer" ReferenceOutputAssembly="false" />
   </ItemGroup>
 
   <ItemGroup>
