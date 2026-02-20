@@ -42,6 +42,8 @@ jobs:
     if: github.event_name == 'release'
     permissions:
       contents: read
+    env:
+      NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
 
     steps:
       - name: Checkout repository
@@ -69,11 +71,9 @@ jobs:
             --no-build --configuration Release --output ./packages
 
       - name: Push to NuGet.org
-        if: ${{ secrets.NUGET_API_KEY != '' }}
-        env:
-          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+        if: env.NUGET_API_KEY != ''
         run: |
           dotnet nuget push ./packages/*.nupkg \
-            --api-key $NUGET_API_KEY \
+            --api-key ${{ env.NUGET_API_KEY }} \
             --source https://api.nuget.org/v3/index.json \
             --skip-duplicate
