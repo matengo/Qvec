@@ -5,7 +5,7 @@ using System.Numerics;
 using System.Runtime.InteropServices;
 using System.Text;
 
-namespace QvecSharp
+namespace Qvec.Core
 {
     public enum DistanceFunction : int
     {

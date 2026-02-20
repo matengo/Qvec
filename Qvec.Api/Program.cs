@@ -1,6 +1,6 @@
 using Microsoft.AspNetCore.Http.HttpResults;
 using System.Text.Json.Serialization;
-using QvecSharp;
+using Qvec.Core;
 
 var builder = WebApplication.CreateSlimBuilder(args);
 

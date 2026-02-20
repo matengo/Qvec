@@ -1,4 +1,4 @@
-﻿using QvecSharp;
+﻿using Qvec.Core;
 using System.Diagnostics;
 
 namespace Qvec.Console.Test
