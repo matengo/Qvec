@@ -122,7 +122,7 @@ var results = client.Search(queryVector, p => p.Price < 15000 && p.InStock);
 
 ## Indexed Filtering with `[QvecIndexed]`
 
-Qvec supports **O(1) metadata filtering** via an in-memory inverted index. Mark properties with `[QvecIndexed]` and Qvec will automatically build and maintain an index — no full scan, no JSON parsing at query time.
+Qvec supports **O(1) metadata filtering** via an in-memory inverted index. Mark properties with `[QvecIndexed]` and Qvec will automatically build and maintain an index — no scanning, no JSON parsing at query time.
 
 ### 1. Mark properties to index
 
@@ -137,7 +137,7 @@ public class Product
     [QvecIndexed]
     public string Brand { get; set; }
 
-    public string Description { get; set; }  // not indexed — Where falls back to scan
+    public string Description { get; set; }  // not indexed — Where falls back to parallel scan
     public double Price { get; set; }
 }
 ```
@@ -155,7 +155,7 @@ The inverted index is rebuilt from disk at startup and kept in sync on every ins
 
 ### 3. Query with `Where`
 
-`Where` accepts an `Expression<Func<T, bool>>`. If the expression consists of `==` comparisons on indexed properties, the inverted index is used automatically. Everything else falls back to a full scan — same syntax either way.
+`Where` accepts an `Expression<Func<T, bool>>`. If the expression consists of `==` comparisons on indexed properties, the inverted index is used automatically. Everything else falls back to a parallel scan — same syntax either way.
 
 ```c#
 // O(1) — single indexed field lookup
@@ -168,7 +168,7 @@ var acmeScience = client.Where(p => p.Category == "Science" && p.Brand == "Acme"
 string cat = "Science";
 var results = client.Where(p => p.Category == cat);
 
-// Automatic fallback to full scan for non-indexed or complex expressions
+// Automatic fallback to parallel scan for non-indexed or complex expressions
 var cheap = client.Where(p => p.Description.Contains("quantum"));
 ```
 
@@ -176,8 +176,8 @@ var cheap = client.Where(p => p.Description.Contains("quantum"));
 | :--- | :--- | :--- |
 | `p => p.Category == "Science"` | Inverted index | **O(1)** |
 | `p => p.Category == "Science" && p.Brand == "Acme"` | Index intersection | **O(1)** |
-| `p => p.Price < 100` | Full scan (fallback) | O(N) |
-| `p => p.Description.Contains("x")` | Full scan (fallback) | O(N) |
+| `p => p.Price < 100` | Parallel scan (fallback) | O(N) |
+| `p => p.Description.Contains("x")` | Parallel scan (fallback) | O(N) |
 
 ### Hybrid Search with Indexed Filtering
 
@@ -191,7 +191,7 @@ var results = client.Search(queryVector, p => p.Category == "Science", topK: 5);
 var results = client.Search(queryVector,
     p => p.Category == "Science" && p.Brand == "Acme", topK: 5);
 
-// Non-indexed filter: falls back to HNSW + post-filter automatically
+// Non-indexed filter: falls back to HNSW + parallel post-filter automatically
 var results = client.Search(queryVector, p => p.Price < 100, topK: 5);
 ```
 
