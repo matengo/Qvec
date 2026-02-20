@@ -1,5 +1,4 @@
-﻿using QvecSharp;
-using System;
+﻿using Qvec.Core;
 using System.CommandLine;
 
 var rootCommand = new RootCommand("QvecSharp CLI - Högpresterande Vektordatabas");

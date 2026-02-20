@@ -1,5 +1,5 @@
 ﻿using Qvec.Console.Test;
-using QvecSharp;
+using Qvec.Core;
 using System.Diagnostics;
 
 const int Dim = 128;        // Dimensioner (t.ex. för en mindre modell)
