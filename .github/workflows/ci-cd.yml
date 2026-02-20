@@ -38,8 +38,9 @@ jobs:
 
   publish:
     name: Publish NuGet Packages
+    needs: build-and-test
     runs-on: ubuntu-latest
-    if: github.event_name == 'release'
+    if: github.event_name == 'push' || github.event_name == 'release'
     permissions:
       contents: read
     env:
