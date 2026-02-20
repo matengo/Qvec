@@ -142,16 +142,9 @@ public class Product
 }
 ```
 
-### 2. Install the source generator
+### 2. Create the client with the extractor
 
-Add a reference to `Qvec.SourceGen` in your project. This will automatically generate a `ProductFieldExtractor` class that implements `IQvecFieldExtractor<Product>`:
-
-```xml
-<ProjectReference Include="..\Qvec.SourceGen\Qvec.SourceGen.csproj"
-                  OutputItemType="Analyzer" ReferenceOutputAssembly="false" />
-```
-
-### 3. Create the client with the extractor
+The source generator is bundled with `Qvec.Core.Client` — no extra package references needed. It automatically generates a `ProductFieldExtractor` class that implements `IQvecFieldExtractor<Product>`.
 
 ```c#
 var db = new QvecDatabase("products.qvec", dim: 1536, max: 10000);
@@ -160,7 +153,7 @@ var client = new QvecClient<Product>(db, new ProductFieldExtractor());
 
 The inverted index is rebuilt from disk at startup and kept in sync on every insert and delete.
 
-### 4. Query with `Where`
+### 3. Query with `Where`
 
 `Where` accepts an `Expression<Func<T, bool>>`. If the expression consists of `==` comparisons on indexed properties, the inverted index is used automatically. Everything else falls back to a full scan — same syntax either way.
 

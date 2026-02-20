@@ -5,11 +5,22 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <PackageReadmeFile>README.md</PackageReadmeFile>
+    <IncludeBuildOutput>true</IncludeBuildOutput>
   </PropertyGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\Qvec.Core\Qvec.Core.csproj" />
-    <ProjectReference Include="..\Qvec.SourceGen\Qvec.SourceGen.csproj" OutputItemType="Analyzer" ReferenceOutputAssembly="false" />
+    <ProjectReference Include="..\Qvec.SourceGen\Qvec.SourceGen.csproj"
+                      OutputItemType="Analyzer"
+                      ReferenceOutputAssembly="false" />
+  </ItemGroup>
+
+  <!-- Bädda in source generator-DLL:en i NuGet-paketet -->
+  <ItemGroup>
+    <None Include="..\Qvec.SourceGen\bin\$(Configuration)\netstandard2.0\Qvec.SourceGen.dll"
+          Pack="true"
+          PackagePath="analyzers/dotnet/cs"
+          Visible="false" />
   </ItemGroup>
 
   <ItemGroup>
