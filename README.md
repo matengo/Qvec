@@ -64,6 +64,24 @@ foreach (var r in results) {
 }
 ```
 
+## Typed client
+
+```c#
+var db = new QvecDatabase("products.qvec", dim: 1536, max: 10000);
+var client = new QvecClient<Product>(db);
+
+// Add entry
+client.AddEntry(myVector, new Product(1, "Laptop", 12000, true));
+
+// Hybrid search with strongly typed filter
+var results = client.Search(queryVector, p => p.Price < 15000 && p.InStock);
+
+foreach (var r in results)
+{
+    Console.WriteLine($"{r.Item.Name}: {r.Score}");
+}
+```
+
 ## Typed client (AOT)
 
 ### 1. for AOT define object serialization
