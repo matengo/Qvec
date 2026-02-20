@@ -627,8 +627,8 @@ namespace Qvec.Core
                     }
                 }
 
-                float[] existingVector = GetVector(existingNode);
-                float newScore = DotProduct(existingVector, newVector);
+            float[] existingVector = GetVector(existingNode);
+                float newScore = DotProduct(existingVector, newVector, _header.VectorDimension);
 
                 int worstIdx = 0;
                 float worstScore = CalculateScore(existingVector, neighbors[0]);
