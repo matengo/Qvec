@@ -55,21 +55,36 @@ jobs:
         with:
           dotnet-version: '10.0.x'
 
+      - name: Compute version
+        id: version
+        run: |
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            TAG="${{ github.event.release.tag_name }}"
+            VERSION="${TAG#v}"
+          else
+            PREFIX=$(grep -oP '(?<=<VersionPrefix>)[^<]+' Directory.Build.props)
+            VERSION="${PREFIX%.*}.${{ github.run_number }}"
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Computed version: $VERSION"
+
       - name: Restore dependencies
         run: dotnet restore
 
       - name: Build solution
-        run: dotnet build --no-restore --configuration Release
+        run: dotnet build --no-restore --configuration Release /p:Version=${{ steps.version.outputs.VERSION }}
 
       - name: Pack Qvec.Core
         run: |
           dotnet pack Qvec.Core/Qvec.Core.csproj \
-            --no-build --configuration Release --output ./packages
+            --no-build --configuration Release --output ./packages \
+            /p:Version=${{ steps.version.outputs.VERSION }}
 
       - name: Pack Qvec.Core.Client
         run: |
           dotnet pack Qvec.Core.Client/Qvec.Core.Client.csproj \
-            --no-build --configuration Release --output ./packages
+            --no-build --configuration Release --output ./packages \
+            /p:Version=${{ steps.version.outputs.VERSION }}
 
       - name: Push to NuGet.org
         if: env.NUGET_API_KEY != ''

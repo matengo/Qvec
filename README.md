@@ -31,7 +31,21 @@ Unlike client-server vector DBs, Qvec runs in-process, utilizing **MemoryMappedF
 
 ## 💻 Quick Start
 
-## Initialize and Add Data
+### Installation
+
+Install via the .NET CLI:
+
+```bash
+dotnet add package Qvec.Core
+```
+
+Or for the typed client:
+
+```bash
+dotnet add package Qvec.Core.Client
+```
+
+### Initialize and Add Data
 
 ```C#
 using Qvec;
