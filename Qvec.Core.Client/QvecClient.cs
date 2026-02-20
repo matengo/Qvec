@@ -57,6 +57,21 @@ namespace Qvec.Core.Client
                 Item = Deserialize(r.Metadata)
             }).ToList();
         }
+        public List<TypedWhereResult<T>> Where(Func<T, bool> filter, int maxResults = 100)
+        {
+            var rawResults = _db.Where(meta =>
+            {
+                var obj = Deserialize(meta);
+                return obj != null && filter(obj);
+            }, maxResults);
+
+            return rawResults.Select(r => new TypedWhereResult<T>
+            {
+                Id = r.Id,
+                Item = Deserialize(r.Metadata)
+            }).ToList();
+        }
+
         public bool DeleteEntry(Guid id)
         {
             return _db.Delete(id);
@@ -76,6 +91,11 @@ namespace Qvec.Core.Client
     {
         public Guid Id { get; set; }
         public float Score { get; set; }
+        public T? Item { get; set; }
+    }
+    public class TypedWhereResult<T>
+    {
+        public Guid Id { get; set; }
         public T? Item { get; set; }
     }
 }

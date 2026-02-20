@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Buffers;
+using System.Collections.Concurrent;
 using System.IO.MemoryMappedFiles;
 using System.Numerics;
 using System.Runtime.InteropServices;
@@ -239,6 +240,68 @@ namespace Qvec.Core
             long offset = _graphSectionOffset + (long)index * _cachedEmptyNeighbors.Length * sizeof(int);
             _dataAccessor.WriteArray(offset - HeaderSize, _cachedEmptyNeighbors, 0, _cachedEmptyNeighbors.Length);
         }
+        /// <summary>
+        /// Filtrerar poster enbart på metadata utan vektorsökning.
+        /// Använder parallell scan för stora dataset, sekventiell för små.
+        /// </summary>
+        public List<(Guid Id, string Metadata)> Where(Func<string, bool> filter, int maxResults = 100)
+        {
+            _lock.EnterReadLock();
+            try
+            {
+                int count = _header.CurrentCount;
+
+                if (count < 512)
+                    return WhereSequential(filter, maxResults);
+
+                return WhereParallelInternal(filter, maxResults, count);
+            }
+            finally { _lock.ExitReadLock(); }
+        }
+
+        private List<(Guid Id, string Metadata)> WhereSequential(Func<string, bool> filter, int maxResults)
+        {
+            var results = new List<(Guid Id, string Metadata)>();
+            for (int i = 0; i < _header.CurrentCount; i++)
+            {
+                if (_deletedIndices.Contains(i)) continue;
+                string meta = GetMetadata(i);
+                if (filter(meta))
+                {
+                    results.Add((ReadGuidFromDisk(i), meta));
+                    if (results.Count >= maxResults) break;
+                }
+            }
+            return results;
+        }
+
+        private List<(Guid Id, string Metadata)> WhereParallelInternal(Func<string, bool> filter, int maxResults, int count)
+        {
+            var matches = new ConcurrentBag<(int Index, Guid Id, string Metadata)>();
+
+            Parallel.For(0, count, (i, state) =>
+            {
+                if (matches.Count >= maxResults)
+                {
+                    state.Stop();
+                    return;
+                }
+                if (_deletedIndices.Contains(i)) return;
+
+                string meta = GetMetadata(i);
+                if (filter(meta))
+                {
+                    matches.Add((i, ReadGuidFromDisk(i), meta));
+                }
+            });
+
+            return matches
+                .OrderBy(m => m.Index)
+                .Take(maxResults)
+                .Select(m => (m.Id, m.Metadata))
+                .ToList();
+        }
+
         /// <summary>
         /// SimpleSearch är en grundläggande linjär sökning som inte utnyttjar HNSW-graf
         /// </summary>
