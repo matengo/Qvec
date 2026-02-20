@@ -65,7 +65,7 @@ jobs:
             --no-build --configuration Release --output ./packages
 
       - name: Push to NuGet.org
-        if: ${{ secrets.NUGET_API_KEY != '' }}
+        if: secrets.NUGET_API_KEY != ''
         run: |
           dotnet nuget push ./packages/*.nupkg \
             --api-key ${{ secrets.NUGET_API_KEY }} \
