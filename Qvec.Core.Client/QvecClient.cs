@@ -40,7 +40,6 @@ namespace Qvec.Core.Client
                 });
             }
         }
-
         private string Serialize(T item) =>
             _jsonInfo is not null
                 ? JsonSerializer.Serialize(item, _jsonInfo)
@@ -51,15 +50,15 @@ namespace Qvec.Core.Client
                 ? JsonSerializer.Deserialize(json, _jsonInfo)
                 : JsonSerializer.Deserialize<T>(json);
 
-        public Guid AddEntry(float[] vector, T item, Guid? externalId = null)
+        public Guid AddEntry(VectorData<T> data)
         {
-            string metadata = Serialize(item);
-            Guid id = _db.AddEntry(vector, metadata, externalId);
+            string metadata = Serialize(data.Item);
+            Guid id = _db.AddEntry(data.vector, metadata, data.externalId);
 
             if (_extractor != null)
             {
                 int index = _db.GetCount() - 1;
-                _db.AddFieldIndex(index, _extractor.ExtractFields(item));
+                _db.AddFieldIndex(index, _extractor.ExtractFields(data.Item));
             }
 
             return id;
@@ -240,7 +239,12 @@ namespace Qvec.Core.Client
             }
         }
     }
-
+    public class VectorData<T>
+    {
+        public T Item { get; set; } = default!;
+        public float[] vector { get; set; } = Array.Empty<float>();
+        public Guid? externalId { get; set; }
+    }
     public class TypedSearchResult<T>
     {
         public Guid Id { get; set; }
