@@ -112,15 +112,26 @@ public class ValidationTests
     }
 
     [Fact]
-    public void AddEntry_BeyondCapacity_ThrowsQvecFullException()
+    public void AddEntry_BeyondCapacity_GrowsByDefaultButThrowsWhenGrowthIsDisabled()
     {
         using var temp = new TempDb();
         using var db = temp.Open(dim: 4, max: 1);
 
         db.AddEntry(Vec.Basis(4, 0), "{}");
 
-        var ex = Assert.Throws<QvecFullException>(() => db.AddEntry(Vec.Basis(4, 1), "{}"));
-        Assert.Equal(1, ex.MaxCount);
+        // max is a starting size, not a ceiling: by default the file grows instead.
+        db.AddEntry(Vec.Basis(4, 1), "{}");
+        Assert.Equal(2, db.LiveCount);
+
+        // Callers that need a hard bound -- PartitionedQvecDatabase in particular -- opt out,
+        // and then a full database still reports itself as full.
+        db.AutoGrow = false;
+        int ceiling = db.MaxCount;
+        for (int i = db.GetCount(); i < ceiling; i++)
+            db.AddEntry(Vec.Basis(4, i % 4), "{}");
+
+        var ex = Assert.Throws<QvecFullException>(() => db.AddEntry(Vec.Basis(4, 2), "{}"));
+        Assert.Equal(ceiling, ex.MaxCount);
         Assert.IsAssignableFrom<QvecException>(ex);
     }
 

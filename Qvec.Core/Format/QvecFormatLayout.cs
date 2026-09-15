@@ -42,6 +42,111 @@ public static class QvecFormatLayout
         };
 
         var offset = (long)V4Header.HeaderSizeValue;
+        LayOutSections(header, maxCount, vectorDimension, maxNeighbors, maxLayers, metadataHeapCapacity, ref offset);
+
+        header.NextSectionDataOffset = offset;
+        header.FileLength = offset;
+
+        return header;
+    }
+
+    /// <summary>
+    /// Produces the header a database should have after growing to <paramref name="newMaxCount"/>
+    /// rows and a metadata heap of <paramref name="newMetadataHeapCapacity"/> bytes.
+    /// <para>
+    /// Every section keeps its identity and its contents; only offsets and lengths change. The
+    /// sections are laid out in the same fixed order as <see cref="CreateInitial"/>, so a grown
+    /// file is indistinguishable from one created at the larger size. Because each section grows,
+    /// every section after the first moves to a higher offset, which is why the caller must copy
+    /// section data back to front.
+    /// </para>
+    /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// The new capacities are smaller than the current ones. Growing is the only supported
+    /// direction; shrinking is what <c>Vacuum</c> is for.
+    /// </exception>
+    public static V4Header CreateGrown(V4Header current, long newMaxCount, long newMetadataHeapCapacity)
+    {
+        ArgumentNullException.ThrowIfNull(current);
+
+        if (newMaxCount < current.MaxCountRaw)
+        {
+            throw new ArgumentOutOfRangeException(nameof(newMaxCount),
+                $"Cannot shrink MaxCount from {current.MaxCountRaw} to {newMaxCount}.");
+        }
+
+        if (newMetadataHeapCapacity < current.MetadataHeapCapacity)
+        {
+            throw new ArgumentOutOfRangeException(nameof(newMetadataHeapCapacity),
+                $"Cannot shrink the metadata heap from {current.MetadataHeapCapacity} to {newMetadataHeapCapacity}.");
+        }
+
+        ValidateCreateArguments(
+            current.VectorDimension, newMaxCount, current.MaxNeighbors, current.MaxLayers,
+            newMetadataHeapCapacity, current.DistanceFunction);
+
+        var grown = current.CloneState();
+        grown.MaxCountRaw = newMaxCount;
+        grown.MetadataHeapCapacity = newMetadataHeapCapacity;
+        grown.UpdatedUnixTimeSeconds = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+
+        var offset = (long)V4Header.HeaderSizeValue;
+        LayOutSections(
+            grown, newMaxCount, current.VectorDimension, current.MaxNeighbors, current.MaxLayers,
+            newMetadataHeapCapacity, ref offset);
+
+        grown.NextSectionDataOffset = offset;
+        grown.FileLength = offset;
+
+        return grown;
+    }
+
+    /// <summary>
+    /// The next capacity to grow to. Geometric growth keeps the amortised cost of an insert
+    /// constant: growing by a fixed amount would make filling a database quadratic in the number
+    /// of grows, and each grow copies the whole file.
+    /// </summary>
+    public static long RecommendGrownMaxCount(long currentMaxCount)
+    {
+        if (currentMaxCount < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(currentMaxCount), "MaxCount must be non-negative.");
+        }
+
+        return Math.Max(currentMaxCount + 1, checked(currentMaxCount + currentMaxCount / 2));
+    }
+
+    /// <summary>
+    /// The next metadata heap capacity, large enough to hold <paramref name="requiredEnd"/> bytes.
+    /// A single blob can be larger than the whole current heap, so the required size has to be a
+    /// floor rather than just a growth factor.
+    /// </summary>
+    public static long RecommendGrownMetadataHeapCapacity(long currentCapacity, long requiredEnd)
+    {
+        if (currentCapacity < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(currentCapacity), "Capacity must be non-negative.");
+        }
+
+        if (requiredEnd < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(requiredEnd), "Required end must be non-negative.");
+        }
+
+        long geometric = checked(currentCapacity + currentCapacity / 2);
+        long stepped = checked(currentCapacity + MinMetadataHeapCapacity);
+        return Math.Max(requiredEnd, Math.Max(geometric, stepped));
+    }
+
+    private static void LayOutSections(
+        V4Header header,
+        long maxCount,
+        int vectorDimension,
+        int maxNeighbors,
+        int maxLayers,
+        long metadataHeapCapacity,
+        ref long offset)
+    {
         AddSection(header.Sections[0], V4SectionIds.Vectors, ref offset, maxCount, checked((uint)(vectorDimension * sizeof(float))));
         AddSection(header.Sections[1], V4SectionIds.Graph, ref offset, maxCount, checked((uint)(maxLayers * maxNeighbors * sizeof(int))));
         AddSection(header.Sections[2], V4SectionIds.MetadataDescriptors, ref offset, maxCount, 16);
@@ -49,11 +154,6 @@ public static class QvecFormatLayout
         AddSection(header.Sections[4], V4SectionIds.Tombstones, ref offset, maxCount, 1);
         AddSection(header.Sections[5], V4SectionIds.FreeList, ref offset, maxCount, 8);
         AddByteSection(header.Sections[6], V4SectionIds.MetadataHeap, ref offset, metadataHeapCapacity, SectionFlags.AppendOnly);
-
-        header.NextSectionDataOffset = offset;
-        header.FileLength = offset;
-
-        return header;
     }
 
     public static long RecommendMetadataHeapCapacity(long maxCount)
