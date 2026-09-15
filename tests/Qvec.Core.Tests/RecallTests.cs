@@ -205,7 +205,12 @@ internal static class RecallMeasurement
             max: n,
             maxNeighbors: maxNeighbors,
             maxLayers: 5,
-            distance: distance);
+            distance: distance,
+            // The HNSW layer draw is randomized by default, so without this a "seeded"
+            // measurement still varied by several points of recall between runs and any floor
+            // close to the measured value flaked. Reusing the data seed keeps each
+            // configuration's graph fixed while still differing across seeds.
+            indexSeed: seed);
 
         var rng = new Random(seed);
         var ids = new Guid[n];

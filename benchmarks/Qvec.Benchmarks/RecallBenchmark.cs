@@ -88,7 +88,11 @@ public static class RecallBenchmark
             max: dataset.Base.Count,
             maxNeighbors: options.MaxNeighbors,
             maxLayers: options.MaxLayers,
-            distanceFunction: options.Distance);
+            distanceFunction: options.Distance,
+            // Pinned so a published number can be re-derived. HNSW layer assignment is random by
+            // default, so without this two runs of the identical command produce two different
+            // graphs and recall moves by a point or two for no visible reason.
+            indexSeed: options.IndexSeed);
 
         var buildTime = BuildIndex(db, dataset, options);
 
@@ -226,6 +230,11 @@ public sealed class BenchmarkOptions
     public int WarmupQueries { get; init; } = 100;
     public int ProgressEvery { get; init; } = 100_000;
     public IReadOnlyList<int> EfSearchSweep { get; init; } = [10, 20, 40, 80, 160, 320, 640];
+
+    /// <summary>
+    /// Seed for the HNSW layer assignment, so a published curve can be reproduced exactly.
+    /// </summary>
+    public int IndexSeed { get; init; } = 20240001;
 }
 
 /// <summary>A complete run, ready to be turned into the README table.</summary>

@@ -58,13 +58,24 @@ namespace Qvec.Core
         private TombstoneSet _deletedIndices;
         private readonly int[] _cachedEmptyNeighbors;
 
+        // Null means "use Random.Shared", i.e. the randomized default. A non-null instance is
+        // not thread-safe, but every RandomLayer() call happens under the write lock.
+        private readonly Random? _layerRng;
+
         // Inverterat index: field -> value -> set of entry indices
         private readonly Dictionary<string, Dictionary<string, HashSet<int>>> _fieldIndex = new();
 
 
         
-        public QvecDatabase(string path, int dim = 1536, int max = 1000, int maxNeighbors = 32, int maxLayers = 5, DistanceFunction distanceFunction = DistanceFunction.DotProduct)
-            : this(path, dim, max, maxNeighbors, maxLayers, distanceFunction, honourHeaderSilently: false)
+        /// <param name="indexSeed">
+        /// Optional seed for the HNSW layer assignment. When omitted the layer draw is
+        /// randomized, which is the right default: a fixed layer pattern in every deployment
+        /// would make the index structure predictable from the insert order alone. Supplying a
+        /// seed makes index construction reproducible, which is what benchmarks and recall
+        /// regression tests need in order to be re-derivable.
+        /// </param>
+        public QvecDatabase(string path, int dim = 1536, int max = 1000, int maxNeighbors = 32, int maxLayers = 5, DistanceFunction distanceFunction = DistanceFunction.DotProduct, int? indexSeed = null)
+            : this(path, dim, max, maxNeighbors, maxLayers, distanceFunction, honourHeaderSilently: false, indexSeed: indexSeed)
         {
         }
 
@@ -85,8 +96,10 @@ namespace Qvec.Core
         }
 
         private QvecDatabase(string path, int dim, int max, int maxNeighbors, int maxLayers,
-                             DistanceFunction distanceFunction, bool honourHeaderSilently)
+                             DistanceFunction distanceFunction, bool honourHeaderSilently,
+                             int? indexSeed = null)
         {
+            _layerRng = indexSeed is int seed ? new Random(seed) : null;
             ArgumentException.ThrowIfNullOrWhiteSpace(path);
             _path = Path.GetFullPath(path);
 
@@ -2073,7 +2086,7 @@ namespace Qvec.Core
 
         private int RandomLayer()
         {
-            double r = Random.Shared.NextDouble();
+            double r = (_layerRng ?? Random.Shared).NextDouble();
             if (r <= 0) r = 0.0001;
 
             int level = (int)(-Math.Log(r) * _header.LayerProbability);

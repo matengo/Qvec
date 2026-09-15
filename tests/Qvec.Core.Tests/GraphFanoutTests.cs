@@ -160,12 +160,15 @@ public sealed class GraphFanoutTests
             worst = Math.Min(worst, recall.RecallAt1);
         }
 
-        // Measured on this exact configuration:
-        //   M0 == M  (before): recall@1 29.0% / 41.0% / 39.0%, recall@10 26.5% / 26.5% / 29.7%
-        //   M0 == 2M (after):  recall@1 58.0% / 58.0% / 58.0%, recall@10 50.8% / 51.1% / 53.3%
-        // The floor sits below the measured worst case with margin, so it fails on a real
-        // regression rather than on seed noise.
-        Assert.True(worst >= 0.52, $"Worst recall@1 across seeds was {worst:P1}, below the 52.0% floor.");
+        // Measured on this exact configuration, now reproducible run-to-run because
+        // RecallMeasurement pins the HNSW layer seed:
+        //   M0 == M  (before): recall@1 29.0% / 41.0% / 39.0%
+        //   M0 == 2M (after):  recall@1 56.0% / 52.0% / 56.0%
+        // The floor sits below the measured worst case but far above the pre-change best, so it
+        // fails on a real fan-out regression while tolerating incidental changes to traversal
+        // order. Before the layer seed existed these numbers moved by up to eight points between
+        // runs of the identical test, which made any floor this close to the measurement flake.
+        Assert.True(worst >= 0.48, $"Worst recall@1 across seeds was {worst:P1}, below the 48.0% floor.");
     }
 
     private static RawGraph ReadGraph(string path)
