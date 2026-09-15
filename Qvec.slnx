@@ -5,6 +5,7 @@
     <File Path="docs/design-update-delete.md" />
   </Folder>
   <Folder Name="/Files/">
+    <File Path="CONTRIBUTING.md" />
     <File Path="README.md" />
     <File Path="TODO.md" />
   </Folder>
@@ -13,5 +14,15 @@
   <Project Path="Qvec.Console/Qvec.Console.csproj" Id="5a92a05d-d3e9-4ca4-9e06-89b48ce62fbb" />
   <Project Path="Qvec.Core.Client/Qvec.Core.Client.csproj" Id="86f2dcde-4102-4f82-9de3-d3acb2e8eb27" />
   <Project Path="Qvec.Core/Qvec.Core.csproj" Id="d140938d-34d5-4a7a-baf6-05162fe06a03" />
+  <Project Path="Qvec.Extensions.VectorData/Qvec.Extensions.VectorData.csproj" />
   <Project Path="Qvec.SourceGen/Qvec.SourceGen.csproj" />
+  <Folder Name="/samples/">
+    <Project Path="samples/Qvec.Samples.Readme/Qvec.Samples.Readme.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Qvec.Api.Tests/Qvec.Api.Tests.csproj" />
+    <Project Path="tests/Qvec.Core.Tests/Qvec.Core.Tests.csproj" />
+    <Project Path="tests/Qvec.Core.Client.Tests/Qvec.Core.Client.Tests.csproj" />
+    <Project Path="tests/Qvec.Extensions.VectorData.Tests/Qvec.Extensions.VectorData.Tests.csproj" />
+  </Folder>
 </Solution>

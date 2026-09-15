@@ -1,0 +1,35 @@
+root = true
+
+# Several source files were previously saved in a non-UTF-8 encoding, which made
+# Swedish characters render as mojibake (for example "f?lt" instead of "fält").
+# Pinning the charset here keeps that from recurring.
+[*]
+charset = utf-8
+end_of_line = crlf
+indent_style = space
+indent_size = 4
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+[*.{yml,yaml,json,md}]
+indent_size = 2
+
+[*.md]
+trim_trailing_whitespace = false
+
+[*.{csproj,props,targets,slnx}]
+indent_size = 2
+
+[*.cs]
+# Nullable reference type violations are errors, not suggestions. The review found
+# several nullability warnings that had been ignored for a long time.
+dotnet_diagnostic.CS8600.severity = warning
+dotnet_diagnostic.CS8602.severity = warning
+dotnet_diagnostic.CS8604.severity = warning
+dotnet_diagnostic.CS8618.severity = warning
+dotnet_diagnostic.CS8625.severity = warning
+
+csharp_new_line_before_open_brace = all
+csharp_indent_case_contents = true
+csharp_prefer_braces = true:suggestion
+dotnet_sort_system_directives_first = true

@@ -4,8 +4,10 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <IsAotCompatible>true</IsAotCompatible>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <IncludeBuildOutput>true</IncludeBuildOutput>
+    <TargetsForTfmSpecificContentInPackage>$(TargetsForTfmSpecificContentInPackage);_PackQvecSourceGeneratorAnalyzer</TargetsForTfmSpecificContentInPackage>
   </PropertyGroup>
 
   <ItemGroup>
@@ -15,13 +17,37 @@
                       ReferenceOutputAssembly="false" />
   </ItemGroup>
 
-  <!-- Bädda in source generator-DLL:en i NuGet-paketet -->
-  <ItemGroup>
-    <None Include="..\Qvec.SourceGen\bin\$(Configuration)\netstandard2.0\Qvec.SourceGen.dll"
-          Pack="true"
-          PackagePath="analyzers/dotnet/cs"
-          Visible="false" />
-  </ItemGroup>
+  <Target Name="_ResolveQvecSourceGeneratorAnalyzerFromReference"
+          DependsOnTargets="ResolveReferences"
+          Condition="'$(NoBuild)' != 'true'">
+    <ItemGroup>
+      <_QvecSourceGeneratorAnalyzer Include="@(Analyzer)"
+                                    Condition="'%(Filename)' == 'Qvec.SourceGen' and '%(Extension)' == '.dll'" />
+    </ItemGroup>
+  </Target>
+
+  <Target Name="_ResolveQvecSourceGeneratorAnalyzerFromProject"
+          Condition="'$(NoBuild)' == 'true'">
+    <MSBuild Projects="..\Qvec.SourceGen\Qvec.SourceGen.csproj"
+             Targets="GetTargetPath"
+             Properties="Configuration=$(Configuration)"
+             RemoveProperties="TargetFramework;NoBuild">
+      <Output TaskParameter="TargetOutputs" ItemName="_QvecSourceGeneratorAnalyzer" />
+    </MSBuild>
+  </Target>
+
+  <Target Name="_PackQvecSourceGeneratorAnalyzer"
+          DependsOnTargets="_ResolveQvecSourceGeneratorAnalyzerFromReference;_ResolveQvecSourceGeneratorAnalyzerFromProject">
+    <Error Condition="'@(_QvecSourceGeneratorAnalyzer)' == ''"
+           Text="Qvec.SourceGen analyzer was not resolved from the ProjectReference; cannot create a NuGet package without the source generator." />
+    <Error Condition="'@(_QvecSourceGeneratorAnalyzer)' != '' and !Exists('%(_QvecSourceGeneratorAnalyzer.FullPath)')"
+           Text="Qvec.SourceGen analyzer file is missing at '%(_QvecSourceGeneratorAnalyzer.FullPath)'; build Qvec.SourceGen before packing or do not use --no-build." />
+
+    <ItemGroup>
+      <TfmSpecificPackageFile Include="@(_QvecSourceGeneratorAnalyzer)"
+                              PackagePath="analyzers/dotnet/cs/" />
+    </ItemGroup>
+  </Target>
 
   <ItemGroup>
     <None Include="..\README.md" Pack="true" PackagePath="\" />

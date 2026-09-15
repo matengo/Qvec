@@ -6,12 +6,12 @@
     <Nullable>enable</Nullable>
 	<AllowUnsafeBlocks>true</AllowUnsafeBlocks>
 	<PublishAot>true</PublishAot>
+	<IsAotCompatible>true</IsAotCompatible>
 	<OptimizationPreference>Speed</OptimizationPreference>
-	<PackageReadmeFile>README.md</PackageReadmeFile>
   </PropertyGroup>
 
   <ItemGroup>
-    <None Include="..\README.md" Pack="true" PackagePath="\" />
+    <PackageReference Include="System.IO.Hashing" Version="10.0.0" />
   </ItemGroup>
 
 </Project>

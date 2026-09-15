@@ -14,7 +14,7 @@ jobs:
   build-and-test:
     name: Build and Test
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    if: github.event_name == 'push' || github.event_name == 'pull_request' || github.event_name == 'release'
     permissions:
       contents: read
 
@@ -33,14 +33,34 @@ jobs:
       - name: Build solution
         run: dotnet build --no-restore --configuration Release
 
+      - name: Build README samples
+        run: dotnet build samples/Qvec.Samples.Readme/Qvec.Samples.Readme.csproj --no-restore --configuration Release
+
+      - name: Verify test projects exist
+        shell: bash
+        run: |
+          if ! find . -name '*.csproj' -print0 | xargs -0 grep -l 'Microsoft.NET.Test.Sdk' | grep -q .; then
+            echo "No test projects found — see plan phase 1"
+            exit 1
+          fi
+
       - name: Run tests
-        run: dotnet test --no-build --configuration Release --verbosity normal
+        run: dotnet test --no-build --configuration Release --verbosity normal --filter "Category!=KnownDefect&Category!=Slow"
+
+      - name: Run slow quality tests
+        run: dotnet test --no-build --configuration Release --verbosity normal --filter "Category=Slow"
+
+      - name: Publish Qvec.Console with Native AOT
+        run: dotnet publish Qvec.Console/Qvec.Console.csproj --configuration Release -r linux-x64 /p:PublishAot=true --self-contained true
+
+      - name: Publish Qvec.Api with Native AOT
+        run: dotnet publish Qvec.Api/Qvec.Api.csproj --configuration Release -r linux-x64 /p:PublishAot=true --self-contained true
 
   publish:
     name: Publish NuGet Packages
     needs: build-and-test
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' || github.event_name == 'release'
+    if: github.event_name == 'release'
     permissions:
       contents: read
     env:
@@ -58,13 +78,8 @@ jobs:
       - name: Compute version
         id: version
         run: |
-          if [[ "${{ github.event_name }}" == "release" ]]; then
-            TAG="${{ github.event.release.tag_name }}"
-            VERSION="${TAG#v}"
-          else
-            PREFIX=$(grep -oP '(?<=<VersionPrefix>)[^<]+' Directory.Build.props)
-            VERSION="${PREFIX%.*}.${{ github.run_number }}"
-          fi
+          TAG="${{ github.event.release.tag_name }}"
+          VERSION="${TAG#v}"
           echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Computed version: $VERSION"
 

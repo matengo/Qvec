@@ -1,65 +1,65 @@
-- [x] **Guid som dokument-ID** — Implementera `Guid`-baserade dokument-ID:n för att möjliggöra synk mellan databaser. Designdokument: [docs/design-guid-id.md](docs/design-guid-id.md)
-- [x] Lägg till Guid-sektion i filformatet (16 bytes/post efter metadata-sektionen)
-- [x] Nya fält: `_guidSectionOffset`, `_guidIndex` dictionary
+- [x] **Guid som dokument-ID** â€” Implementera `Guid`-baserade dokument-ID:n fÃ¶r att mÃ¶jliggÃ¶ra synk mellan databaser. Designdokument: [docs/design-guid-id.md](docs/design-guid-id.md)
+- [x] LÃ¤gg till Guid-sektion i filformatet (16 bytes/post efter metadata-sektionen)
+- [x] Nya fÃ¤lt: `_guidSectionOffset`, `_guidIndex` dictionary
 - [x] `WriteGuidToDisk` / `ReadGuidFromDisk` metoder
 - [x] `RebuildGuidIndex` vid uppstart
-- [x] Ändra `AddEntry` att returnera `Guid` och stödja `externalId`-parameter
-- [x] Dedup-logik: hoppa över om Guid redan finns
-- [x] Ändra alla `Search`-metoder att returnera `Guid` istället för `int` i resultat
+- [x] Ã„ndra `AddEntry` att returnera `Guid` och stÃ¶dja `externalId`-parameter
+- [x] Dedup-logik: hoppa Ã¶ver om Guid redan finns
+- [x] Ã„ndra alla `Search`-metoder att returnera `Guid` istÃ¤llet fÃ¶r `int` i resultat
 - [x] `GetByGuid` lookup-metod
 - [x] `SyncFrom(QvecDatabase source)` metod
 - [x] Uppdatera `PartitionedQvecDatabase` att propagera Guid
 - [x] Uppdatera `QvecClient<T>` returtyper
 - [x] Uppdatera API-endpoints
-- [x] Bakåtkompatibilitet: auto-migrering av v1-filer
+- [x] BakÃ¥tkompatibilitet: auto-migrering av v1-filer
 - [x] Bumpa `DbHeader.Version` till 2
-- [ ] Uppdatera tester
-- [ ] **Delete** — Implementera soft-delete med tombstone-baserad strategi. Designdokument: [docs/design-update-delete.md](docs/design-update-delete.md)
-  - [x] Lägg till tombstone-sektion i filformatet (1 byte/post efter Guid-sektionen)
-  - [x] Nytt fält `DeletedCount` i `DbHeader`
+- [x] Uppdatera tester
+- [x] **Delete** â€” Implementera soft-delete med tombstone-baserad strategi. Designdokument: [docs/design-update-delete.md](docs/design-update-delete.md)
+  - [x] LÃ¤gg till tombstone-sektion i filformatet (1 byte/post efter Guid-sektionen)
+  - [x] Nytt fÃ¤lt `DeletedCount` i `DbHeader`
   - [x] In-memory `_deletedIndices` HashSet, laddas vid uppstart
-  - [x] `Delete(Guid id)` — markera tombstone, rensa grannreferenser i HNSW-grafen
-  - [x] `DisconnectNode` — nollställ borttagen nods grannar och ta bort inkommande referenser
-  - [x] `RemoveNeighborReference` — ta bort specifik nod ur en annan nods grannlista
+  - [x] `Delete(Guid id)` â€” markera tombstone, rensa grannreferenser i HNSW-grafen
+  - [x] `DisconnectNode` â€” nollstÃ¤ll borttagen nods grannar och ta bort inkommande referenser
+  - [x] `RemoveNeighborReference` â€” ta bort specifik nod ur en annan nods grannlista
   - [x] Hantera EntryPoint-migration vid delete av EntryPoint-nod
-  - [x] Filtrera bort tombstones i alla sökmetoder (`Search`, `SearchSimple`, `SearchSimpleParallel`)
+  - [x] Filtrera bort tombstones i alla sÃ¶kmetoder (`Search`, `SearchSimple`, `SearchSimpleParallel`)
   - [x] Filtrera bort tombstones i `CalculateScore` / `SearchLayerNearest`
   - [x] Uppdatera `PartitionedQvecDatabase` med `Delete`
   - [x] Uppdatera `QvecClient<T>` med `DeleteEntry`
-  - [x] Lägg till `DELETE /vectors/{guid}` endpoint i API
-  - [ ] Tester för delete, grannintegritet, EntryPoint-migration
-- [ ] **Update** — Implementera uppdatering av vektor och/eller metadata. Designdokument: [docs/design-update-delete.md](docs/design-update-delete.md)
-  - [x] `UpdateMetadata(Guid id, string newMetadata)` — in-place överskrivning av metadata-slot
-  - [x] `UpdateVector(Guid id, float[] newVector)` — soft-delete + re-insert med samma Guid
-  - [x] `Update(Guid id, float[] newVector, string newMetadata)` — kombinerad metod
+  - [x] LÃ¤gg till `DELETE /vectors/{guid}` endpoint i API
+  - [x] Tester fÃ¶r delete, grannintegritet, EntryPoint-migration
+- [x] **Update** â€” Implementera uppdatering av vektor och/eller metadata. Designdokument: [docs/design-update-delete.md](docs/design-update-delete.md)
+  - [x] `UpdateMetadata(Guid id, string newMetadata)` â€” in-place Ã¶verskrivning av metadata-slot
+  - [x] `UpdateVector(Guid id, float[] newVector)` â€” soft-delete + re-insert med samma Guid
+  - [x] `Update(Guid id, float[] newVector, string newMetadata)` â€” kombinerad metod
   - [x] Uppdatera `PartitionedQvecDatabase` med `Update`
   - [x] Uppdatera `QvecClient<T>` med `UpdateEntry`
-  - [x] Lägg till `PUT /vectors/{guid}` endpoint i API
-  - [ ] Tester för metadata-update, vektor-update, kombinerad update
-- [ ] **Vacuum / Kompaktering** — Återvinn lagring efter många deletes. Designdokument: [docs/design-update-delete.md](docs/design-update-delete.md)
-  - [ ] `Vacuum()` — skapa ny fil, kopiera aktiva poster, bygg om HNSW-graf
+  - [x] LÃ¤gg till `PUT /vectors/{guid}` endpoint i API
+  - [x] Tester fÃ¶r metadata-update, vektor-update, kombinerad update
+- [ ] **Vacuum / Kompaktering** â€” Ã…tervinn lagring efter mÃ¥nga deletes. Designdokument: [docs/design-update-delete.md](docs/design-update-delete.md)
+  - [ ] `Vacuum()` â€” skapa ny fil, kopiera aktiva poster, bygg om HNSW-graf
   - [ ] Auto-vacuum trigger vid `DeletedCount / CurrentCount > threshold`
-  - [ ] Tester för vacuum, verifiering av data-integritet efter kompaktering
-- [ ] **Sync Engine** — Opt-in edge-cloud synkronisering för flera lokala Qvec-databaser. Designdokument: [docs/design-sync-engine.md](docs/design-sync-engine.md)
+  - [ ] Tester fÃ¶r vacuum, verifiering av data-integritet efter kompaktering
+- [ ] **Sync Engine** â€” Opt-in edge-cloud synkronisering fÃ¶r flera lokala Qvec-databaser. Designdokument: [docs/design-sync-engine.md](docs/design-sync-engine.md)
   - [ ] Nytt projekt `Qvec.Sync` (klient-sida, refererar `Qvec.Core`)
-    - [ ] `SyncEvent` / `SyncEventHeader` — binärt eventformat (Add, UpdateVector, UpdateMetadata, Delete)
-    - [ ] `SyncState` — lokal offset-tracking, persisteras till disk
-    - [ ] `SyncOptions` — konfiguration (ServerUrl, TransportType, ConnectionString, StateFilePath)
-    - [ ] `ISyncTransport` — abstrakt transport-interface (Send, Subscribe, PullDelta)
-    - [ ] `WebPubSubTransport` — Azure Web PubSub implementation
-    - [ ] `SseTransport` — Server-Sent Events implementation
-    - [ ] `WebSocketTransport` — Raw WebSocket implementation
-    - [ ] `QvecSyncAgent` — huvudklass som wrappar `QvecDatabase`
-      - [ ] `StartAsync` — initial catch-up (PullDelta) + starta realtidsprenumeration
-      - [ ] `AddEntryAsync` — lokal skrivning + outbound event till server
-      - [ ] `UpdateAsync` — lokal uppdatering + outbound event till server
-      - [ ] `DeleteAsync` — lokal delete + outbound event till server
-      - [ ] `OnRemoteEvent` — applicera inkommande events lokalt (idempotent via Guid)
-      - [ ] Outbound event queue med retry-logik för offline-scenarier
-    - [ ] Tester för SyncAgent, delta-sync, reconnect catch-up, dedup
+    - [ ] `SyncEvent` / `SyncEventHeader` â€” binÃ¤rt eventformat (Add, UpdateVector, UpdateMetadata, Delete)
+    - [ ] `SyncState` â€” lokal offset-tracking, persisteras till disk
+    - [ ] `SyncOptions` â€” konfiguration (ServerUrl, TransportType, ConnectionString, StateFilePath)
+    - [ ] `ISyncTransport` â€” abstrakt transport-interface (Send, Subscribe, PullDelta)
+    - [ ] `WebPubSubTransport` â€” Azure Web PubSub implementation
+    - [ ] `SseTransport` â€” Server-Sent Events implementation
+    - [ ] `WebSocketTransport` â€” Raw WebSocket implementation
+    - [ ] `QvecSyncAgent` â€” huvudklass som wrappar `QvecDatabase`
+      - [ ] `StartAsync` â€” initial catch-up (PullDelta) + starta realtidsprenumeration
+      - [ ] `AddEntryAsync` â€” lokal skrivning + outbound event till server
+      - [ ] `UpdateAsync` â€” lokal uppdatering + outbound event till server
+      - [ ] `DeleteAsync` â€” lokal delete + outbound event till server
+      - [ ] `OnRemoteEvent` â€” applicera inkommande events lokalt (idempotent via Guid)
+      - [ ] Outbound event queue med retry-logik fÃ¶r offline-scenarier
+    - [ ] Tester fÃ¶r SyncAgent, delta-sync, reconnect catch-up, dedup
   - [ ] Nytt projekt `Qvec.Sync.Server` (server-sida, Azure Function relay)
-    - [ ] `POST /events` — ta emot event, skriva till Append Blob, notifiera via Web PubSub
-    - [ ] `GET /delta?from={offset}` — returnera events sedan offset via Range Request
-    - [ ] `GET /status` — blob-storlek och antal anslutna klienter
-    - [ ] Konfliktstrategi: Last-Write-Wins (LWW) baserat på Append Blob-ordning
-    - [ ] Tester för server-endpoints, concurrent appends, delta-requests
+    - [ ] `POST /events` â€” ta emot event, skriva till Append Blob, notifiera via Web PubSub
+    - [ ] `GET /delta?from={offset}` â€” returnera events sedan offset via Range Request
+    - [ ] `GET /status` â€” blob-storlek och antal anslutna klienter
+    - [ ] Konfliktstrategi: Last-Write-Wins (LWW) baserat pÃ¥ Append Blob-ordning
+    - [ ] Tester fÃ¶r server-endpoints, concurrent appends, delta-requests

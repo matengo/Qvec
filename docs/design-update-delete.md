@@ -2,23 +2,23 @@
 
 ## Bakgrund
 
-Qvec använder idag ett **append-only** filformat där varje dokument tilldelas ett sekventiellt `int`-index som direkt mappar till en fysisk position i den minnesmappade filen. Det finns ingen mekanism för att ta bort eller uppdatera enskilda dokument.
+Qvec anvÃ¤nder idag ett **append-only** filformat dÃ¤r varje dokument tilldelas ett sekventiellt `int`-index som direkt mappar till en fysisk position i den minnesmappade filen. Det finns ingen mekanism fÃ¶r att ta bort eller uppdatera enskilda dokument.
 
-Med [Guid som logiskt dokument-ID](design-guid-id.md) får vi en stabil extern referens som gör det naturligt att erbjuda `Update(Guid, ...)` och `Delete(Guid)`.
+Med [Guid som logiskt dokument-ID](design-guid-id.md) fÃ¥r vi en stabil extern referens som gÃ¶r det naturligt att erbjuda `Update(Guid, ...)` och `Delete(Guid)`.
 
 ## Utmaning: append-only + HNSW-graf
 
-Att fysiskt flytta eller ta bort data i mitten av en memory-mapped fil är kostsamt:
-- Alla efterföljande index skulle förskjutas ? alla grannreferenser i HNSW-grafen blir ogiltiga.
-- Kompaktering kräver omskrivning av hela filen.
+Att fysiskt flytta eller ta bort data i mitten av en memory-mapped fil Ã¤r kostsamt:
+- Alla efterfÃ¶ljande index skulle fÃ¶rskjutas ? alla grannreferenser i HNSW-grafen blir ogiltiga.
+- Kompaktering krÃ¤ver omskrivning av hela filen.
 
-Därför väljer vi en **tombstone-baserad soft-delete** som är standardmönstret för denna typ av datastruktur.
+DÃ¤rfÃ¶r vÃ¤ljer vi en **tombstone-baserad soft-delete** som Ã¤r standardmÃ¶nstret fÃ¶r denna typ av datastruktur.
 
 ## Design
 
-### Ny sektion: Tombstone-bitfält
+### Ny sektion: Tombstone-bitfÃ¤lt
 
-En ny sektion läggs till i filformatet. Varje dokument representeras av en enda byte (1 = borttagen, 0 = aktiv). Detta ger snabb lookup och är alignment-vänligt.
+En ny sektion lÃ¤ggs till i filformatet. Varje dokument representeras av en enda byte (1 = borttagen, 0 = aktiv). Detta ger snabb lookup och Ã¤r alignment-vÃ¤nligt.
 
 ```
 ??????????????????????????  0
@@ -36,17 +36,17 @@ En ny sektion läggs till i filformatet. Varje dokument representeras av en enda 
 ??????????????????????????
 ```
 
-### Nytt fält i DbHeader
+### Nytt fÃ¤lt i DbHeader
 
 ```csharp
 public struct DbHeader
 {
-    // ... befintliga fält ...
+    // ... befintliga fÃ¤lt ...
     public int DeletedCount;  // Antal soft-deleted dokument
 }
 ```
 
-`ActiveCount` kan alltid beräknas som `CurrentCount - DeletedCount`.
+`ActiveCount` kan alltid berÃ¤knas som `CurrentCount - DeletedCount`.
 
 ### In-memory state
 
@@ -69,16 +69,16 @@ public bool Delete(Guid id)
 
 ### Steg
 
-1. **Slå upp Guid ? int index** via `_guidIndex`. Returnera `false` om Guid inte finns.
+1. **SlÃ¥ upp Guid ? int index** via `_guidIndex`. Returnera `false` om Guid inte finns.
 2. **Markera som deleted:**
-   - Skriv `1` till tombstone-sektionen på disk för det indexet.
-   - Lägg till i `_deletedIndices`.
-   - Ta bort från `_guidIndex`.
+   - Skriv `1` till tombstone-sektionen pÃ¥ disk fÃ¶r det indexet.
+   - LÃ¤gg till i `_deletedIndices`.
+   - Ta bort frÃ¥n `_guidIndex`.
 3. **Rensa grannreferenser:**
-   - Nollställ den borttagna nodens grannar i alla HNSW-lager (skriv `-1`).
+   - NollstÃ¤ll den borttagna nodens grannar i alla HNSW-lager (skriv `-1`).
    - Iterera alla grannar som pekade tillbaka till den borttagna noden och ta bort referensen.
 4. **Hantera EntryPoint:**
-   - Om den borttagna noden var `EntryPoint`, välj en ny EntryPoint bland kvarvarande grannar eller via linjärt scan.
+   - Om den borttagna noden var `EntryPoint`, vÃ¤lj en ny EntryPoint bland kvarvarande grannar eller via linjÃ¤rt scan.
 5. **Uppdatera header:**
    - `DeletedCount++`.
    - Flush header till disk.
@@ -93,7 +93,7 @@ private void DisconnectNode(int deletedIndex)
     {
         for (int level = 0; level < _header.MaxLayers; level++)
         {
-            // Hämta alla grannar till den borttagna noden
+            // HÃ¤mta alla grannar till den borttagna noden
             GetNeighborsAtLevel(deletedIndex, level, neighbors);
 
             for (int j = 0; j < _header.MaxNeighbors; j++)
@@ -101,11 +101,11 @@ private void DisconnectNode(int deletedIndex)
                 if (neighbors[j] == -1) break;
                 int neighborId = neighbors[j];
 
-                // Ta bort deletedIndex från grannens grannlista
+                // Ta bort deletedIndex frÃ¥n grannens grannlista
                 RemoveNeighborReference(neighborId, level, deletedIndex);
             }
 
-            // Nollställ den borttagna nodens egna grannar
+            // NollstÃ¤ll den borttagna nodens egna grannar
             InitNeighborsAtLevel(deletedIndex, level);
         }
     }
@@ -126,7 +126,7 @@ private void RemoveNeighborReference(int nodeIndex, int level, int targetToRemov
         {
             if (neighbors[i] == targetToRemove)
             {
-                // Skifta resterande grannar ett steg åt vänster
+                // Skifta resterande grannar ett steg Ã¥t vÃ¤nster
                 for (int k = i; k < _header.MaxNeighbors - 1; k++)
                     neighbors[k] = neighbors[k + 1];
                 neighbors[_header.MaxNeighbors - 1] = -1;
@@ -142,9 +142,9 @@ private void RemoveNeighborReference(int nodeIndex, int level, int targetToRemov
 }
 ```
 
-### Filtrera bort tombstones i sökning
+### Filtrera bort tombstones i sÃ¶kning
 
-Alla sökmetoder måste hoppa över borttagna noder. Befintlig `CalculateScore` och loop-logik ändras:
+Alla sÃ¶kmetoder mÃ¥ste hoppa Ã¶ver borttagna noder. Befintlig `CalculateScore` och loop-logik Ã¤ndras:
 
 ```csharp
 // I SearchLayerNearest, efter visited.Add(neighbor):
@@ -154,7 +154,7 @@ if (_deletedIndices.Contains(neighbor)) continue;
 if (_deletedIndices.Contains(i)) continue;
 ```
 
-Detta är en billig `HashSet<int>.Contains` — O(1) per check.
+Detta Ã¤r en billig `HashSet<int>.Contains` â€” O(1) per check.
 
 ---
 
@@ -168,15 +168,15 @@ public bool UpdateMetadata(Guid id, string newMetadata)
 public bool Update(Guid id, float[] newVector, string newMetadata)
 ```
 
-### Strategi: In-place för metadata, Delete+Re-insert för vektor
+### Strategi: In-place fÃ¶r metadata, Delete+Re-insert fÃ¶r vektor
 
 **Metadata-uppdatering** (billig):
-- Slå upp Guid ? int index.
-- Skriv över metadata-sloten direkt — den har fast storlek (512 bytes).
-- Inga grafändringar behövs.
+- SlÃ¥ upp Guid ? int index.
+- Skriv Ã¶ver metadata-sloten direkt â€” den har fast storlek (512 bytes).
+- Inga grafÃ¤ndringar behÃ¶vs.
 
-**Vektor-uppdatering** (kräver graf-omskrivning):
-- Vektorn påverkar alla grannrelationer i HNSW-grafen.
+**Vektor-uppdatering** (krÃ¤ver graf-omskrivning):
+- Vektorn pÃ¥verkar alla grannrelationer i HNSW-grafen.
 - Enklaste korrekta strategin: **soft-delete + re-insert**.
 
 ```csharp
@@ -195,7 +195,7 @@ public bool Update(Guid id, float[] newVector, string newMetadata)
             return true;
         }
 
-        // Vektor ändrad ? delete + re-insert med samma Guid
+        // Vektor Ã¤ndrad ? delete + re-insert med samma Guid
         string metadata = newMetadata ?? GetMetadata(oldIndex);
         SoftDelete(oldIndex);
         AddEntry(newVector, metadata, externalId: id);
@@ -205,7 +205,7 @@ public bool Update(Guid id, float[] newVector, string newMetadata)
 }
 ```
 
-### UpdateMetadata — in-place
+### UpdateMetadata â€” in-place
 
 ```csharp
 public bool UpdateMetadata(Guid id, string newMetadata)
@@ -227,7 +227,7 @@ public bool UpdateMetadata(Guid id, string newMetadata)
 
 ## Kompaktering (Vacuum)
 
-Soft-delete lämnar "hål" i filen. Vid många deletes slösas lagring och sökprestanda försämras (fler noder att hoppa över).
+Soft-delete lÃ¤mnar "hÃ¥l" i filen. Vid mÃ¥nga deletes slÃ¶sas lagring och sÃ¶kprestanda fÃ¶rsÃ¤mras (fler noder att hoppa Ã¶ver).
 
 ### Publikt API
 
@@ -237,51 +237,51 @@ public void Vacuum()
 
 ### Steg
 
-1. Skapa en ny temporär databasfil.
-2. Iterera alla aktiva poster (hoppa över `_deletedIndices`).
+1. Skapa en ny temporÃ¤r databasfil.
+2. Iterera alla aktiva poster (hoppa Ã¶ver `_deletedIndices`).
 3. Kopiera vektor, metadata och Guid till den nya filen via `AddEntry(..., externalId: guid)`.
 4. HNSW-grafen byggs om automatiskt av `AddEntry/ConnectNewNode`.
-5. Byt ut den gamla filen med den nya (atomiskt om möjligt).
-6. Nollställ `DeletedCount`.
+5. Byt ut den gamla filen med den nya (atomiskt om mÃ¶jligt).
+6. NollstÃ¤ll `DeletedCount`.
 
-### När ska man köra Vacuum?
+### NÃ¤r ska man kÃ¶ra Vacuum?
 
 | Strategi | Trigger |
 |---|---|
-| Manuellt | Användaren kallar `Vacuum()` explicit |
-| Automatiskt | När `DeletedCount / CurrentCount > threshold` (t.ex. 25%) |
-| Schemalagt | I bakgrundstjänst vid låg last |
+| Manuellt | AnvÃ¤ndaren kallar `Vacuum()` explicit |
+| Automatiskt | NÃ¤r `DeletedCount / CurrentCount > threshold` (t.ex. 25%) |
+| Schemalagt | I bakgrundstjÃ¤nst vid lÃ¥g last |
 
 ---
 
-## Påverkade filer
+## PÃ¥verkade filer
 
-| Fil | Ändring |
+| Fil | Ã„ndring |
 |---|---|
-| `Qvec.Core\QvecDatabase.cs` | Tombstone-sektion, `Delete`, `Update*`, `Vacuum`, grannrensning, sökfiltrering |
-| `Qvec.Core\PartitionedQvecDatabase.cs` | Propagera `Delete`/`Update` genom att hitta rätt partition via Guid |
+| `Qvec.Core\QvecDatabase.cs` | Tombstone-sektion, `Delete`, `Update*`, `Vacuum`, grannrensning, sÃ¶kfiltrering |
+| `Qvec.Core\PartitionedQvecDatabase.cs` | Propagera `Delete`/`Update` genom att hitta rÃ¤tt partition via Guid |
 | `Qvec.Core.Client\QvecClient.cs` | `UpdateEntry`, `DeleteEntry` med typade metoder |
 | `Qvec.Api\*` | `PUT /vectors/{guid}`, `DELETE /vectors/{guid}` endpoints |
-| `Qvec.Console.Test\*` | Tester för delete, update, vacuum, EntryPoint-migration |
+| `Qvec.Console.Test\*` | Tester fÃ¶r delete, update, vacuum, EntryPoint-migration |
 
 ## Prestandabudget
 
 | Operation | Kostnad |
 |---|---|
-| `Delete` | O(M × L) där M = maxNeighbors, L = maxLayers — rensa grannar |
-| `UpdateMetadata` | O(1) — direkt överskrivning av 512-byte slot |
-| `UpdateVector` | O(Delete) + O(AddEntry) — soft-delete + re-insert |
-| `Vacuum` | O(N × AddEntry) — full ombyggnad, körs sällan |
-| Sökoverhead | +1 `HashSet.Contains` per besökt nod — försumbart |
-| Lagring | +1 byte/post för tombstone, +4 bytes i header för `DeletedCount` |
+| `Delete` | O(M Ã— L) dÃ¤r M = maxNeighbors, L = maxLayers â€” rensa grannar |
+| `UpdateMetadata` | O(1) â€” direkt Ã¶verskrivning av 512-byte slot |
+| `UpdateVector` | O(Delete) + O(AddEntry) â€” soft-delete + re-insert |
+| `Vacuum` | O(N Ã— AddEntry) â€” full ombyggnad, kÃ¶rs sÃ¤llan |
+| SÃ¶koverhead | +1 `HashSet.Contains` per besÃ¶kt nod â€” fÃ¶rsumbart |
+| Lagring | +1 byte/post fÃ¶r tombstone, +4 bytes i header fÃ¶r `DeletedCount` |
 
 ## Korrekthetsgarantier
 
-- **HNSW-grafens integritet:** `DisconnectNode` säkerställer att inga grannar pekar på en borttagen nod. Sökning kan aldrig nå en tombstoned nod via grannlänkar.
-- **Guid-stabilitet:** Ett dokument som uppdateras med ny vektor behåller sin Guid. Externa system som cachelagrat Guid:t behöver inte uppdateras.
-- **Trådsäkerhet:** Alla mutationer sker under `WriteLock`. Läsoperationer filtrerar bort `_deletedIndices` under `ReadLock`.
-- **Persistens:** Tombstones skrivs till disk innan header uppdateras, vilket garanterar att en crash aldrig kan dölja en delete.
+- **HNSW-grafens integritet:** `DisconnectNode` sÃ¤kerstÃ¤ller att inga grannar pekar pÃ¥ en borttagen nod. SÃ¶kning kan aldrig nÃ¥ en tombstoned nod via grannlÃ¤nkar.
+- **Guid-stabilitet:** Ett dokument som uppdateras med ny vektor behÃ¥ller sin Guid. Externa system som cachelagrat Guid:t behÃ¶ver inte uppdateras.
+- **TrÃ¥dsÃ¤kerhet:** Alla mutationer sker under `WriteLock`. LÃ¤soperationer filtrerar bort `_deletedIndices` under `ReadLock`.
+- **Persistens:** Tombstones skrivs till disk innan header uppdateras, vilket garanterar att en crash aldrig kan dÃ¶lja en delete.
 
-## Beroende på
+## Beroende pÃ¥
 
-- [Design: Guid som dokument-ID](design-guid-id.md) — Guid-infrastruktur måste implementeras först.
+- [Design: Guid som dokument-ID](design-guid-id.md) â€” Guid-infrastruktur mÃ¥ste implementeras fÃ¶rst.
