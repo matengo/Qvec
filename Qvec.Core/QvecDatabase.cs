@@ -12,7 +12,14 @@ namespace Qvec.Core
     public enum DistanceFunction : int
     {
         DotProduct = 0,
-        Cosine = 1
+        Cosine = 1,
+
+        /// <summary>
+        /// Straight-line distance. Unlike the other two this ranks by position rather than
+        /// direction, which is what the standard ANN corpora and most image and audio
+        /// embeddings mean by a nearest neighbour. Vectors are stored unnormalised.
+        /// </summary>
+        Euclidean = 2
     }
 
     public class QvecDatabase : IDisposable
@@ -51,13 +58,24 @@ namespace Qvec.Core
         private TombstoneSet _deletedIndices;
         private readonly int[] _cachedEmptyNeighbors;
 
+        // Null means "use Random.Shared", i.e. the randomized default. A non-null instance is
+        // not thread-safe, but every RandomLayer() call happens under the write lock.
+        private readonly Random? _layerRng;
+
         // Inverterat index: field -> value -> set of entry indices
         private readonly Dictionary<string, Dictionary<string, HashSet<int>>> _fieldIndex = new();
 
 
         
-        public QvecDatabase(string path, int dim = 1536, int max = 1000, int maxNeighbors = 32, int maxLayers = 5, DistanceFunction distanceFunction = DistanceFunction.DotProduct)
-            : this(path, dim, max, maxNeighbors, maxLayers, distanceFunction, honourHeaderSilently: false)
+        /// <param name="indexSeed">
+        /// Optional seed for the HNSW layer assignment. When omitted the layer draw is
+        /// randomized, which is the right default: a fixed layer pattern in every deployment
+        /// would make the index structure predictable from the insert order alone. Supplying a
+        /// seed makes index construction reproducible, which is what benchmarks and recall
+        /// regression tests need in order to be re-derivable.
+        /// </param>
+        public QvecDatabase(string path, int dim = 1536, int max = 1000, int maxNeighbors = 32, int maxLayers = 5, DistanceFunction distanceFunction = DistanceFunction.DotProduct, int? indexSeed = null)
+            : this(path, dim, max, maxNeighbors, maxLayers, distanceFunction, honourHeaderSilently: false, indexSeed: indexSeed)
         {
         }
 
@@ -78,8 +96,10 @@ namespace Qvec.Core
         }
 
         private QvecDatabase(string path, int dim, int max, int maxNeighbors, int maxLayers,
-                             DistanceFunction distanceFunction, bool honourHeaderSilently)
+                             DistanceFunction distanceFunction, bool honourHeaderSilently,
+                             int? indexSeed = null)
         {
+            _layerRng = indexSeed is int seed ? new Random(seed) : null;
             ArgumentException.ThrowIfNullOrWhiteSpace(path);
             _path = Path.GetFullPath(path);
 
@@ -436,6 +456,76 @@ namespace Qvec.Core
             for (; i < count; i++) dot += left[i] * right[i];
             return dot;
         }
+
+        /// <summary>
+        /// Negated squared Euclidean distance, which is the score used by
+        /// <see cref="DistanceFunction.Euclidean"/>.
+        ///
+        /// Negated because every heap, sort and pruning comparison in the HNSW code treats a
+        /// higher score as better; flipping the sign here means none of that code has to know
+        /// which metric is in use. Squared because the square root is a monotone function of
+        /// the sum, so it cannot change any ordering — it would only cost time and precision.
+        /// </summary>
+        public static float NegativeSquaredDistance(float[] left, float[] right, int count)
+        {
+            int i = 0;
+            var accumulator = Vector<float>.Zero;
+            int vectorSize = Vector<float>.Count;
+
+            for (; i <= count - vectorSize; i += vectorSize)
+            {
+                var difference = new Vector<float>(left, i) - new Vector<float>(right, i);
+                accumulator += difference * difference;
+            }
+
+            float sum = Vector.Sum(accumulator);
+            for (; i < count; i++)
+            {
+                float d = left[i] - right[i];
+                sum += d * d;
+            }
+
+            return -sum;
+        }
+
+        internal static float NegativeSquaredDistance(ReadOnlySpan<float> left, ReadOnlySpan<float> right)
+        {
+            int i = 0;
+            var accumulator = Vector<float>.Zero;
+            int vectorSize = Vector<float>.Count;
+            int count = Math.Min(left.Length, right.Length);
+
+            for (; i <= count - vectorSize; i += vectorSize)
+            {
+                var difference = new Vector<float>(left.Slice(i, vectorSize)) - new Vector<float>(right.Slice(i, vectorSize));
+                accumulator += difference * difference;
+            }
+
+            float sum = Vector.Sum(accumulator);
+            for (; i < count; i++)
+            {
+                float d = left[i] - right[i];
+                sum += d * d;
+            }
+
+            return -sum;
+        }
+
+        /// <summary>
+        /// The single place that decides what "closer" means. Every scoring call site goes
+        /// through here or through its span/pointer siblings, so adding a metric is a change
+        /// in one switch rather than in a dozen scattered loops.
+        /// Higher is always better, whichever metric is configured.
+        /// </summary>
+        private float Similarity(float[] query, float[] stored, int count) =>
+            _header.DistanceFunction == DistanceFunction.Euclidean
+                ? NegativeSquaredDistance(query, stored, count)
+                : DotProduct(query, stored, count);
+
+        private float Similarity(ReadOnlySpan<float> query, ReadOnlySpan<float> stored) =>
+            _header.DistanceFunction == DistanceFunction.Euclidean
+                ? NegativeSquaredDistance(query, stored)
+                : DotProduct(query, stored);
 
         /// <summary>
         /// Returns a vector suitable for scoring against stored data. For cosine distance the
@@ -1170,7 +1260,7 @@ namespace Qvec.Core
 
                         long offset = (long)i * _header.VectorDimension * sizeof(float);
                         _dataAccessor.ReadArray(offset, v, 0, _header.VectorDimension);
-                        float score = DotProduct(query, v, _header.VectorDimension);
+                        float score = Similarity(query, v, _header.VectorDimension);
                         scored.Add((i, score));
                     }
                 }
@@ -1280,7 +1370,7 @@ namespace Qvec.Core
                     try
                     {
                         _dataAccessor.ReadArray((long)i * _header.VectorDimension * sizeof(float), v, 0, _header.VectorDimension);
-                        float score = DotProduct(query, v, _header.VectorDimension);
+                        float score = Similarity(query, v, _header.VectorDimension);
                         candidates.Add((i, score));
                     }
                     finally
@@ -1358,7 +1448,7 @@ namespace Qvec.Core
 
                     float* currentVecPtr = vectorBasePtr + (i * dim);
 
-                    float score = DotProductUnsafe(query, currentVecPtr, dim);
+                    float score = SimilarityUnsafe(query, currentVecPtr, dim);
                     partialResults[i] = (i, score);
                 });
             }
@@ -1465,7 +1555,7 @@ namespace Qvec.Core
                 float[] vector = GetVector(i);
                 try
                 {
-                    matches.Add((i, DotProduct(query, vector, _header.VectorDimension), meta));
+                    matches.Add((i, Similarity(query, vector, _header.VectorDimension), meta));
                 }
                 finally
                 {
@@ -1598,7 +1688,7 @@ namespace Qvec.Core
         /// </summary>
         /// <param name="ordered">Candidates sorted by descending similarity to the owner.</param>
         /// <param name="vectors">Candidate vectors, laid out contiguously in <paramref name="ordered"/> order.</param>
-        private static (int Id, float Score)[] PruneNeighbors(
+        private (int Id, float Score)[] PruneNeighbors(
             (int Id, float Score)[] ordered, float[] vectors, int dim, int m)
         {
             var selected = new List<(int Id, float Score)>(m);
@@ -1614,7 +1704,7 @@ namespace Qvec.Core
                 foreach (int slot in selectedSlots)
                 {
                     // Score is a similarity: higher means closer.
-                    if (DotProduct(candidateVector, vectors.AsSpan(slot * dim, dim)) > candidate.Score)
+                    if (Similarity(candidateVector, vectors.AsSpan(slot * dim, dim)) > candidate.Score)
                     {
                         closerToOwnerThanToNeighbours = false;
                         break;
@@ -1917,12 +2007,12 @@ namespace Qvec.Core
                         ReadVectorInto(neighbors[i], candidateVectors, i * dim);
                         candidates[i] = (
                             neighbors[i],
-                            DotProduct(existingVector.AsSpan(0, dim), candidateVectors.AsSpan(i * dim, dim)));
+                            Similarity(existingVector.AsSpan(0, dim), candidateVectors.AsSpan(i * dim, dim)));
                     }
 
                     int newSlot = slots;
                     newVector.AsSpan(0, dim).CopyTo(candidateVectors.AsSpan(newSlot * dim, dim));
-                    candidates[newSlot] = (newNode, DotProduct(existingVector, newVector, dim));
+                    candidates[newSlot] = (newNode, Similarity(existingVector, newVector, dim));
 
                     // Reorder candidates (and their vectors) by descending similarity so the
                     // pruning pass can run entirely in memory.
@@ -1996,7 +2086,7 @@ namespace Qvec.Core
 
         private int RandomLayer()
         {
-            double r = Random.Shared.NextDouble();
+            double r = (_layerRng ?? Random.Shared).NextDouble();
             if (r <= 0) r = 0.0001;
 
             int level = (int)(-Math.Log(r) * _header.LayerProbability);
@@ -2009,7 +2099,7 @@ namespace Qvec.Core
             {
                 long offset = (long)targetIndex * _header.VectorDimension * sizeof(float);
                 _dataAccessor.ReadArray(offset, targetVector, 0, _header.VectorDimension);
-                return DotProduct(query, targetVector, _header.VectorDimension);
+                return Similarity(query, targetVector, _header.VectorDimension);
             }
             finally
             {
@@ -2189,6 +2279,40 @@ namespace Qvec.Core
                 }
                 return _dataBasePtr;
             }
+        }
+
+        /// <summary>
+        /// Metric dispatch for the memory-mapped fast path, which scores straight against a raw
+        /// pointer instead of copying the stored vector out first.
+        /// </summary>
+        private unsafe float SimilarityUnsafe(float[] query, float* stored, int dim) =>
+            _header.DistanceFunction == DistanceFunction.Euclidean
+                ? NegativeSquaredDistanceUnsafe(query, stored, dim)
+                : DotProductUnsafe(query, stored, dim);
+
+        private static unsafe float NegativeSquaredDistanceUnsafe(float[] left, float* right, int dim)
+        {
+            int i = 0;
+            var accumulator = Vector<float>.Zero;
+            int vectorSize = Vector<float>.Count;
+
+            fixed (float* pLeft = left)
+            {
+                for (; i <= dim - vectorSize; i += vectorSize)
+                {
+                    var difference = *(Vector<float>*)(pLeft + i) - *(Vector<float>*)(right + i);
+                    accumulator += difference * difference;
+                }
+            }
+
+            float sum = Vector.Sum(accumulator);
+            for (; i < dim; i++)
+            {
+                float d = left[i] - right[i];
+                sum += d * d;
+            }
+
+            return -sum;
         }
 
         // SIMD DotProduct som arbetar direkt mot en rå pekare

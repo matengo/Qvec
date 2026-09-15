@@ -236,9 +236,11 @@ public static class QvecFormatLayout
             throw new ArgumentOutOfRangeException(nameof(metadataHeapCapacity), "Metadata heap capacity must be non-negative.");
         }
 
-        if (distanceFunction is not DistanceFunction.DotProduct and not DistanceFunction.Cosine)
+        if (distanceFunction is not DistanceFunction.DotProduct
+            and not DistanceFunction.Cosine
+            and not DistanceFunction.Euclidean)
         {
-            throw new ArgumentOutOfRangeException(nameof(distanceFunction), "Distance function must be DotProduct or Cosine.");
+            throw new ArgumentOutOfRangeException(nameof(distanceFunction), "Distance function must be DotProduct, Cosine or Euclidean.");
         }
     }
 }

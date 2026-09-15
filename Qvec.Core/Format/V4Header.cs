@@ -172,8 +172,9 @@ public sealed class V4Header
         {
             0 => DistanceFunction.DotProduct,
             1 => DistanceFunction.Cosine,
+            2 => DistanceFunction.Euclidean,
             _ => throw new QvecFormatException(
-                $"DistanceFunction must be 0 (DotProduct) or 1 (Cosine) but was {DistanceFunctionRaw}."),
+                $"DistanceFunction must be 0 (DotProduct), 1 (Cosine) or 2 (Euclidean) but was {DistanceFunctionRaw}."),
         };
         set => DistanceFunctionRaw = (int)value;
     }
@@ -504,7 +505,7 @@ public sealed class V4Header
             $"EntryPoint must be -1 or a row index below CurrentCount ({header.CurrentCountRaw}) but was {header.EntryPointRaw}.");
         Require(header.EntryPointLevel >= 0 && header.EntryPointLevel < header.MaxLayers,
             $"EntryPointLevel must be in the range 0..{header.MaxLayers - 1} but was {header.EntryPointLevel}.");
-        Require(header.DistanceFunctionRaw is 0 or 1, $"DistanceFunction must be 0 (DotProduct) or 1 (Cosine) but was {header.DistanceFunctionRaw}.");
+        Require(header.DistanceFunctionRaw is 0 or 1 or 2, $"DistanceFunction must be 0 (DotProduct), 1 (Cosine) or 2 (Euclidean) but was {header.DistanceFunctionRaw}.");
         Require(header.QuantizationMode == 0,
             $"QuantizationMode is {header.QuantizationMode}; this build reserves quantization modes but does not implement them.");
         Require(header.QuantizationSectionId == 0,

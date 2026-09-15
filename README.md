@@ -15,7 +15,9 @@ Unlike client-server vector DBs, Qvec runs in-process, using **MemoryMappedFiles
 *   **HNSW Indexing:** Approximate nearest-neighbor search with tunable `maxNeighbors` and `efSearch` parameters for speed/recall trade-offs. The base layer uses double fan-out (`M0 = 2 × M`) as recommended by the HNSW paper.
 *   **Disk-Backed Storage:** Uses `MemoryMappedFiles` for persistent local storage that survives application restarts.
 *   **Growable, Sparse Files:** Capacity is a starting point, not a limit. The file is created sparse and grows geometrically — both row capacity and the metadata heap — when it runs out of room. Set `AutoGrow = false` for a hard ceiling.
-*   **Hardware-Accelerated Math:** Uses .NET vector APIs and unsafe pointer paths for SIMD-friendly dot-product scoring.
+*   **Three Distance Metrics:** `DotProduct`, `Cosine` and `Euclidean` (L2). Cosine normalizes stored copies; the other two store vectors untouched. Euclidean is the metric most image and audio embeddings — and every published ANN benchmark corpus — are defined against.
+*   **Hardware-Accelerated Math:** Uses .NET vector APIs and unsafe pointer paths for SIMD-friendly scoring.
+*   **Reproducible Index Builds:** HNSW layer assignment is randomized by default, so two builds of the same data normally produce different graphs. Pass `indexSeed:` to pin it — necessary for benchmarks and recall regression tests to be re-derivable.
 *   **Guid Document IDs:** `AddEntry` returns a stable `Guid` document identifier; external IDs can be supplied for deduplication and sync scenarios.
 *   **Update and Delete:** Supports tombstone-based delete, metadata updates, and vector updates by delete-and-reinsert. `Vacuum()` compacts the file, reuses tombstoned rows, reclaims orphaned metadata, and rebuilds the HNSW graph.
 *   **Metadata Filtering:** General metadata predicates are supported after HNSW retrieval; `[QvecIndexed]` equality filters can pre-filter via an in-memory inverted index.
@@ -25,16 +27,26 @@ Unlike client-server vector DBs, Qvec runs in-process, using **MemoryMappedFiles
 
 ## 📊 Performance Benchmark
 
-Qvec's performance and recall depend strongly on HNSW parameters, especially `efSearch`. The original README benchmark is being replaced with measured, parameterized results.
+Measured on **SIFT-1M** ([TexMex corpus](http://corpus-texmex.irisa.fr/)) against its published exact ground truth — not against a linear scan in the same process.
 
-Measured on 5,000 random uniform 128-dimensional vectors with recall@1 against exact linear search:
+1,000,000 base vectors, 128 dimensions, 10,000 queries. `DistanceFunction.Euclidean`, `maxNeighbors = 32`, `maxLayers = 5`. Single-threaded queries on 12 logical cores, Windows 11.
 
-| maxNeighbors | efSearch | recall@1 |
-| ---: | ---: | ---: |
-| 32 (default) | 50 | ~85% |
-| 32 (default) | 200 (default) | >=95% |
+| efSearch | recall@1 | recall@10 | QPS | mean latency |
+| ---: | ---: | ---: | ---: | ---: |
+| 10 | 89.3 % | 86.0 % | 4,099 | 0.244 ms |
+| 20 | 95.3 % | 93.8 % | 2,708 | 0.369 ms |
+| 40 | 98.0 % | 97.8 % | 1,652 | 0.605 ms |
+| 80 | 98.8 % | 99.4 % | 977 | 1.024 ms |
+| 160 | 99.2 % | 99.8 % | 569 | 1.757 ms |
+| 320 | 99.2 % | 99.9 % | 327 | 3.057 ms |
 
-Random uniform vectors are often harder for HNSW than real embedding distributions, and different datasets/hardware will produce different timings. If recall matters, raise `efSearch` and measure on your own data.
+Index build: 4,133 s (242 inserts/s), producing a 1,324 MiB file, with `indexSeed` pinned so the run can be reproduced. **Build throughput is currently the weakest number here** and is the next thing being worked on; query performance is not affected by it.
+
+A single recall figure would be misleading, because any ANN index reaches 99% by widening the beam until it has effectively scanned everything. The honest unit is the whole curve, so pick the row that matches your latency budget.
+
+Reproduce with `dotnet run -c Release --project benchmarks/Qvec.Benchmarks -- --dataset sift --download`. See [benchmarks/README.md](benchmarks/README.md).
+
+> **Note on the previous numbers.** Earlier versions of this README reported "~85% recall@1 at efSearch=50", measured on randomly generated uniform vectors and scored against Qvec's own linear scan. That figure understated real-world behaviour substantially: in high dimensions uniform random vectors are all roughly equidistant, which is an artificially hard case that no real embedding model produces.
 
 ---
 
@@ -290,7 +302,8 @@ Planned cloud work is tracked in design documents and the roadmap below.
 - **ASP.NET health-check integration** — The core exposes `IsHealthy()` and the sample API maps `/health`; packaged Kubernetes/Azure health-check wiring is not implemented yet.
 - **Full Native AOT support for the typed client** — Remove or replace reflection, expression compilation, and reflection-based JSON paths.
 - **ProjectReference analyzer flow for source generation** — Ensure the `[QvecIndexed]` generator is available when consuming `Qvec.Core.Client` through project references.
-- **Published benchmark methodology** — Add reproducible benchmark projects, datasets, and hardware/runtime details.
+- **Published benchmark methodology** — ✅ Done. `benchmarks/Qvec.Benchmarks` measures recall vs. QPS against the TexMex SIFT/GIST corpora and their published ground truth.
+- **Faster index construction** — Build throughput is ~240 inserts/s on SIFT-1M and degrades as the index grows. Query performance is unaffected, but building a large index is slow.
 - **Multi-vector support** — Store and search multiple embeddings, such as image + text, for one logical entry.
 
 ## License

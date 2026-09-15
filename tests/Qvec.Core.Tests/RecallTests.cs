@@ -191,10 +191,13 @@ internal static class RecallMeasurement
         DistanceFunction distance,
         int seed,
         int queryCount,
-        bool deleteEveryOtherEntry = false)
+        bool deleteEveryOtherEntry = false,
+        Func<int, Random, float[]>? vectorSource = null)
     {
         if (queryCount <= 0) throw new ArgumentOutOfRangeException(nameof(queryCount));
         if (queryCount > n) throw new ArgumentOutOfRangeException(nameof(queryCount));
+
+        vectorSource ??= static (dim, rng) => Vec.Random(dim, rng);
 
         using var temp = new TempDb();
         using var db = temp.Open(
@@ -202,14 +205,19 @@ internal static class RecallMeasurement
             max: n,
             maxNeighbors: maxNeighbors,
             maxLayers: 5,
-            distance: distance);
+            distance: distance,
+            // The HNSW layer draw is randomized by default, so without this a "seeded"
+            // measurement still varied by several points of recall between runs and any floor
+            // close to the measured value flaked. Reusing the data seed keeps each
+            // configuration's graph fixed while still differing across seeds.
+            indexSeed: seed);
 
         var rng = new Random(seed);
         var ids = new Guid[n];
 
         for (int i = 0; i < n; i++)
         {
-            var vector = Vec.Random(dim, rng);
+            var vector = vectorSource(dim, rng);
             ids[i] = DeterministicId(i);
             db.AddEntry(vector, $$"""{"i":{{i}}}""", ids[i]);
         }
@@ -230,13 +238,13 @@ internal static class RecallMeasurement
 
         for (int measuredQueries = 0; measuredQueries < queryCount; measuredQueries++)
         {
-            var query = Vec.Random(dim, rng);
+            var query = vectorSource(dim, rng);
 
             // SearchSimple was verified in QvecDatabase.cs to scan every current
             // non-deleted row, skip tombstones, sort by score, and use the same
-            // score path as HNSW. It therefore matches dot-product semantics and
-            // cosine semantics, where both stored vectors and query copies are
-            // normalized by QvecDatabase before scoring.
+            // score path as HNSW. It therefore matches the semantics of whichever
+            // distance function is configured, including the normalisation cosine
+            // applies to both stored vectors and query copies.
             var exactTop10 = db.SearchSimple(query.ToArray(), topK: 10).Select(r => r.Id).ToArray();
             var approximateTop10 = db.Search(query.ToArray(), topK: 10, efSearch: efSearch).Select(r => r.Id).ToArray();
 
