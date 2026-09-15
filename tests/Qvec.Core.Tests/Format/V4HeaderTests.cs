@@ -38,7 +38,7 @@ public class V4HeaderTests
         { "EntryPoint", h => h.EntryPoint = h.CurrentCount },
         { "EntryPointLevel", h => h.EntryPointLevel = -1 },
         { "EntryPointLevel", h => h.EntryPointLevel = h.MaxLayers },
-        { "DistanceFunction", h => h.DistanceFunctionRaw = 2 },
+        { "DistanceFunction", h => h.DistanceFunctionRaw = 3 },
         { "QuantizationMode", h => h.QuantizationMode = 1 },
         { "QuantizationSectionId", h => h.QuantizationSectionId = 8 },
     };

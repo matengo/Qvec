@@ -117,7 +117,7 @@ Primary header är 512 bytes. Fälten nedan är absoluta offsetar från filens b
 | 84 | 8 | `Int64` | `EntryPoint` | radindex eller `-1` |
 | 92 | 4 | `Int32` | `EntryPointLevel` | `0..MaxLayers-1`, eller `0` när tom |
 | 96 | 8 | `Int64` | `DeletedCount` | antal tombstoned rader |
-| 104 | 4 | `Int32` | `DistanceFunction` | `0 = DotProduct`, `1 = Cosine` |
+| 104 | 4 | `Int32` | `DistanceFunction` | `0 = DotProduct`, `1 = Cosine`, `2 = Euclidean` |
 | 108 | 8 | `Int64` | `MetadataHeapUsed` | antal använda bytes i metadata heap |
 | 116 | 8 | `Int64` | `FreeListHead` | första fria radindex eller `-1` |
 | 124 | 8 | `Int64` | `FreeListCount` | antal noder i free list |
@@ -231,7 +231,7 @@ row i offset = Vectors.Offset + i * Vectors.ElementSize
 Vectors.ElementSize = VectorDimension * sizeof(float)
 ```
 
-Varje rad är `float32[VectorDimension]`. Semantiken för cosine är oförändrad: inlagrade vektorer är normaliserade kopior, caller-arrayer muteras inte.
+Varje rad är `float32[VectorDimension]`. Semantiken för cosine är oförändrad: inlagrade vektorer är normaliserade kopior, caller-arrayer muteras inte. För `DotProduct` och `Euclidean` lagras vektorn som den kom in — att normalisera under euklidisk metrik vore direkt fel, eftersom skalning ändrar avståndet till allt annat.
 
 Validering:
 

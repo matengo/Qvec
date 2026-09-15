@@ -61,4 +61,57 @@ public static class Vec
         Array.Fill(v, value);
         return v;
     }
+
+    /// <summary>
+    /// Vectors drawn from a mixture of Gaussian clusters, which is a far better stand-in for
+    /// real embeddings than <see cref="Random"/>.
+    ///
+    /// Uniformly random vectors in high dimensions are all roughly equidistant from each other,
+    /// so "the nearest neighbour" is barely distinguishable from the tenth nearest and any
+    /// graph index looks bad. Real embeddings are strongly clustered: the nearest neighbour is
+    /// genuinely much closer than the rest, and that gap is what HNSW navigates by. Measuring
+    /// only on uniform data therefore understates the index and, worse, hides regressions that
+    /// would only show up on the data users actually have.
+    /// </summary>
+    public sealed class ClusteredVectors
+    {
+        private readonly float[][] _centroids;
+        private readonly float _spread;
+        private int _next;
+
+        public ClusteredVectors(int dim, int clusterCount, int seed, float spread = 0.08f)
+        {
+            var rng = new Random(seed);
+            _centroids = new float[clusterCount][];
+            for (int c = 0; c < clusterCount; c++) _centroids[c] = Random(dim, rng);
+            _spread = spread;
+        }
+
+        /// <summary>
+        /// Matches the delegate shape taken by the recall harness. Successive calls walk the
+        /// clusters in turn, so the set is evenly populated regardless of how many are drawn.
+        /// </summary>
+        public float[] Next(int dim, Random rng)
+        {
+            var centroid = _centroids[_next++ % _centroids.Length];
+            var v = new float[dim];
+
+            for (int i = 0; i < dim; i++)
+            {
+                v[i] = centroid[i] + (_spread * Gaussian(rng));
+            }
+
+            return v;
+        }
+
+        // Box-Muller. Random has no Gaussian of its own, and a sum-of-uniforms approximation
+        // would put a hard bound on the tails, which is exactly where the interesting
+        // near-miss queries live.
+        private static float Gaussian(Random rng)
+        {
+            double u1 = 1.0 - rng.NextDouble();
+            double u2 = rng.NextDouble();
+            return (float)(Math.Sqrt(-2.0 * Math.Log(u1)) * Math.Cos(2.0 * Math.PI * u2));
+        }
+    }
 }

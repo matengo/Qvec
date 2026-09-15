@@ -15,7 +15,8 @@ Unlike client-server vector DBs, Qvec runs in-process, using **MemoryMappedFiles
 *   **HNSW Indexing:** Approximate nearest-neighbor search with tunable `maxNeighbors` and `efSearch` parameters for speed/recall trade-offs. The base layer uses double fan-out (`M0 = 2 × M`) as recommended by the HNSW paper.
 *   **Disk-Backed Storage:** Uses `MemoryMappedFiles` for persistent local storage that survives application restarts.
 *   **Growable, Sparse Files:** Capacity is a starting point, not a limit. The file is created sparse and grows geometrically — both row capacity and the metadata heap — when it runs out of room. Set `AutoGrow = false` for a hard ceiling.
-*   **Hardware-Accelerated Math:** Uses .NET vector APIs and unsafe pointer paths for SIMD-friendly dot-product scoring.
+*   **Three Distance Metrics:** `DotProduct`, `Cosine` and `Euclidean` (L2). Cosine normalizes stored copies; the other two store vectors untouched. Euclidean is the metric most image and audio embeddings — and every published ANN benchmark corpus — are defined against.
+*   **Hardware-Accelerated Math:** Uses .NET vector APIs and unsafe pointer paths for SIMD-friendly scoring.
 *   **Guid Document IDs:** `AddEntry` returns a stable `Guid` document identifier; external IDs can be supplied for deduplication and sync scenarios.
 *   **Update and Delete:** Supports tombstone-based delete, metadata updates, and vector updates by delete-and-reinsert. `Vacuum()` compacts the file, reuses tombstoned rows, reclaims orphaned metadata, and rebuilds the HNSW graph.
 *   **Metadata Filtering:** General metadata predicates are supported after HNSW retrieval; `[QvecIndexed]` equality filters can pre-filter via an in-memory inverted index.
