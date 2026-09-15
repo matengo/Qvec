@@ -10,7 +10,7 @@
        single file rather than one edit per project. -->
 
   <ItemGroup Label="Runtime">
-    <PackageVersion Include="System.IO.Hashing" Version="10.0.0" />
+    <PackageVersion Include="System.IO.Hashing" Version="10.0.12" />
     <PackageVersion Include="System.CommandLine" Version="2.0.3" />
     <PackageVersion Include="Microsoft.Extensions.VectorData.Abstractions" Version="10.10.0" />
   </ItemGroup>
