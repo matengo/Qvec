@@ -12,7 +12,7 @@ Unlike client-server vector DBs, Qvec runs in-process, using **MemoryMappedFiles
 ## 🚀 Key Features
 
 *   **Embedded .NET Library:** Runs in-process with no vector database server, daemon, or external service required.
-*   **HNSW Indexing:** Approximate nearest-neighbor search with tunable `maxNeighbors` and `efSearch` parameters for speed/recall trade-offs.
+*   **HNSW Indexing:** Approximate nearest-neighbor search with tunable `maxNeighbors` and `efSearch` parameters for speed/recall trade-offs. The base layer uses double fan-out (`M0 = 2 × M`) as recommended by the HNSW paper.
 *   **Disk-Backed Storage:** Uses `MemoryMappedFiles` for persistent local storage that survives application restarts.
 *   **Growable, Sparse Files:** Capacity is a starting point, not a limit. The file is created sparse and grows geometrically — both row capacity and the metadata heap — when it runs out of room. Set `AutoGrow = false` for a hard ceiling.
 *   **Hardware-Accelerated Math:** Uses .NET vector APIs and unsafe pointer paths for SIMD-friendly dot-product scoring.
@@ -282,8 +282,7 @@ Planned cloud work is tracked in design documents and the roadmap below.
 
 ## 📜 Roadmap / Not yet implemented
 
-- **Storage format v4** — The on-disk format is self-describing (magic, version, CRC-32 over the header, a section table, and a `WriteInProgress` flag). There is **no migration** from earlier formats; v2/v3 files are rejected with `QvecFormatException`.
-- **`M0 = 2 × M` on layer 0** — The HNSW paper's recommended fan-out for the base layer. Requires a graph-section layout change.
+- **Storage format v5** — The on-disk format is self-describing (magic, version, CRC-32 over the header, a section table, and a `WriteInProgress` flag). There is **no migration** from earlier formats; older files are rejected with `QvecFormatException`.
 - **int8 scalar quantization** — ~4× smaller vectors on disk and in memory. The format reserves space for the metadata this needs.
 - **Sync Engine** — Opt-in edge-cloud synchronization. Connect multiple local Qvec databases to a central sync server so connected instances can stay in sync automatically. The current design discusses Azure Append Blob and Azure Web PubSub, but this is not implemented. See [design doc](docs/design-sync-engine.md).
 - **Azure Blob Storage and Managed Identity integration** — Planned as part of the sync/cloud work; no Azure SDK dependency is shipped today.

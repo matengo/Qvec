@@ -27,7 +27,7 @@ public enum V4FormatOptions : uint
 public sealed class V4Header
 {
     public const int MagicNumberValue = 0x5A564543;
-    public const int CurrentFormatVersion = 4;
+    public const int CurrentFormatVersion = 5;
     public const int HeaderSizeValue = 4096;
     public const int PrimaryHeaderSizeValue = 512;
     public const int SectionTableOffsetValue = 512;
@@ -593,9 +593,11 @@ public sealed class V4Header
         Require(vectors.Length >= CheckedLength(header.MaxCountRaw, vectorElementSize, V4SectionIds.Vectors),
             "Vectors length is too small for MaxCount and VectorDimension.");
 
-        var graphElementSize = checked((uint)(header.MaxLayers * header.MaxNeighbors * sizeof(int)));
+        // Layer 0 is allocated 2 * MaxNeighbors slots (M0 = 2 * M, per Malkov & Yashunin) and
+        // every layer above it MaxNeighbors, which sums to (MaxLayers + 1) * MaxNeighbors.
+        var graphElementSize = checked((uint)((header.MaxLayers + 1) * header.MaxNeighbors * sizeof(int)));
         Require(graph.ElementSize == graphElementSize,
-            $"Graph ElementSize must be MaxLayers * MaxNeighbors * 4 ({graphElementSize}) but was {graph.ElementSize}.");
+            $"Graph ElementSize must be (MaxLayers + 1) * MaxNeighbors * 4 ({graphElementSize}) but was {graph.ElementSize}.");
         Require(graph.Length >= CheckedLength(header.MaxCountRaw, graphElementSize, V4SectionIds.Graph),
             "Graph length is too small for MaxCount, MaxLayers, and MaxNeighbors.");
 

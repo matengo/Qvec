@@ -98,7 +98,7 @@ Primary header är 512 bytes. Fälten nedan är absoluta offsetar från filens b
 | Offset | Storlek | Typ | Fältnamn | Värde / betydelse |
 |---:|---:|---|---|---|
 | 0 | 4 | `Int32` | `MagicNumber` | `0x5A564543` (`"ZVEC"`) |
-| 4 | 4 | `Int32` | `Version` | `4` |
+| 4 | 4 | `Int32` | `Version` | `CurrentFormatVersion` (`5`) |
 | 8 | 4 | `Int32` | `HeaderSize` | `4096` |
 | 12 | 4 | `Int32` | `PrimaryHeaderSize` | `512` |
 | 16 | 4 | `Int32` | `SectionTableOffset` | `512` |
@@ -204,7 +204,7 @@ Regler:
 |---:|---|---|---:|---|
 | 0 | `Unused` | nej | 0 | tom slot |
 | 1 | `Vectors` | ja | `VectorDimension * 4` | `float32[VectorDimension]` per rad |
-| 2 | `Graph` | ja | `MaxLayers * MaxNeighbors * 4` | `Int32` grannar per rad och lager |
+| 2 | `Graph` | ja | `(MaxLayers + 1) * MaxNeighbors * 4` | `Int32` grannar per rad och lager; level 0 har `2 * MaxNeighbors` platser |
 | 3 | `MetadataDescriptors` | ja | `16` | en descriptor per rad |
 | 4 | `MetadataHeap` | ja | `1` | UTF-8 metadata bytes, append-only |
 | 5 | `Guids` | ja | `16` | `Guid.ToByteArray()`-kompatibla bytes per rad |
@@ -242,9 +242,15 @@ Validering:
 
 Layout:
 
+Baslagret (level 0) har dubbel fan-out: `M0 = 2 * MaxNeighbors` platser, medan varje
+lager ovanför har `MaxNeighbors` platser. Det följer originalpubliceringen av HNSW och
+är det som gör baslagret navigerbart. Level 0 ligger först i raden, vilket betyder att
+varje level `l > 0` börjar på `(l + 1) * MaxNeighbors` — inte `l * MaxNeighbors`.
+
 ```
 row i offset      = Graph.Offset + i * Graph.ElementSize
-level l offset    = row i offset + l * MaxNeighbors * sizeof(Int32)
+level 0 offset    = row i offset
+level l offset    = row i offset + (l + 1) * MaxNeighbors * sizeof(Int32)   // l > 0
 neighbor j offset = level l offset + j * sizeof(Int32)
 ```
 
@@ -252,8 +258,8 @@ Varje neighbor är `Int32` row index eller `-1` för tom plats.
 
 Validering:
 
-- `Graph.Length >= MaxCount * MaxLayers * MaxNeighbors * 4`
-- `Graph.ElementSize == MaxLayers * MaxNeighbors * 4`
+- `Graph.Length >= MaxCount * (MaxLayers + 1) * MaxNeighbors * 4`
+- `Graph.ElementSize == (MaxLayers + 1) * MaxNeighbors * 4`
 - `EntryPoint == -1` eller `0 <= EntryPoint < CurrentCount`
 - `EntryPointLevel` inom `0..MaxLayers-1`
 
@@ -417,26 +423,32 @@ Motivering: `AllocateSlot` blir O(1) efter restart, men startup hittar korrupta 
 
 ## Version och kompatibilitet
 
-`CurrentFormatVersion = 4`.
+`CurrentFormatVersion = 5`.
+
+Version 5 skiljer sig från version 4 endast i `Graph.ElementSize`: baslagret fick dubbel
+fan-out (`M0 = 2 * MaxNeighbors`), vilket ändrade radlängden. Allt annat i headern är
+oförändrat. En v4-fil skulle redan ha avvisats av `ValidateSections`, eftersom
+`ElementSize` valideras mot formeln, men två olika layouter får inte kalla sig samma
+version.
 
 Exakt kompatibilitetsregel:
 
-- En v4-implementation får bara öppna filer med `MagicNumber == 0x5A564543` och `Version == 4`.
-- Version 1, 2 och 3 migreras inte.
-- Versioner större än 4 avvisas.
+- En implementation får bara öppna filer med `MagicNumber == 0x5A564543` och `Version == CurrentFormatVersion`.
+- Version 1 till 4 migreras inte.
+- Versioner större än `CurrentFormatVersion` avvisas.
 - `QvecDatabase.Open(path)` och den publika konstruktorn ska följa samma regel för befintliga filer.
 - Konstruktorargument (`dim`, `max`, `maxNeighbors`, `maxLayers`, `distanceFunction`) får inte användas för att tolka en befintlig fil. Om argumenten skiljer sig från headern ska konstruktorn kasta argument/header-mismatch på samma sätt som dagens säkra beteende, men offsets ska alltid komma från section table.
 
 För en äldre Qvec-fil ska `Open` kasta `QvecFormatException` med meddelande som innehåller följande ordalydelse:
 
 ```text
-'{path}' has Qvec format version {version}. This build only supports format version 4. Qvec does not migrate v2/v3 files automatically; export with an older Qvec version and re-import into v4.
+'{path}' has Qvec format version {version}. This build only supports format version {CurrentFormatVersion}. Qvec does not migrate older files automatically; export with the matching Qvec version and re-import.
 ```
 
 För framtida version:
 
 ```text
-'{path}' has Qvec format version {version}. This build only supports format version 4.
+'{path}' has Qvec format version {version}. This build only supports format version {CurrentFormatVersion}.
 ```
 
 För fel magic number:
@@ -557,7 +569,7 @@ Om `Dispose()` anropas när `WriteInProgress` fortfarande är satt på grund av 
 Den ska:
 
 1. läsa `HeaderSize` bytes från filen/accessorn,
-2. validera magic och `Version == 4`,
+2. validera magic och `Version == CurrentFormatVersion`,
 3. validera CRC,
 4. kräva `WriteInProgress == 0`,
 5. validera section table och kända section-längder,
@@ -770,7 +782,7 @@ Ny ordning:
    - annars kasta truncation/corrupt header.
 3. Läs `MagicNumber`.
 4. Läs `Version`.
-5. Kräv `Version == 4`.
+5. Kräv `Version == CurrentFormatVersion`.
 6. Kräv header-konstanter:
    - `HeaderSize == 4096`
    - `PrimaryHeaderSize == 512`
