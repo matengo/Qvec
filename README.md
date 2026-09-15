@@ -33,14 +33,14 @@ Measured on **SIFT-1M** ([TexMex corpus](http://corpus-texmex.irisa.fr/)) agains
 
 | efSearch | recall@1 | recall@10 | QPS | mean latency |
 | ---: | ---: | ---: | ---: | ---: |
-| 10 | 89.3 % | 86.0 % | 4,099 | 0.244 ms |
-| 20 | 95.3 % | 93.8 % | 2,708 | 0.369 ms |
-| 40 | 98.0 % | 97.8 % | 1,652 | 0.605 ms |
-| 80 | 98.8 % | 99.4 % | 977 | 1.024 ms |
-| 160 | 99.2 % | 99.8 % | 569 | 1.757 ms |
-| 320 | 99.2 % | 99.9 % | 327 | 3.057 ms |
+| 10 | 89.7 % | 85.9 % | 8,110 | 0.123 ms |
+| 20 | 95.3 % | 93.7 % | 5,128 | 0.195 ms |
+| 40 | 98.2 % | 97.8 % | 3,231 | 0.310 ms |
+| 80 | 99.0 % | 99.4 % | 1,873 | 0.534 ms |
+| 160 | 99.2 % | 99.8 % | 1,023 | 0.978 ms |
+| 320 | 99.2 % | 99.9 % | 573 | 1.744 ms |
 
-Index build: 4,133 s (242 inserts/s), producing a 1,324 MiB file, with `indexSeed` pinned so the run can be reproduced. **Build throughput is currently the weakest number here** and is the next thing being worked on; query performance is not affected by it.
+Index build: 2,762 s (362 inserts/s), producing a 1,324 MiB file, with `indexSeed` pinned so the run can be reproduced. Build throughput is still the weakest number here: the insert path is now dominated by the O(M0²) distance arithmetic of the neighbour-selection heuristic and by memory latency once the file outgrows the CPU caches. Query performance is not affected by it.
 
 A single recall figure would be misleading, because any ANN index reaches 99% by widening the beam until it has effectively scanned everything. The honest unit is the whole curve, so pick the row that matches your latency budget.
 
@@ -303,7 +303,7 @@ Planned cloud work is tracked in design documents and the roadmap below.
 - **Full Native AOT support for the typed client** — Remove or replace reflection, expression compilation, and reflection-based JSON paths.
 - **ProjectReference analyzer flow for source generation** — Ensure the `[QvecIndexed]` generator is available when consuming `Qvec.Core.Client` through project references.
 - **Published benchmark methodology** — ✅ Done. `benchmarks/Qvec.Benchmarks` measures recall vs. QPS against the TexMex SIFT/GIST corpora and their published ground truth.
-- **Faster index construction** — Build throughput is ~240 inserts/s on SIFT-1M and degrades as the index grows. Query performance is unaffected, but building a large index is slow.
+- **Faster index construction** — Partly done: removing marshalling, pool and allocation overhead from the insert path took SIFT-1M from 242 to 362 inserts/s and doubled query throughput. What remains is algorithmic (the O(M0²) neighbour heuristic) and memory-bound; parallel construction and multi-accumulator SIMD kernels are the next candidates.
 - **Multi-vector support** — Store and search multiple embeddings, such as image + text, for one logical entry.
 
 ## License

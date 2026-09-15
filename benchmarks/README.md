@@ -40,6 +40,11 @@ The dataset is cached under `%TEMP%/qvec-ann-datasets` (or `$TMPDIR` on Unix), s
 only slow the first time. `curl` does the fetching, because the TexMex corpora are served over
 FTP and `HttpClient` does not speak it.
 
+`--index <path> --keep-index` builds into a file of your choosing and leaves it on disk. Because
+`indexSeed` is pinned, two builds of the same dataset from the same code produce byte-identical
+graph sections, which makes this the way to prove that an insert-path change did not alter the
+graph: build once from `master`, once from your branch, and compare the section bytes.
+
 ## Metric
 
 SIFT and GIST ground truth is **Euclidean**. Run them with `--distance Euclidean`, which is the
