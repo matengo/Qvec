@@ -40,15 +40,15 @@ namespace Qvec.Core
         private const int HeaderSize = V4Header.HeaderSizeValue;
         private const int MetadataDescriptorSize = 16;
         private const int GuidSize = 16;
-        private readonly long _vectorSectionOffset;
-        private readonly long _graphSectionOffset;
-        private readonly long _metadataSectionOffset;
-        private readonly long _metadataHeapOffset;
-        private readonly long _guidSectionOffset;
-        private readonly long _tombstoneSectionOffset;
-        private readonly long _freeListSectionOffset;
+        private long _vectorSectionOffset;
+        private long _graphSectionOffset;
+        private long _metadataSectionOffset;
+        private long _metadataHeapOffset;
+        private long _guidSectionOffset;
+        private long _tombstoneSectionOffset;
+        private long _freeListSectionOffset;
         private readonly Dictionary<Guid, int> _guidIndex = new();
-        private readonly TombstoneSet _deletedIndices;
+        private TombstoneSet _deletedIndices;
         private readonly int[] _cachedEmptyNeighbors;
 
         // Inverterat index: field -> value -> set of entry indices
@@ -121,13 +121,7 @@ namespace Qvec.Core
             // Section offsets come exclusively from the file's own section table, so a v4
             // file is self-describing: nothing about where a section lives is recomputed
             // from what the caller happened to pass in.
-            _vectorSectionOffset = _header.GetRequiredSection(V4SectionIds.Vectors).Offset;
-            _graphSectionOffset = _header.GetRequiredSection(V4SectionIds.Graph).Offset;
-            _metadataSectionOffset = _header.GetRequiredSection(V4SectionIds.MetadataDescriptors).Offset;
-            _metadataHeapOffset = _header.GetRequiredSection(V4SectionIds.MetadataHeap).Offset;
-            _guidSectionOffset = _header.GetRequiredSection(V4SectionIds.Guids).Offset;
-            _tombstoneSectionOffset = _header.GetRequiredSection(V4SectionIds.Tombstones).Offset;
-            _freeListSectionOffset = _header.GetRequiredSection(V4SectionIds.FreeList).Offset;
+            CaptureSectionOffsets();
 
             long totalSize = _header.FileLength;
 
@@ -502,7 +496,10 @@ namespace Qvec.Core
             }
 
             if (_header.CurrentCount >= _header.MaxCount)
-                throw new QvecFullException(_header.MaxCount);
+            {
+                if (!AutoGrow) throw new QvecFullException(_header.MaxCount);
+                Grow(_header.MaxCountRaw + 1, _header.MetadataHeapUsed);
+            }
 
             return _header.CurrentCount++;
         }
@@ -601,8 +598,194 @@ namespace Qvec.Core
             }
         }
 
-        private unsafe void ReleaseMapping()
+        /// <summary>
+        /// Reads the current section offsets out of the header's own section table. Called on
+        /// open and again after every grow, because growing moves every section.
+        /// </summary>
+        private void CaptureSectionOffsets()
         {
+            _vectorSectionOffset = _header.GetRequiredSection(V4SectionIds.Vectors).Offset;
+            _graphSectionOffset = _header.GetRequiredSection(V4SectionIds.Graph).Offset;
+            _metadataSectionOffset = _header.GetRequiredSection(V4SectionIds.MetadataDescriptors).Offset;
+            _metadataHeapOffset = _header.GetRequiredSection(V4SectionIds.MetadataHeap).Offset;
+            _guidSectionOffset = _header.GetRequiredSection(V4SectionIds.Guids).Offset;
+            _tombstoneSectionOffset = _header.GetRequiredSection(V4SectionIds.Tombstones).Offset;
+            _freeListSectionOffset = _header.GetRequiredSection(V4SectionIds.FreeList).Offset;
+        }
+
+        /// <summary>
+        /// Grows the file so it can hold <paramref name="requiredMaxCount"/> rows and a metadata
+        /// heap of at least <paramref name="requiredHeapEnd"/> bytes.
+        /// <para>
+        /// Growth is geometric, so filling a database costs amortised constant time per insert
+        /// even though each grow rewrites the file. The whole operation happens under the write
+        /// lock, which excludes readers, so a reader sees either the old mapping or the new one
+        /// and never a half-finished remap.
+        /// </para>
+        /// <para>
+        /// The header is left marked <c>WriteInProgress</c> for the duration. If the process dies
+        /// mid-grow the file is left structurally inconsistent, and the flag is what makes the
+        /// next <see cref="Open"/> refuse it rather than read scrambled data.
+        /// </para>
+        /// Callers must hold the write lock.
+        /// </summary>
+        private void Grow(long requiredMaxCount, long requiredHeapEnd)
+        {
+            long newMaxCount = Math.Max(
+                requiredMaxCount,
+                QvecFormatLayout.RecommendGrownMaxCount(_header.MaxCountRaw));
+
+            long newHeapCapacity = _header.MetadataHeapCapacity;
+            if (requiredHeapEnd > newHeapCapacity)
+            {
+                newHeapCapacity = QvecFormatLayout.RecommendGrownMetadataHeapCapacity(
+                    _header.MetadataHeapCapacity, requiredHeapEnd);
+            }
+
+            var grown = QvecFormatLayout.CreateGrown(_header, newMaxCount, newHeapCapacity);
+
+            // Publish "a write is in progress" against the OLD geometry before anything moves,
+            // so a crash during the move is detectable.
+            BeginWrite();
+            _dataAccessor.Flush();
+            _headerAccessor.Flush();
+
+            var moves = PlanSectionMoves(_header, grown);
+
+            ReleaseMapping();
+
+            try
+            {
+                using (var stream = new FileStream(_path, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+                {
+                    stream.SetLength(grown.FileLength);
+                    MoveSections(stream, moves);
+                    stream.Flush(flushToDisk: true);
+                }
+
+                _previousMaxCount = _header.MaxCountRaw;
+                _header = grown;
+                RemapAfterGrow();
+                InitialiseNewCapacity();
+                CommitHeader();
+                _headerAccessor.Flush();
+
+                // The caller is in the middle of a write, so the header must go straight back to
+                // "write in progress" -- now against the new geometry.
+                BeginWrite();
+            }
+            catch
+            {
+                // The file is now in an unknown state and the mapping is gone. Reopening is the
+                // only safe recovery, and it will fail loudly if the grow corrupted the file.
+                RemapFromDisk();
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Where each section lives before and after a grow. Sections are laid out in a fixed
+        /// order and all of them grow, so every section moves to a higher offset.
+        /// </summary>
+        private readonly record struct SectionMove(
+            uint SectionId, long OldOffset, long OldLength, long NewOffset, long NewLength);
+
+        private static List<SectionMove> PlanSectionMoves(V4Header oldHeader, V4Header newHeader)
+        {
+            var moves = new List<SectionMove>(oldHeader.Sections.Length);
+
+            foreach (var oldEntry in oldHeader.Sections)
+            {
+                if ((oldEntry.SectionFlags & SectionFlags.Present) == 0) continue;
+
+                var newEntry = newHeader.GetRequiredSection(oldEntry.SectionId);
+                moves.Add(new SectionMove(
+                    oldEntry.SectionId, oldEntry.Offset, oldEntry.Length, newEntry.Offset, newEntry.Length));
+            }
+
+            return moves;
+        }
+
+        /// <summary>
+        /// Copies section contents to their new offsets, back to front. Every destination is at a
+        /// higher offset than its source and the regions can overlap, so moving front to back
+        /// would overwrite data that has not been copied yet.
+        /// </summary>
+        private static void MoveSections(FileStream stream, List<SectionMove> moves)
+        {
+            const int ChunkSize = 4 * 1024 * 1024;
+            byte[] buffer = ArrayPool<byte>.Shared.Rent(ChunkSize);
+
+            try
+            {
+                foreach (var move in moves.OrderByDescending(m => m.OldOffset))
+                {
+                    if (move.NewOffset == move.OldOffset) continue;
+
+                    long remaining = Math.Min(move.OldLength, move.NewLength);
+
+                    // Copy the tail first so an overlapping forward move cannot clobber itself.
+                    while (remaining > 0)
+                    {
+                        int chunk = (int)Math.Min(remaining, ChunkSize);
+                        long sourceAt = move.OldOffset + remaining - chunk;
+                        long destinationAt = move.NewOffset + remaining - chunk;
+
+                        stream.Position = sourceAt;
+                        stream.ReadExactly(buffer, 0, chunk);
+
+                        stream.Position = destinationAt;
+                        stream.Write(buffer, 0, chunk);
+
+                        remaining -= chunk;
+                    }
+                }
+            }
+            finally { ArrayPool<byte>.Shared.Return(buffer); }
+        }
+
+        /// <summary>
+        /// Zero is a valid value for most sections, but graph neighbours and the free list use -1
+        /// as "empty". A freshly grown region is zero-filled by the file system, so those two
+        /// sections have to be initialised explicitly or row 0 would look like every new node's
+        /// neighbour.
+        /// </summary>
+        private void InitialiseNewCapacity()
+        {
+            for (int index = (int)_previousMaxCount; index < _header.MaxCount; index++)
+            {
+                InitNeighborsOnDisk(index);
+            }
+        }
+
+        /// <summary>Row capacity before the grow in progress, used to initialise only the new rows.</summary>
+        private long _previousMaxCount;
+
+        /// <summary>
+        /// Re-establishes the mapping over the grown file. Unlike <see cref="RemapFromDisk"/> this
+        /// keeps the in-memory header, which is the authority for the new geometry and has not
+        /// been written to disk yet.
+        /// </summary>
+        private void RemapAfterGrow()
+        {
+            _mmf = MemoryMappedFile.CreateFromFile(_path, FileMode.Open, null, _header.FileLength);
+            _headerAccessor = _mmf.CreateViewAccessor(0, HeaderSize);
+            _dataAccessor = _mmf.CreateViewAccessor(HeaderSize, _header.FileLength - HeaderSize);
+
+            CaptureSectionOffsets();
+
+            // TombstoneSet is documented as never resizing, because Contains() is read without a
+            // lock. Replacing the instance is safe here only because Grow holds the write lock,
+            // which excludes every reader.
+            var grownTombstones = new TombstoneSet(_header.MaxCount);
+            for (int i = 0; i < _previousMaxCount; i++)
+            {
+                if (_deletedIndices.Contains(i)) grownTombstones.Add(i);
+            }
+            _deletedIndices = grownTombstones;
+        }
+
+        private unsafe void ReleaseMapping()        {
             if (_dataBasePtr != null)
             {
                 _dataAccessor.SafeMemoryMappedViewHandle.ReleasePointer();
@@ -647,6 +830,17 @@ namespace Qvec.Core
             catch (IOException) { /* best effort cleanup */ }
             catch (UnauthorizedAccessException) { /* best effort cleanup */ }
         }
+
+        /// <summary>
+        /// Whether the file grows automatically when it runs out of row capacity or metadata heap
+        /// space. On by default, so <c>max</c> is a starting size rather than a hard ceiling.
+        /// <para>
+        /// <see cref="PartitionedQvecDatabase"/> turns this off: partitioning exists precisely to
+        /// keep individual files bounded, so a full partition must roll over to a new one rather
+        /// than grow. With growth disabled a full database throws <see cref="QvecFullException"/>.
+        /// </para>
+        /// </summary>
+        public bool AutoGrow { get; set; } = true;
 
         public Guid AddEntry(float[] vector, string metadata, Guid? externalId = null)
         {
@@ -724,10 +918,16 @@ namespace Qvec.Core
             long heapOffset = _header.MetadataHeapUsed;
             if (heapOffset + bytes.Length > _header.MetadataHeapCapacity)
             {
-                throw new QvecFullException(
-                    $"The metadata heap is full: {_header.MetadataHeapCapacity} bytes reserved, " +
-                    $"{heapOffset} used, {bytes.Length} more requested. Run Vacuum() to reclaim " +
-                    "space left behind by updated or deleted entries.");
+                if (!AutoGrow)
+                {
+                    throw new QvecFullException(
+                        $"The metadata heap is full: {_header.MetadataHeapCapacity} bytes reserved, " +
+                        $"{heapOffset} used, {bytes.Length} more requested. Run Vacuum() to reclaim " +
+                        "space left behind by updated or deleted entries.");
+                }
+
+                Grow(_header.MaxCountRaw, heapOffset + bytes.Length);
+                descriptorPos = (_metadataSectionOffset - HeaderSize) + (long)index * MetadataDescriptorSize;
             }
 
             _dataAccessor.WriteArray((_metadataHeapOffset - HeaderSize) + heapOffset, bytes, 0, bytes.Length);
@@ -2317,6 +2517,7 @@ namespace Qvec.Core
                     return false;
 
                 WriteMetadataToDisk(index, newMetadata);
+                CommitHeader();
                 return true;
             }
             finally { _lock.ExitWriteLock(); }
@@ -2368,6 +2569,7 @@ namespace Qvec.Core
                 if (newVector == null)
                 {
                     WriteMetadataToDisk(oldIndex, newMetadata!);
+                    CommitHeader();
                     return true;
                 }
 

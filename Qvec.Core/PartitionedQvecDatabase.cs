@@ -59,6 +59,7 @@ namespace Qvec.Core
                 try
                 {
                     partition = QvecDatabase.Open(Path);
+                    partition.AutoGrow = false;
                     DistanceFunction partitionDistance = partition.DistanceFunction;
 
                     if (partition.VectorDimension != _dim)
@@ -107,6 +108,11 @@ namespace Qvec.Core
         private QvecDatabase CreateNextPartition()
         {
             var partition = new QvecDatabase(GetPath(_nextPartitionIndex), _dim, _partitionSize, distanceFunction: _distanceFunction);
+
+            // A partition must stay the size it was created at. Letting it grow would defeat the
+            // point of partitioning and produce one oversized file instead of several bounded ones.
+            partition.AutoGrow = false;
+
             _partitions.Add(partition);
             _nextPartitionIndex++;
             return partition;

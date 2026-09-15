@@ -14,6 +14,7 @@ Unlike client-server vector DBs, Qvec runs in-process, using **MemoryMappedFiles
 *   **Embedded .NET Library:** Runs in-process with no vector database server, daemon, or external service required.
 *   **HNSW Indexing:** Approximate nearest-neighbor search with tunable `maxNeighbors` and `efSearch` parameters for speed/recall trade-offs.
 *   **Disk-Backed Storage:** Uses `MemoryMappedFiles` for persistent local storage that survives application restarts.
+*   **Growable, Sparse Files:** Capacity is a starting point, not a limit. The file is created sparse and grows geometrically — both row capacity and the metadata heap — when it runs out of room. Set `AutoGrow = false` for a hard ceiling.
 *   **Hardware-Accelerated Math:** Uses .NET vector APIs and unsafe pointer paths for SIMD-friendly dot-product scoring.
 *   **Guid Document IDs:** `AddEntry` returns a stable `Guid` document identifier; external IDs can be supplied for deduplication and sync scenarios.
 *   **Update and Delete:** Supports tombstone-based delete, metadata updates, and vector updates by delete-and-reinsert. `Vacuum()` compacts the file, reuses tombstoned rows, reclaims orphaned metadata, and rebuilds the HNSW graph.
@@ -65,9 +66,9 @@ float[] embedding = GetEmbedding("Hello World");
 Guid id = db.AddEntry(embedding, "{\"id\":1,\"category\":\"text\"}");
 ```
 
-> **Capacity note:** `max` is fixed at creation and the file is laid out for that capacity up front. For example, `dim: 1536, max: 1_000_000` describes a file of roughly **7.3 GB**: about 6.14 GB for vectors, 640 MB for graph links, plus metadata, IDs, tombstones and header. The file is created **sparse**, so that is logical size — only the pages you actually write consume disk. Growing `max` after creation is not supported yet.
+> **Capacity note:** `max` is a **starting** size, not a ceiling. The file is laid out for that capacity up front and **grows geometrically** when it runs out of rows or metadata heap space. It is also created **sparse**, so `dim: 1536, max: 1_000_000` describes a ~7.3 GB layout while consuming only the pages you actually write. Set `AutoGrow = false` if you want a hard bound instead — a full database then throws `QvecFullException`.
 >
-> **Metadata note:** metadata is stored in an append-only heap addressed by a per-row `(offset, length)` descriptor. There is no per-entry size limit. Updating metadata orphans the previous blob until `Vacuum()` reclaims it; if the heap fills up, `QvecFullException` is thrown rather than anything being truncated.
+> **Metadata note:** metadata is stored in an append-only heap addressed by a per-row `(offset, length)` descriptor. There is no per-entry size limit and the heap grows on demand. Updating metadata orphans the previous blob until `Vacuum()` reclaims it.
 
 ## HNSW Vector Search
 
@@ -282,7 +283,6 @@ Planned cloud work is tracked in design documents and the roadmap below.
 ## 📜 Roadmap / Not yet implemented
 
 - **Storage format v4** — The on-disk format is self-describing (magic, version, CRC-32 over the header, a section table, and a `WriteInProgress` flag). There is **no migration** from earlier formats; v2/v3 files are rejected with `QvecFormatException`.
-- **Growable files** — Allow capacity expansion after creation. Not implemented; `max` is still a hard ceiling, but sparse allocation means an over-sized `max` no longer costs disk.
 - **`M0 = 2 × M` on layer 0** — The HNSW paper's recommended fan-out for the base layer. Requires a graph-section layout change.
 - **int8 scalar quantization** — ~4× smaller vectors on disk and in memory. The format reserves space for the metadata this needs.
 - **Sync Engine** — Opt-in edge-cloud synchronization. Connect multiple local Qvec databases to a central sync server so connected instances can stay in sync automatically. The current design discusses Azure Append Blob and Azure Web PubSub, but this is not implemented. See [design doc](docs/design-sync-engine.md).

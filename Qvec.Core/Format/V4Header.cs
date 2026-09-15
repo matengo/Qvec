@@ -200,6 +200,46 @@ public sealed class V4Header
 
     public bool IsWriteInProgress => WriteInProgress != 0;
 
+    /// <summary>
+    /// A copy of every header field except the section table, which the caller is expected to lay
+    /// out afresh. Used when growing a database: the mutable state (row count, entry point,
+    /// tombstones, heap usage) carries over unchanged while the geometry is recomputed.
+    /// </summary>
+    public V4Header CloneState() => new()
+    {
+        MagicNumber = MagicNumber,
+        Version = Version,
+        HeaderSize = HeaderSize,
+        PrimaryHeaderSize = PrimaryHeaderSize,
+        SectionTableOffset = SectionTableOffset,
+        SectionTableEntrySize = SectionTableEntrySize,
+        SectionTableEntryCount = SectionTableEntryCount,
+        WriteInProgress = WriteInProgress,
+        Generation = Generation,
+        VectorDimension = VectorDimension,
+        CurrentCountRaw = CurrentCountRaw,
+        MaxCountRaw = MaxCountRaw,
+        MaxNeighbors = MaxNeighbors,
+        MaxLayers = MaxLayers,
+        LayerProbability = LayerProbability,
+        EntryPointRaw = EntryPointRaw,
+        EntryPointLevel = EntryPointLevel,
+        DeletedCountRaw = DeletedCountRaw,
+        DistanceFunction = DistanceFunction,
+        MetadataHeapUsed = MetadataHeapUsed,
+        FreeListHead = FreeListHead,
+        FreeListCount = FreeListCount,
+        HeaderFlags = HeaderFlags,
+        FormatOptions = FormatOptions,
+        QuantizationMode = QuantizationMode,
+        QuantizationSectionId = QuantizationSectionId,
+        FileLength = FileLength,
+        MetadataHeapCapacity = MetadataHeapCapacity,
+        NextSectionDataOffset = NextSectionDataOffset,
+        CreatedUnixTimeSeconds = CreatedUnixTimeSeconds,
+        UpdatedUnixTimeSeconds = UpdatedUnixTimeSeconds,
+    };
+
     public void WriteTo(Span<byte> destination)
     {
         if (destination.Length != HeaderSizeValue)
