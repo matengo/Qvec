@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
@@ -9,7 +9,7 @@
     <InvariantGlobalization>true</InvariantGlobalization>
   </PropertyGroup>
 	<ItemGroup>
-		<PackageReference Include="System.CommandLine" Version="2.0.3" />
+		<PackageReference Include="System.CommandLine" />
 	</ItemGroup>
 	<ItemGroup>
 	  <ProjectReference Include="..\Qvec.Core\Qvec.Core.csproj" />
