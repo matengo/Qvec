@@ -361,3 +361,7 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
+# Qvec database files - these are preallocated and can be very large
+*.qvec
+*.qvec.*
+

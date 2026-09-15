@@ -1,8 +1,8 @@
-# Design: Sync Engine — Edge-Cloud Hybrid Synchronization
+# Design: Sync Engine â€” Edge-Cloud Hybrid Synchronization
 
 ## Vision
 
-Qvec är och förblir en **inprocess edge-databas**. Sync Engine är ett helt separat, opt-in lager som låter flera lokala Qvec-instanser synkronisera via en central server. En lokal databas fungerar fullt autonomt utan sync — man kopplar på synkronisering när man behöver det.
+Qvec Ã¤r och fÃ¶rblir en **inprocess edge-databas**. Sync Engine Ã¤r ett helt separat, opt-in lager som lÃ¥ter flera lokala Qvec-instanser synkronisera via en central server. En lokal databas fungerar fullt autonomt utan sync â€” man kopplar pÃ¥ synkronisering nÃ¤r man behÃ¶ver det.
 
 ```
 ????????????     ????????????     ????????????
@@ -29,16 +29,16 @@ Qvec är och förblir en **inprocess edge-databas**. Sync Engine är ett helt separ
 
 ## Principer
 
-1. **Opt-in** — Sync läggs till utanpå en befintlig `QvecDatabase`. Ingen ändring krävs i core.
-2. **Offline-first** — Klienten kan läsa, söka och skriva lokalt utan anslutning. Synk sker när anslutningen kommer tillbaka.
-3. **Event-sourcing** — Alla mutationer (Add, Update, Delete) loggas som events i en append-only central log.
-4. **Idempotent apply** — Events identifieras via Guid. Samma event kan appliceras flera gånger utan dubbletter.
-5. **Delta-sync** — Klienter laddar bara ner data som tillkommit sedan senaste synkpunkten (offset-baserat).
+1. **Opt-in** â€” Sync lÃ¤ggs till utanpÃ¥ en befintlig `QvecDatabase`. Ingen Ã¤ndring krÃ¤vs i core.
+2. **Offline-first** â€” Klienten kan lÃ¤sa, sÃ¶ka och skriva lokalt utan anslutning. Synk sker nÃ¤r anslutningen kommer tillbaka.
+3. **Event-sourcing** â€” Alla mutationer (Add, Update, Delete) loggas som events i en append-only central log.
+4. **Idempotent apply** â€” Events identifieras via Guid. Samma event kan appliceras flera gÃ¥nger utan dubbletter.
+5. **Delta-sync** â€” Klienter laddar bara ner data som tillkommit sedan senaste synkpunkten (offset-baserat).
 
 ## Beroenden
 
-- [Guid som dokument-ID](design-guid-id.md) — Krävs för dedup vid synk.
-- [Update & Delete](design-update-delete.md) — Krävs för att kunna applicera remote-events lokalt.
+- [Guid som dokument-ID](design-guid-id.md) â€” KrÃ¤vs fÃ¶r dedup vid synk.
+- [Update & Delete](design-update-delete.md) â€” KrÃ¤vs fÃ¶r att kunna applicera remote-events lokalt.
 
 ---
 
@@ -46,7 +46,7 @@ Qvec är och förblir en **inprocess edge-databas**. Sync Engine är ett helt separ
 
 ### Sync Event Format
 
-Varje mutation serialiseras som ett binärt event som skrivs till Append Blob:
+Varje mutation serialiseras som ett binÃ¤rt event som skrivs till Append Blob:
 
 ```
 ???????????????????????????????????????????????????
@@ -92,12 +92,12 @@ Event-storlek per typ:
 
 ### Klient: `QvecSyncAgent`
 
-`QvecSyncAgent` wrapprar en `QvecDatabase` och hanterar all synk-logik. Det är den enda klassen användaren behöver interagera med.
+`QvecSyncAgent` wrapprar en `QvecDatabase` och hanterar all synk-logik. Det Ã¤r den enda klassen anvÃ¤ndaren behÃ¶ver interagera med.
 
 ```csharp
 /// <summary>
 /// Kopplar en lokal QvecDatabase till en central synkserver.
-/// Opt-in: skapa databasen som vanligt och lägg till sync när du behöver det.
+/// Opt-in: skapa databasen som vanligt och lÃ¤gg till sync nÃ¤r du behÃ¶ver det.
 /// </summary>
 public class QvecSyncAgent : IAsyncDisposable
 {
@@ -114,14 +114,14 @@ public class QvecSyncAgent : IAsyncDisposable
     }
 
     /// <summary>
-    /// Startar bakgrundssynkronisering. Lyssnar på remote events
-    /// och skickar lokala ändringar.
+    /// Startar bakgrundssynkronisering. Lyssnar pÃ¥ remote events
+    /// och skickar lokala Ã¤ndringar.
     /// </summary>
     public async Task StartAsync(CancellationToken ct = default)
     {
         _cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
 
-        // 1. Initial catch-up: hämta allt vi missat sedan senaste offset
+        // 1. Initial catch-up: hÃ¤mta allt vi missat sedan senaste offset
         await PullDeltaAsync(_cts.Token);
 
         // 2. Starta realtidslyssning
@@ -129,7 +129,7 @@ public class QvecSyncAgent : IAsyncDisposable
     }
 
     /// <summary>
-    /// Lägger till lokalt OCH skickar till servern.
+    /// LÃ¤gger till lokalt OCH skickar till servern.
     /// Returnerar omedelbart efter lokal skrivning (offline-first).
     /// </summary>
     public async Task<Guid> AddEntryAsync(float[] vector, string metadata)
@@ -168,13 +168,13 @@ public class QvecSyncAgent : IAsyncDisposable
 }
 ```
 
-### Användning — opt-in pattern
+### AnvÃ¤ndning â€” opt-in pattern
 
 ```csharp
-// 1. Skapa databasen som vanligt — fungerar fullt autonomt
+// 1. Skapa databasen som vanligt â€” fungerar fullt autonomt
 using var db = new QvecDatabase("local.qvec", dim: 1536, max: 100_000);
 
-// 2. VALFRITT: Koppla på synk
+// 2. VALFRITT: Koppla pÃ¥ synk
 await using var sync = new QvecSyncAgent(db, new SyncOptions
 {
     ServerUrl = "https://qvec-sync.azurewebsites.net",
@@ -187,24 +187,24 @@ await sync.StartAsync();
 // 3. Alla skrivningar via sync-agenten synkas automatiskt
 Guid id = await sync.AddEntryAsync(embedding, "{\"text\": \"hello\"}");
 
-// 4. Sökningar sker alltid direkt mot lokal databas — ingen nätverkslatens
+// 4. SÃ¶kningar sker alltid direkt mot lokal databas â€” ingen nÃ¤tverkslatens
 var results = db.Search(queryVector, topK: 5);
 ```
 
 ### Transport-abstraktion
 
-Olika realtidskanaler stöds via ett gemensamt interface:
+Olika realtidskanaler stÃ¶ds via ett gemensamt interface:
 
 ```csharp
 public interface ISyncTransport : IAsyncDisposable
 {
-    /// <summary>Skickar ett event till servern för central lagring.</summary>
+    /// <summary>Skickar ett event till servern fÃ¶r central lagring.</summary>
     Task SendAsync(SyncEvent evt, CancellationToken ct);
 
-    /// <summary>Prenumererar på realtidsnotifieringar om nya events.</summary>
+    /// <summary>Prenumererar pÃ¥ realtidsnotifieringar om nya events.</summary>
     Task SubscribeAsync(Func<SyncNotification, Task> onNotification, CancellationToken ct);
 
-    /// <summary>Hämtar events från en given offset (delta-sync).</summary>
+    /// <summary>HÃ¤mtar events frÃ¥n en given offset (delta-sync).</summary>
     Task<SyncDelta> PullDeltaAsync(long fromOffset, CancellationToken ct);
 }
 
@@ -216,11 +216,11 @@ public enum SyncTransportType
 }
 ```
 
-### SyncState — lokal offset-tracking
+### SyncState â€” lokal offset-tracking
 
 ```csharp
 /// <summary>
-/// Sparar klientens synk-position till disk. Överlever omstarter.
+/// Sparar klientens synk-position till disk. Ã–verlever omstarter.
 /// </summary>
 public class SyncState
 {
@@ -228,7 +228,7 @@ public class SyncState
     public DateTime LastSyncedUtc { get; set; }
     public string StateFilePath { get; init; }
 
-    public static SyncState Load(string path) { /* läs från fil */ }
+    public static SyncState Load(string path) { /* lÃ¤s frÃ¥n fil */ }
     public void Save() { /* skriv till fil */ }
 }
 ```
@@ -237,21 +237,21 @@ public class SyncState
 
 ## Server: Sync Relay
 
-Servern är en tunn relay som inte behöver förstå vektordata — den lagrar och vidarebefordrar binära events.
+Servern Ã¤r en tunn relay som inte behÃ¶ver fÃ¶rstÃ¥ vektordata â€” den lagrar och vidarebefordrar binÃ¤ra events.
 
 ### Ansvar
 
-1. **Append** — Ta emot events från klienter och skriva till Append Blob i strikt ordning.
-2. **Notify** — Skicka lättviktsnotifiering via Web PubSub: `{"offset": 124500}`.
-3. **Serve Delta** — Hantera `GET /delta?from={offset}` med Range-headers mot Append Blob.
+1. **Append** â€” Ta emot events frÃ¥n klienter och skriva till Append Blob i strikt ordning.
+2. **Notify** â€” Skicka lÃ¤ttviktsnotifiering via Web PubSub: `{"offset": 124500}`.
+3. **Serve Delta** â€” Hantera `GET /delta?from={offset}` med Range-headers mot Append Blob.
 
 ### Endpoints
 
 ```
-POST   /events              — Tar emot SyncEvent, skriver till blob, notifierar
-GET    /delta?from={offset}  — Returnerar alla events sedan offset (Range Request)
-GET    /status               — Returnerar blob-storlek och antal anslutna klienter
-WS     /ws                   — WebSocket-anslutning för realtidsprenumeration
+POST   /events              â€” Tar emot SyncEvent, skriver till blob, notifierar
+GET    /delta?from={offset}  â€” Returnerar alla events sedan offset (Range Request)
+GET    /status               â€” Returnerar blob-storlek och antal anslutna klienter
+WS     /ws                   â€” WebSocket-anslutning fÃ¶r realtidsprenumeration
 ```
 
 ### Implementering (Azure Function)
@@ -268,7 +268,7 @@ public class SyncFunction
     {
         byte[] eventBytes = await req.Body.ReadAsByteArrayAsync();
 
-        // Atomisk append — Append Blob garanterar ordning
+        // Atomisk append â€” Append Blob garanterar ordning
         await _blob.AppendBlockAsync(new BinaryData(eventBytes));
 
         long newOffset = (await _blob.GetPropertiesAsync()).Value.ContentLength;
@@ -291,7 +291,7 @@ public class SyncFunction
         if (from >= blobLength)
             return new OkObjectResult(Array.Empty<byte>());
 
-        // Range request — bara de nya byten
+        // Range request â€” bara de nya byten
         var range = new HttpRange(from, blobLength - from);
         var download = await _blob.DownloadContentAsync(new BlobDownloadOptions { Range = range });
 
@@ -302,7 +302,7 @@ public class SyncFunction
 
 ---
 
-## Synk-flöde: steg för steg
+## Synk-flÃ¶de: steg fÃ¶r steg
 
 ### Skrivning (klient ? server ? alla)
 
@@ -333,36 +333,36 @@ Edge A                     Server                    Edge B
 Edge C (var offline i 2 timmar)
   ?
   ?  StartAsync()
-  ?  1. Läs _state.LastSyncedOffset (t.ex. 8192)
+  ?  1. LÃ¤s _state.LastSyncedOffset (t.ex. 8192)
   ?  2. GET /delta?from=8192
   ?  3. Applicera alla events sekventiellt
   ?  4. Uppdatera _state.LastSyncedOffset
-  ?  5. Prenumerera på realtid
+  ?  5. Prenumerera pÃ¥ realtid
 ```
 
 ---
 
 ## Konflikthantering
 
-Guid löser ID-konflikter, men vad händer om två klienter uppdaterar samma dokument samtidigt?
+Guid lÃ¶ser ID-konflikter, men vad hÃ¤nder om tvÃ¥ klienter uppdaterar samma dokument samtidigt?
 
 | Strategi | Beskrivning |
 |---|---|
 | **Last-Write-Wins (LWW)** | Servern serialiserar alla events. Den sista UpdateVector som skrivs till Append Blob vinner. Enkelt och deterministiskt. |
-| **Timestamp-baserad** | Varje event har `TimestampTicks`. Vid apply: skippa events äldre än lokalt timestamp. Kräver klocksynk. |
-| **Application-level** | Exponera konflikter uppåt via callback. Låt applikationen bestämma. |
+| **Timestamp-baserad** | Varje event har `TimestampTicks`. Vid apply: skippa events Ã¤ldre Ã¤n lokalt timestamp. KrÃ¤ver klocksynk. |
+| **Application-level** | Exponera konflikter uppÃ¥t via callback. LÃ¥t applikationen bestÃ¤mma. |
 
-**Rekommendation:** Börja med **Last-Write-Wins** (LWW) — det är det enklaste och passar bra för vektordata där "senaste embedningen" normalt är den korrekta.
+**Rekommendation:** BÃ¶rja med **Last-Write-Wins** (LWW) â€” det Ã¤r det enklaste och passar bra fÃ¶r vektordata dÃ¤r "senaste embedningen" normalt Ã¤r den korrekta.
 
 ---
 
 ## Projektstruktur
 
-Sync Engine implementeras som ett separat projekt för att behålla Qvec.Core utan beroenden:
+Sync Engine implementeras som ett separat projekt fÃ¶r att behÃ¥lla Qvec.Core utan beroenden:
 
 ```
 Qvec.sln
-??? Qvec.Core/                  # Ingen ändring — ren embedded DB
+??? Qvec.Core/                  # Ingen Ã¤ndring â€” ren embedded DB
 ??? Qvec.Core.Client/           # Typade klienter
 ??? Qvec.Sync/                  # ? NYTT: SyncAgent, transporter, state
 ?   ??? QvecSyncAgent.cs
@@ -381,20 +381,20 @@ Qvec.sln
 ??? Qvec.Console.Test/
 ```
 
-## Påverkade befintliga filer
+## PÃ¥verkade befintliga filer
 
-| Fil | Ändring |
+| Fil | Ã„ndring |
 |---|---|
-| `Qvec.sln` | Lägg till `Qvec.Sync` och `Qvec.Sync.Server` |
-| `Qvec.Core\QvecDatabase.cs` | **Ingen** — sync wrappar utifrån |
-| `README.md` | Dokumentation och Quick Start för sync |
+| `Qvec.sln` | LÃ¤gg till `Qvec.Sync` och `Qvec.Sync.Server` |
+| `Qvec.Core\QvecDatabase.cs` | **Ingen** â€” sync wrappar utifrÃ¥n |
+| `README.md` | Dokumentation och Quick Start fÃ¶r sync |
 
 ## Prestandabudget
 
 | Operation | Latens |
 |---|---|
-| Lokal skrivning + sökning | Oförändrat (µs–ms) |
-| Outbound event ? server | ~50–200 ms (nätverkslatens) |
-| Remote event ? lokal apply | ~100–300 ms (notifiering + delta pull + apply) |
-| Catch-up (10 000 events) | ~2–5 s (beroende på bandbredd) |
+| Lokal skrivning + sÃ¶kning | OfÃ¶rÃ¤ndrat (Âµsâ€“ms) |
+| Outbound event ? server | ~50â€“200 ms (nÃ¤tverkslatens) |
+| Remote event ? lokal apply | ~100â€“300 ms (notifiering + delta pull + apply) |
+| Catch-up (10 000 events) | ~2â€“5 s (beroende pÃ¥ bandbredd) |
 | Idle minnesoverhead | ~1 WebSocket-anslutning + SyncState (bytes) |

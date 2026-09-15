@@ -8,29 +8,29 @@ Idag identifieras varje dokument av ett sekventiellt `int`-index som direkt mapp
 offset = index * dimension * sizeof(float)
 ```
 
-Det ger O(1)-åtkomst utan lookup, men gör det omöjligt att synkronisera eller merga flera databaser — ett index i databas A har ingen relation till samma index i databas B.
+Det ger O(1)-Ã¥tkomst utan lookup, men gÃ¶r det omÃ¶jligt att synkronisera eller merga flera databaser â€” ett index i databas A har ingen relation till samma index i databas B.
 
-## Mål
+## MÃ¥l
 
-Införa `Guid` som **logiskt dokument-ID** medan `int` behålls som **fysiskt positionsindex**. Detta möjliggör:
+InfÃ¶ra `Guid` som **logiskt dokument-ID** medan `int` behÃ¥lls som **fysiskt positionsindex**. Detta mÃ¶jliggÃ¶r:
 
 - Deterministisk deduplicering vid synk mellan noder
 - Idempotent `AddEntry` (samma Guid = samma dokument)
-- Stabil extern referens som överlever rebuild/kompaktering
+- Stabil extern referens som Ã¶verlever rebuild/kompaktering
 
-## Jämförelse
+## JÃ¤mfÃ¶relse
 
-| Aspekt | `int` index (nuläge) | `Guid` + `int` index (nytt) |
+| Aspekt | `int` index (nulÃ¤ge) | `Guid` + `int` index (nytt) |
 |---|---|---|
 | Lagring per post | 0 extra bytes | +16 bytes (Guid) |
 | Lookup by ID | O(1) direkt offset | O(1) via `Dictionary<Guid, int>` |
-| Synk/merge | Omöjligt (index är lokala) | Naturlig dedup via Guid |
+| Synk/merge | OmÃ¶jligt (index Ã¤r lokala) | Naturlig dedup via Guid |
 | Minnesoverhead | Inget | ~40 bytes/post i dictionary |
-| Uppstartstid | Direkt | Linjärt scan för att bygga Guid?index-map |
+| Uppstartstid | Direkt | LinjÃ¤rt scan fÃ¶r att bygga Guid?index-map |
 
 ## Filformat: ny Guid-sektion
 
-En ny sektion läggs till efter metadata-sektionen. Varje post är exakt 16 bytes (`sizeof(Guid)`).
+En ny sektion lÃ¤ggs till efter metadata-sektionen. Varje post Ã¤r exakt 16 bytes (`sizeof(Guid)`).
 
 ```
 ??????????????????????????  0
@@ -46,11 +46,11 @@ En ny sektion läggs till efter metadata-sektionen. Varje post är exakt 16 bytes 
 ??????????????????????????
 ```
 
-`DbHeader.Version` bumpas till `2` för att skilja det nya formatet.
+`DbHeader.Version` bumpas till `2` fÃ¶r att skilja det nya formatet.
 
-## Ändringar i kod
+## Ã„ndringar i kod
 
-### 1. Nya fält i `QvecDatabase`
+### 1. Nya fÃ¤lt i `QvecDatabase`
 
 ```csharp
 private const int GuidSize = 16;
@@ -58,7 +58,7 @@ private readonly long _guidSectionOffset;
 private readonly Dictionary<Guid, int> _guidIndex = new();
 ```
 
-### 2. Konstruktor — beräkna Guid-sektion och bygga index
+### 2. Konstruktor â€” berÃ¤kna Guid-sektion och bygga index
 
 ```csharp
 _guidSectionOffset = _metadataSectionOffset + metadataSpace;
@@ -73,7 +73,7 @@ if (exists)
 }
 ```
 
-### 3. Disk I/O för Guid
+### 3. Disk I/O fÃ¶r Guid
 
 ```csharp
 private void WriteGuidToDisk(int index, Guid guid)
@@ -107,7 +107,7 @@ private void RebuildGuidIndex()
 }
 ```
 
-### 5. Ändrad `AddEntry` — returnerar Guid, stödjer extern Guid
+### 5. Ã„ndrad `AddEntry` â€” returnerar Guid, stÃ¶djer extern Guid
 
 ```csharp
 public Guid AddEntry(float[] vector, string metadata, Guid? externalId = null)
@@ -119,7 +119,7 @@ public Guid AddEntry(float[] vector, string metadata, Guid? externalId = null)
 
         Guid docId = externalId ?? Guid.NewGuid();
 
-        // Dedup: om Guid redan finns, hoppa över
+        // Dedup: om Guid redan finns, hoppa Ã¶ver
         if (_guidIndex.ContainsKey(docId))
             return docId;
 
@@ -134,7 +134,7 @@ public Guid AddEntry(float[] vector, string metadata, Guid? externalId = null)
         _guidIndex[docId] = index;
         _header.CurrentCount++;
 
-        // ... resten av HNSW-logiken oförändrad ...
+        // ... resten av HNSW-logiken ofÃ¶rÃ¤ndrad ...
 
         _headerAccessor.Write(0, ref _header);
         return docId;
@@ -143,19 +143,19 @@ public Guid AddEntry(float[] vector, string metadata, Guid? externalId = null)
 }
 ```
 
-### 6. Sökresultat returnerar Guid
+### 6. SÃ¶kresultat returnerar Guid
 
-Alla publika `Search`-metoder ändrar sin returtyp:
+Alla publika `Search`-metoder Ã¤ndrar sin returtyp:
 
 ```csharp
-// Före:
+// FÃ¶re:
 List<(int Id, float Score, string Metadata)>
 
 // Efter:
 List<(Guid Id, float Score, string Metadata)>
 ```
 
-Internt används fortfarande `int` för all graf-navigering och vektor-åtkomst.
+Internt anvÃ¤nds fortfarande `int` fÃ¶r all graf-navigering och vektor-Ã¥tkomst.
 
 ### 7. Lookup via Guid
 
@@ -194,28 +194,28 @@ public int SyncFrom(QvecDatabase source)
 }
 ```
 
-## Påverkade filer
+## PÃ¥verkade filer
 
-| Fil | Ändring |
+| Fil | Ã„ndring |
 |---|---|
-| `Qvec.Core\QvecDatabase.cs` | Ny sektion, Guid-fält, ändrad `AddEntry`, nya metoder |
+| `Qvec.Core\QvecDatabase.cs` | Ny sektion, Guid-fÃ¤lt, Ã¤ndrad `AddEntry`, nya metoder |
 | `Qvec.Core\PartitionedQvecDatabase.cs` | Propagera Guid genom partitioner |
 | `Qvec.Core.Client\QvecClient.cs` | Uppdatera returtyper till Guid |
 | `Qvec.Api\*` | Uppdatera API-endpoints att returnera Guid |
 | `Qvec.Console.Test\*` | Uppdatera tester |
 
-## Bakåtkompatibilitet
+## BakÃ¥tkompatibilitet
 
-- Filer med `Version == 1` saknar Guid-sektionen. Vid öppning av en v1-fil kan vi antingen:
-  - **Migrera:** Generera Guid:s för alla befintliga poster och bumpa version till 2.
+- Filer med `Version == 1` saknar Guid-sektionen. Vid Ã¶ppning av en v1-fil kan vi antingen:
+  - **Migrera:** Generera Guid:s fÃ¶r alla befintliga poster och bumpa version till 2.
   - **Avvisa:** Kasta ett undantag som uppmanar till manuell migrering.
-- Rekommendation: automatisk migrering vid första öppning.
+- Rekommendation: automatisk migrering vid fÃ¶rsta Ã¶ppning.
 
 ## Prestandabudget
 
 | Operation | Kostnad |
 |---|---|
-| `AddEntry` | +1 `WriteArray` (16 bytes) — försumbart |
-| `Search` | +1 `ReadGuidFromDisk` per resultat (topK st) — försumbart |
-| Uppstart (1M poster) | ~16 MB sekventiell läsning + dictionary-allokering ? <100 ms |
+| `AddEntry` | +1 `WriteArray` (16 bytes) â€” fÃ¶rsumbart |
+| `Search` | +1 `ReadGuidFromDisk` per resultat (topK st) â€” fÃ¶rsumbart |
+| Uppstart (1M poster) | ~16 MB sekventiell lÃ¤sning + dictionary-allokering ? <100 ms |
 | Minne | ~56 bytes/post (16 Guid + 40 dictionary entry) ? ~56 MB vid 1M poster |

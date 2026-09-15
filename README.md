@@ -1,31 +1,39 @@
 # Qvec ⚡ 
 ### The "SQLite of Vector Databases" for .NET 10
 
-**Qvec** is an open-source, embedded, high-performance vector database written entirely in C# for **.NET 10**. It is designed to be the fastest local vector store for AI-driven applications, offering **HNSW** (Hierarchical Navigable Small World) indexing with **Native AOT** support.
+> **Status: pre-1.0 / active hardening.** Qvec is usable for experiments and prototypes, but APIs are still changing. Version `0.1.x` should be treated as an early preview. The on-disk format is **v4**, self-describing and checksummed; there is no migration from the pre-0.1 formats.
 
-Unlike client-server vector DBs, Qvec runs in-process, utilizing **MemoryMappedFiles** for zero-copy disk access and **SIMD** for hardware-accelerated vector mathematics.
+**Qvec** is an open-source, embedded vector database written entirely in C# for **.NET 10**. It is designed for local AI-driven applications that need in-process vector search with **HNSW** (Hierarchical Navigable Small World) indexing.
+
+Unlike client-server vector DBs, Qvec runs in-process, using **MemoryMappedFiles** for disk-backed storage and SIMD-friendly vector math for fast similarity scoring.
 
 ---
 
 ## 🚀 Key Features
 
-*   **Native AOT Ready:** Compiled to a single, dependency-free binary for Windows, Linux, and macOS.
-*   **HNSW Indexing:** Logarithmic search complexity ($O(\log N)$) providing up to 1000x speedup over linear scanning.
-*   **Hybrid Search:** Integrated metadata filtering ($AI \text{ Similarity} + \text{Scalar Filters}$) directly within the HNSW navigation loop.
-*   **Zero-Copy Storage:** Built on `MemoryMappedFiles` for persistent, disk-backed storage that survives application restarts.
-*   **Hardware Accelerated:** Uses .NET 10 `Vector<T>` and `Intrinsics` to leverage **AVX2 / NEON** SIMD instructions.
-*   **Cloud-Native:** Built-in support for **Azure Blob Storage** synchronization and **Managed Identity** for passwordless security.
+*   **Embedded .NET Library:** Runs in-process with no vector database server, daemon, or external service required.
+*   **HNSW Indexing:** Approximate nearest-neighbor search with tunable `maxNeighbors` and `efSearch` parameters for speed/recall trade-offs.
+*   **Disk-Backed Storage:** Uses `MemoryMappedFiles` for persistent local storage that survives application restarts.
+*   **Hardware-Accelerated Math:** Uses .NET vector APIs and unsafe pointer paths for SIMD-friendly dot-product scoring.
+*   **Guid Document IDs:** `AddEntry` returns a stable `Guid` document identifier; external IDs can be supplied for deduplication and sync scenarios.
+*   **Update and Delete:** Supports tombstone-based delete, metadata updates, and vector updates by delete-and-reinsert. `Vacuum()` compacts the file, reuses tombstoned rows, reclaims orphaned metadata, and rebuilds the HNSW graph.
+*   **Metadata Filtering:** General metadata predicates are supported after HNSW retrieval; `[QvecIndexed]` equality filters can pre-filter via an in-memory inverted index.
+*   **AOT-Friendly Core:** `Qvec.Core` is dependency-free and avoids JSON/reflection requirements. The typed client currently uses reflection and expression compilation; see the AOT notes below.
 
 ---
 
-## 📊 Performance Benchmark (1M Vectors)
+## 📊 Performance Benchmark
 
-| Method | Search Time | Throughput | Recall |
-| :--- | :--- | :--- | :--- |
-| **Linear Search** | 4.65 ms | ~215 QPS | 100% |
-| **Qvec HNSW** | **0.110 ms** | **~9,070 QPS** | **98%** |
+Qvec's performance and recall depend strongly on HNSW parameters, especially `efSearch`. The original README benchmark is being replaced with measured, parameterized results.
 
-*Test conducted on .NET 10 Native AOT (128-dim vectors). Surface Laptop Windows 11 ARM64, Qualcomm Snapdragon X Elite (X1E-80100)*
+Measured on 5,000 random uniform 128-dimensional vectors with recall@1 against exact linear search:
+
+| maxNeighbors | efSearch | recall@1 |
+| ---: | ---: | ---: |
+| 32 (default) | 50 | ~85% |
+| 32 (default) | 200 (default) | >=95% |
+
+Random uniform vectors are often harder for HNSW than real embedding distributions, and different datasets/hardware will produce different timings. If recall matters, raise `efSearch` and measure on your own data.
 
 ---
 
@@ -47,207 +55,244 @@ dotnet add package Qvec.Core.Client
 
 ### Initialize and Add Data
 
-```C#
-using Qvec;
+```csharp
+using Qvec.Core;
 
-// Initialize DB (1536 dims for OpenAI, max 1M vectors)
-using var db = new VectorDatabase("vectors.qvec", dim: 1536, max: 1000000);
+// Fixed-capacity database: dim and max are chosen at creation time.
+using var db = new QvecDatabase("vectors.qvec", dim: 1536, max: 10_000);
 
-float[] myEmbedding = GetEmbedding("Hello World");
-db.AddEntry(myEmbedding, "{\"id\": 1, \"category\": \"text\"}");
+float[] embedding = GetEmbedding("Hello World");
+Guid id = db.AddEntry(embedding, "{\"id\":1,\"category\":\"text\"}");
 ```
+
+> **Capacity note:** `max` is fixed at creation and the file is laid out for that capacity up front. For example, `dim: 1536, max: 1_000_000` describes a file of roughly **7.3 GB**: about 6.14 GB for vectors, 640 MB for graph links, plus metadata, IDs, tombstones and header. The file is created **sparse**, so that is logical size — only the pages you actually write consume disk. Growing `max` after creation is not supported yet.
+>
+> **Metadata note:** metadata is stored in an append-only heap addressed by a per-row `(offset, length)` descriptor. There is no per-entry size limit. Updating metadata orphans the previous blob until `Vacuum()` reclaims it; if the heap fills up, `QvecFullException` is thrown rather than anything being truncated.
+
 ## HNSW Vector Search
 
-```c#
+```csharp
 var results = db.Search(queryVector, topK: 5);
-
-foreach (var r in results) {
-    Console.WriteLine($"Found Match: {r.Id} with Score: {r.Score}");
-}
-```
-
-## Hybrid HNSW Search
-
-```c#
-var results = db.Search(queryVector, meta => {
-    return meta.Contains("\"category\": \"text\"");
-}, topK: 5);
-
-foreach (var r in results) {
-    Console.WriteLine($"Found Match: {r.Id} with Score: {r.Score}");
-}
-```
-
-## Typed client
-
-```c#
-var db = new QvecDatabase("products.qvec", dim: 1536, max: 10000);
-var client = new QvecClient<Product>(db);
-
-// Add entry
-client.AddEntry(myVector, new Product(1, "Laptop", 12000, true));
-
-// Hybrid search with strongly typed filter
-var results = client.Search(queryVector, p => p.Price < 15000 && p.InStock);
 
 foreach (var r in results)
 {
-    Console.WriteLine($"{r.Item.Name}: {r.Score}");
+    Console.WriteLine($"Found match: {r.Id} with score {r.Score}");
 }
 ```
 
-## Typed client (AOT)
+`Search` returns `List<(Guid Id, float Score, string Metadata)>`.
 
-### 1. for AOT define object serialization
-```c#
-// define a class
+## Metadata Filtered Search
+
+```csharp
+var results = db.Search(
+    queryVector,
+    meta => meta.Contains("\"category\":\"text\""),
+    topK: 5);
+
+foreach (var r in results)
+{
+    Console.WriteLine($"Found match: {r.Id} with score {r.Score}");
+}
+```
+
+This overload performs HNSW retrieval first and then applies the metadata predicate to the retrieved candidates. It is convenient, but it is **post-filtering**, not integrated filtering inside the HNSW navigation loop.
+
+## Typed client
+
+```csharp
+using Qvec.Core;
+using Qvec.Core.Client;
+
+using var db = new QvecDatabase("products.qvec", dim: 1536, max: 10_000);
+var client = new QvecClient<Product>(db);
+
+Guid id = client.AddEntry(new VectorData<Product>
+{
+    vector = myVector,
+    Item = new Product(1, "Laptop", 12_000, true)
+});
+
+var results = client.Search(queryVector, p => p.Price < 15_000 && p.InStock);
+
+foreach (var r in results)
+{
+    Console.WriteLine($"{r.Item?.Name}: {r.Score}");
+}
+
+public record Product(int Id, string Name, double Price, bool InStock);
+```
+
+## Typed client serialization
+
+You can pass source-generated JSON metadata for serialization/deserialization:
+
+```csharp
+using System.Text.Json.Serialization;
+using Qvec.Core;
+using Qvec.Core.Client;
+
+using var db = new QvecDatabase("products.qvec", dim: 1536, max: 10_000);
+var client = new QvecClient<Product>(db, ProductJsonContext.Default.Product);
+
+Guid id = client.AddEntry(new VectorData<Product>
+{
+    vector = myVector,
+    Item = new Product(1, "Laptop", 12_000, true)
+});
+
+var results = client.Search(queryVector, p => p.Price < 15_000 && p.InStock);
+
 public record Product(int Id, string Name, double Price, bool InStock);
 
-// Source Generator for JSON (needed for AOT)
 [JsonSerializable(typeof(Product))]
 internal partial class ProductJsonContext : JsonSerializerContext { }
 ```
 
-### 2. Use typed client
-```c#
-var db = new QvecDatabase("products.qvec", dim: 1536, max: 10000);
-var client = new QvecClient<Product>(db, ProductJsonContext.Default.Product);
+### AOT scope
 
-// Add entry
-client.AddEntry(myVector, new Product(1, "Laptop", 12000, true));
-
-// Hybrid search
-var results = client.Search(queryVector, p => p.Price < 15000 && p.InStock);
-```
+`Qvec.Core` is the AOT-friendly package: it is dependency-free and stores caller-provided metadata strings. `Qvec.Core.Client` is convenient, but it currently uses `typeof(T).GetProperties()`, expression-tree compilation, and reflection-based JSON serialization unless `JsonTypeInfo<T>` is supplied. Treat the typed client as not fully Native AOT-ready yet.
 
 ## Indexed Filtering with `[QvecIndexed]`
 
-Qvec supports **O(1) metadata filtering** via an in-memory inverted index. Mark properties with `[QvecIndexed]` and Qvec will automatically build and maintain an index — no scanning, no JSON parsing at query time.
+Qvec supports equality filtering via an in-memory inverted index. Mark properties with `[QvecIndexed]`, create the typed client with the generated extractor, and simple `==` expressions over indexed properties use the index instead of scanning JSON metadata.
 
 ### 1. Mark properties to index
 
-```c#
+```csharp
 using Qvec.Core;
 
 public class Product
 {
     [QvecIndexed]
-    public string Category { get; set; }
+    public string Category { get; set; } = "";
 
     [QvecIndexed]
-    public string Brand { get; set; }
+    public string Brand { get; set; } = "";
 
-    public string Description { get; set; }  // not indexed — Where falls back to parallel scan
+    public string Description { get; set; } = "";
     public double Price { get; set; }
 }
 ```
 
 ### 2. Create the client with the extractor
 
-The source generator is bundled with `Qvec.Core.Client` — no extra package references needed. It automatically generates a `ProductFieldExtractor` class that implements `IQvecFieldExtractor<Product>`.
+When `Qvec.Core.Client` is consumed as a NuGet package, its analyzer includes the source generator. For a type in the global namespace, the generator emits `Qvec.Generated.ProductFieldExtractor`; for a type inside a namespace, the extractor is emitted into that same namespace.
 
-```c#
-var db = new QvecDatabase("products.qvec", dim: 1536, max: 10000);
-var client = new QvecClient<Product>(db, new ProductFieldExtractor());
+```csharp
+using Qvec.Core;
+using Qvec.Core.Client;
+
+using var db = new QvecDatabase("products.qvec", dim: 1536, max: 10_000);
+var client = new QvecClient<Product>(
+    db,
+    new Qvec.Generated.ProductFieldExtractor());
 ```
 
-The inverted index is rebuilt from disk at startup and kept in sync on every insert and delete.
+> **Known limitation:** if you reference `Qvec.Core.Client` via `ProjectReference` instead of the NuGet package, the source generator/analyzer does not currently flow transitively. Add an explicit analyzer reference to `Qvec.SourceGen` in that setup until this is fixed.
+
+The inverted index is rebuilt from disk at startup when an extractor is supplied and kept in sync on inserts and deletes.
 
 ### 3. Query with `Where`
 
 `Where` accepts an `Expression<Func<T, bool>>`. If the expression consists of `==` comparisons on indexed properties, the inverted index is used automatically. Everything else falls back to a parallel scan — same syntax either way.
 
-```c#
-// O(1) — single indexed field lookup
+```csharp
 var science = client.Where(p => p.Category == "Science");
 
-// O(1) — compound AND, uses HashSet intersection
-var acmeScience = client.Where(p => p.Category == "Science" && p.Brand == "Acme");
+var acmeScience = client.Where(
+    p => p.Category == "Science" && p.Brand == "Acme");
 
-// O(1) — captured variables work too
 string cat = "Science";
 var results = client.Where(p => p.Category == cat);
 
-// Automatic fallback to parallel scan for non-indexed or complex expressions
 var cheap = client.Where(p => p.Description.Contains("quantum"));
 ```
 
 | Expression | Strategy | Complexity |
 | :--- | :--- | :--- |
-| `p => p.Category == "Science"` | Inverted index | **O(1)** |
-| `p => p.Category == "Science" && p.Brand == "Acme"` | Index intersection | **O(1)** |
-| `p => p.Price < 100` | Parallel scan (fallback) | O(N) |
-| `p => p.Description.Contains("x")` | Parallel scan (fallback) | O(N) |
+| `p => p.Category == "Science"` | Inverted index | **O(1)** lookup |
+| `p => p.Category == "Science" && p.Brand == "Acme"` | Index intersection | HashSet intersection |
+| `p => p.Price < 100` | Parallel scan fallback | O(N) |
+| `p => p.Description.Contains("x")` | Parallel scan fallback | O(N) |
 
 ### Hybrid Search with Indexed Filtering
 
-The same expression analysis works for `Search` (vector + filter). When the filter uses `==` on indexed properties, Qvec pre-filters via the inverted index and computes vector similarity **only on matching entries** — no HNSW post-filtering, no wasted similarity calculations:
+The typed client's `Search` can pre-filter only when the filter is made of equality comparisons on `[QvecIndexed]` properties. In that case, Qvec gets candidate row IDs from the inverted index and ranks only those candidates by vector similarity. Other filters fall back to HNSW search followed by post-filtering.
 
-```c#
-// Pre-filtered: vector similarity computed only for Category == "Science" entries
+```csharp
 var results = client.Search(queryVector, p => p.Category == "Science", topK: 5);
 
-// Compound: intersection first, then vector ranking over the small candidate set
-var results = client.Search(queryVector,
-    p => p.Category == "Science" && p.Brand == "Acme", topK: 5);
+var acmeResults = client.Search(
+    queryVector,
+    p => p.Category == "Science" && p.Brand == "Acme",
+    topK: 5);
 
-// Non-indexed filter: falls back to HNSW + parallel post-filter automatically
-var results = client.Search(queryVector, p => p.Price < 100, topK: 5);
+var postFiltered = client.Search(queryVector, p => p.Price < 100, topK: 5);
 ```
 
-| Scenario | Without index | With `[QvecIndexed]` |
+| Scenario | Without index | With `[QvecIndexed]` equality filter |
 | :--- | :--- | :--- |
 | 1M entries, 1% match filter | HNSW finds 50 candidates → filter → **~0 results** | Index → 10K candidates → rank → **5 perfect results** |
-| 1M entries, 50% match filter | HNSW + post-filter works OK | Index → 500K candidates (fallback to HNSW is better) |
+| 1M entries, 50% match filter | HNSW + post-filter works OK | Index → 500K candidates → rank; HNSW may be faster depending on recall/latency needs |
 
-### Combining with AOT
+### Combining JSON type info and indexed filtering
 
-Pass both the JSON type info and the extractor:
-
-```c#
+```csharp
 var client = new QvecClient<Product>(
     db,
     ProductJsonContext.Default.Product,
-    new ProductFieldExtractor());
+    new Qvec.Generated.ProductFieldExtractor());
 ```
 
+---
 
 ## 🎯 Use Cases
 
-Qvec is built as an **embedded** vector database — no server, no network overhead, just a library running in your process. This makes it ideal for scenarios where low latency, offline capability, and small footprint matter:
+Qvec is built as an **embedded** vector database — no server, no network overhead, just a library running in your process. This makes it suitable for scenarios where low latency, offline capability, and a small deployment footprint matter:
 
 | Scenario | Why Qvec? |
 | :--- | :--- |
 | **AI Agents on the Edge** | Run RAG-powered agents on IoT gateways, factory floors, or retail kiosks without depending on cloud connectivity. |
 | **Agent Memory** | Give autonomous agents persistent, searchable long-term memory that lives alongside the agent process. |
-| **Embedded / Industrial Software** | Native AOT + MemoryMappedFiles keeps the footprint tiny — perfect for instruments, PLCs, and headless services. |
+| **Embedded / Industrial Software** | In-process .NET storage with MemoryMappedFiles is a good fit for instruments, PLCs, and headless services. |
 | **Mobile & Tablet Apps** | Ship a local vector store inside .NET MAUI or Uno Platform apps for offline semantic search. |
 | **Desktop Copilots & Plugins** | Add similarity search to WPF / WinUI / Avalonia apps — no Docker, no external service. |
-| **Serverless & Functions** | Cold-start friendly: a single-file AOT binary boots instantly in Azure Functions or AWS Lambda. |
+| **Serverless & Functions** | The core library has no server dependency, but validate cold-start, file-system, and AOT constraints for your host. |
 | **Privacy-Sensitive Workloads** | Keep embeddings on-device for healthcare, legal, or finance apps where data must never leave the machine. |
-| **Rapid Prototyping** | One NuGet reference, zero infrastructure — go from idea to working vector search in minutes. |
+| **Rapid Prototyping** | One NuGet reference, zero infrastructure — go from idea to working vector search quickly. |
 
 ---
 
 ## 🏗 Architecture
 
-1. **Header:** Stores metadata, EntryPoint, and layer distribution.
-2. **Vector Store:** Contiguous float arrays stored via MemoryMappedFiles.
-3. **Graph Store:** Hierarchical adjacency lists (HNSW layers) mapped to disk.
-4. **Metadata Store:** Fixed-size UTF-8 slots for rapid scalar filtering.
+1. **Header:** Stores metadata, entry point, layer distribution, capacity, and format version.
+2. **Vector Store:** Contiguous float arrays stored via `MemoryMappedFiles`.
+3. **Graph Store:** Hierarchical adjacency lists for HNSW layers.
+4. **Metadata Store:** Fixed-size 512-byte UTF-8 slots for caller-supplied metadata strings.
+5. **ID and Tombstone Stores:** Stable `Guid` document IDs plus soft-delete markers.
+6. **Optional Inverted Index:** In-memory equality index rebuilt by the typed client when an extractor is supplied.
 
 ## ☁️ Cloud Readiness
 
-Qvec is built for modern cloud environments:
-- **Chiseled Containers:** Run on ~20MB Docker images for Azure Container Apps.
-- **Health Checks:** Built-in /health endpoints for Kubernetes/Azure liveness probes.
+Today, Qvec is a local embedded library. There is a small `Qvec.Api` sample project with `/health`, `/search`, `/stats`, update, and delete endpoints, but the API project is not published as a package and the core library does not register ASP.NET health checks.
 
-## 📜 Roadmap
+Planned cloud work is tracked in design documents and the roadmap below.
 
-- ~~**Guid Document IDs** — Replace sequential `int` IDs with `Guid` as the logical document identifier to enable multi-database sync, deduplication, and stable external references. Internal storage remains index-based for zero-overhead disk access. See [design doc](docs/design-guid-id.md).~~
-- ~~**Update & Delete** — Tombstone-based soft-delete with HNSW graph repair, in-place metadata updates, and delete+re-insert for vector updates. Includes `Vacuum()` for storage reclamation. See [design doc](docs/design-update-delete.md).~~
-- **Sync Engine** — Opt-in edge-cloud synchronization. Connect multiple local Qvec databases to a central sync server so all connected instances stay in sync automatically. Offline-first with delta-sync via Azure Append Blob and real-time push via Azure Web PubSub. See [design doc](docs/design-sync-engine.md).
-- Multi-Vector Support (Image + Text in one entry)
+## 📜 Roadmap / Not yet implemented
+
+- **Storage format v4** — The on-disk format is self-describing (magic, version, CRC-32 over the header, a section table, and a `WriteInProgress` flag). There is **no migration** from earlier formats; v2/v3 files are rejected with `QvecFormatException`.
+- **Growable files** — Allow capacity expansion after creation. Not implemented; `max` is still a hard ceiling, but sparse allocation means an over-sized `max` no longer costs disk.
+- **`M0 = 2 × M` on layer 0** — The HNSW paper's recommended fan-out for the base layer. Requires a graph-section layout change.
+- **int8 scalar quantization** — ~4× smaller vectors on disk and in memory. The format reserves space for the metadata this needs.
+- **Sync Engine** — Opt-in edge-cloud synchronization. Connect multiple local Qvec databases to a central sync server so connected instances can stay in sync automatically. The current design discusses Azure Append Blob and Azure Web PubSub, but this is not implemented. See [design doc](docs/design-sync-engine.md).
+- **Azure Blob Storage and Managed Identity integration** — Planned as part of the sync/cloud work; no Azure SDK dependency is shipped today.
+- **Container packaging** — A `Dockerfile` for `Qvec.Api` is included. Chiseled base images are not used yet.
+- **ASP.NET health-check integration** — The core exposes `IsHealthy()` and the sample API maps `/health`; packaged Kubernetes/Azure health-check wiring is not implemented yet.
+- **Full Native AOT support for the typed client** — Remove or replace reflection, expression compilation, and reflection-based JSON paths.
+- **ProjectReference analyzer flow for source generation** — Ensure the `[QvecIndexed]` generator is available when consuming `Qvec.Core.Client` through project references.
+- **Published benchmark methodology** — Add reproducible benchmark projects, datasets, and hardware/runtime details.
+- **Multi-vector support** — Store and search multiple embeddings, such as image + text, for one logical entry.
 
 ## License
 
