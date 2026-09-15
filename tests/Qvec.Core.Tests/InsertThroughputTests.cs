@@ -1,0 +1,54 @@
+using System.Diagnostics;
+using Qvec.Core;
+using Xunit.Abstractions;
+
+namespace Qvec.Core.Tests;
+
+/// <summary>
+/// Insert throughput gate.
+///
+/// The SIFT-1M benchmark measured index construction at ~242 inserts/s -- 69 minutes for a
+/// million vectors -- and a CPU profile showed that the distance arithmetic accounted for well
+/// under one percent of that. The rest was overhead per insert: element-by-element marshalling
+/// through <c>MemoryMappedViewAccessor.ReadArray</c>/<c>WriteArray</c>, shared-pool rentals of
+/// large scratch buffers, and allocation-heavy search state that kept the GC busy.
+///
+/// This test exists so that overhead cannot quietly come back. The floor is deliberately far
+/// below what a developer machine achieves, because CI runners are slower and noisier and a
+/// throughput gate that fails on a busy runner teaches people to ignore it.
+/// </summary>
+public class InsertThroughputTests(ITestOutputHelper output)
+{
+    [Fact]
+    [Trait("Category", TestCategories.Slow)]
+    public void AddEntry_OnClusteredVectors_SustainsMinimumThroughput()
+    {
+        const int N = 5_000;
+        const int Dim = 128;
+
+        var clusters = new Vec.ClusteredVectors(Dim, clusterCount: 100, seed: 8080);
+        var rng = new Random(8080);
+        var vectors = new float[N][];
+        for (int i = 0; i < N; i++) vectors[i] = clusters.Next(Dim, rng);
+
+        using var temp = new TempDb();
+        using var db = temp.Open(dim: Dim, max: N, maxNeighbors: 32, maxLayers: 5,
+            distance: DistanceFunction.Euclidean, indexSeed: 8080);
+
+        var sw = Stopwatch.StartNew();
+        for (int i = 0; i < N; i++) db.AddEntry(vectors[i], "{}");
+        sw.Stop();
+
+        double perSecond = N / sw.Elapsed.TotalSeconds;
+        output.WriteLine($"{N} inserts in {sw.Elapsed.TotalSeconds:F2}s = {perSecond:F0} inserts/s");
+
+        // Before the insert-path work this configuration ran at roughly 450 inserts/s on a
+        // 12-core developer machine; after it, 1,300-1,450/s on the same machine, with the
+        // remaining time spent in the O(M0²) distance arithmetic of the neighbour heuristic
+        // rather than in overhead. The floor is set so that regressing back to the old path
+        // is a clear failure while a CI runner at roughly half developer speed still passes.
+        Assert.True(perSecond >= 800,
+            $"Insert throughput was {perSecond:F0}/s, below the 800/s floor. " +
+            "Profile AddEntry before adjusting this number.");
+    }
+}

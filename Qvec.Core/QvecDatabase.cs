@@ -433,11 +433,13 @@ namespace Qvec.Core
             int vectorSize = Vector<float>.Count;
             int count = Math.Min(left.Length, right.Length);
 
+            ref float l = ref MemoryMarshal.GetReference(left);
+            ref float r = ref MemoryMarshal.GetReference(right);
             for (; i <= count - vectorSize; i += vectorSize)
             {
                 dot += Vector.Dot(
-                    new Vector<float>(left.Slice(i, vectorSize)),
-                    new Vector<float>(right.Slice(i, vectorSize)));
+                    Vector.LoadUnsafe(ref l, (nuint)i),
+                    Vector.LoadUnsafe(ref r, (nuint)i));
             }
             for (; i < count; i++) dot += left[i] * right[i];
             return dot;
@@ -495,9 +497,13 @@ namespace Qvec.Core
             int vectorSize = Vector<float>.Count;
             int count = Math.Min(left.Length, right.Length);
 
+            // LoadUnsafe skips the per-iteration slice bounds checks; the loop bound above
+            // already guarantees every load stays inside both spans.
+            ref float l = ref MemoryMarshal.GetReference(left);
+            ref float r = ref MemoryMarshal.GetReference(right);
             for (; i <= count - vectorSize; i += vectorSize)
             {
-                var difference = new Vector<float>(left.Slice(i, vectorSize)) - new Vector<float>(right.Slice(i, vectorSize));
+                var difference = Vector.LoadUnsafe(ref l, (nuint)i) - Vector.LoadUnsafe(ref r, (nuint)i);
                 accumulator += difference * difference;
             }
 
@@ -1028,11 +1034,15 @@ namespace Qvec.Core
             _dataAccessor.Write(descriptorPos + 12, 0);
         }
 
-        private void InitNeighborsOnDisk(int index)
+        private unsafe void InitNeighborsOnDisk(int index)
         {
             BeginWrite();
             long offset = _graphSectionOffset + (long)index * _cachedEmptyNeighbors.Length * sizeof(int);
-            _dataAccessor.WriteArray(offset - HeaderSize, _cachedEmptyNeighbors, 0, _cachedEmptyNeighbors.Length);
+            long bytes = (long)_cachedEmptyNeighbors.Length * sizeof(int);
+            fixed (int* source = _cachedEmptyNeighbors)
+            {
+                Buffer.MemoryCopy(source, DataBasePointer + (offset - HeaderSize), bytes, bytes);
+            }
         }
         // --- INVERTERAT INDEX ---
 
@@ -1624,7 +1634,7 @@ namespace Qvec.Core
 
             for (int level = Math.Min(newLevel, _header.MaxLayers - 1); level >= 0; level--)
             {
-                var candidates = SearchLayerNearest(newVector, currentElement, level, EfConstruction);
+                var candidates = SearchLayerNearest(newVector, currentElement, level, EfConstruction, _insertScratch);
                 var nearest = SelectNeighborsHeuristic(candidates, NeighborsAtLevel(level));
 
                 WriteNeighborsAtLevel(newIndex, level, nearest);
@@ -1661,23 +1671,7 @@ namespace Qvec.Core
 
             if (ordered.Length <= m) return ordered;
 
-            int dim = _header.VectorDimension;
-
-            // Candidate vectors are loaded once into a contiguous buffer. Re-reading them from
-            // the mapped file inside the O(m^2) comparison loop made every insert dominated by
-            // I/O and turned index construction into the slowest part of the library.
-            float[] vectors = ArrayPool<float>.Shared.Rent(ordered.Length * dim);
-            try
-            {
-                for (int i = 0; i < ordered.Length; i++)
-                    ReadVectorInto(ordered[i].Id, vectors, i * dim);
-
-                return PruneNeighbors(ordered, vectors, dim, m);
-            }
-            finally
-            {
-                ArrayPool<float>.Shared.Return(vectors);
-            }
+            return PruneNeighbors(ordered, m);
         }
 
         /// <summary>
@@ -1686,25 +1680,28 @@ namespace Qvec.Core
         /// already selected, which preserves long-range links instead of collapsing the
         /// neighbourhood into a single tight cluster.
         /// </summary>
-        /// <param name="ordered">Candidates sorted by descending similarity to the owner.</param>
-        /// <param name="vectors">Candidate vectors, laid out contiguously in <paramref name="ordered"/> order.</param>
-        private (int Id, float Score)[] PruneNeighbors(
-            (int Id, float Score)[] ordered, float[] vectors, int dim, int m)
+        /// <remarks>
+        /// Candidate vectors are read in place from the mapped file. An earlier version copied
+        /// them into a rented contiguous buffer first; with M0 = 64 that meant renting and
+        /// filling a 33 KiB buffer for every one of the up to 64 back-links an insert creates,
+        /// and the pool traffic outweighed the O(m²) comparisons it was feeding.
+        /// </remarks>
+        /// <param name="ordered">Candidates sorted by descending similarity to the owner. Every id must be a stored row.</param>
+        private (int Id, float Score)[] PruneNeighbors((int Id, float Score)[] ordered, int m)
         {
             var selected = new List<(int Id, float Score)>(m);
-            var selectedSlots = new List<int>(m);
             var discarded = new List<(int Id, float Score)>();
 
             for (int i = 0; i < ordered.Length && selected.Count < m; i++)
             {
                 var candidate = ordered[i];
-                var candidateVector = vectors.AsSpan(i * dim, dim);
+                var candidateVector = StoredVector(candidate.Id);
 
                 bool closerToOwnerThanToNeighbours = true;
-                foreach (int slot in selectedSlots)
+                foreach (var (selectedId, _) in selected)
                 {
                     // Score is a similarity: higher means closer.
-                    if (Similarity(candidateVector, vectors.AsSpan(slot * dim, dim)) > candidate.Score)
+                    if (Similarity(candidateVector, StoredVector(selectedId)) > candidate.Score)
                     {
                         closerToOwnerThanToNeighbours = false;
                         break;
@@ -1712,14 +1709,9 @@ namespace Qvec.Core
                 }
 
                 if (closerToOwnerThanToNeighbours)
-                {
                     selected.Add(candidate);
-                    selectedSlots.Add(i);
-                }
                 else
-                {
                     discarded.Add(candidate);
-                }
             }
 
             // keepPrunedConnections: top up with the best discarded candidates rather than
@@ -1762,15 +1754,65 @@ namespace Qvec.Core
             }
             return current;
         }
-        private (int Id, float Score)[] SearchLayerNearest(float[] query, int entryPoint, int level, int ef)
+        /// <summary>
+        /// Reusable per-database scratch state for the insert path. Only touched while the write
+        /// lock is held, so a single instance is safe; the concurrent read path allocates its own.
+        /// </summary>
+        private sealed class InsertScratch
         {
-            var visited = new HashSet<int> { entryPoint };
+            public int[] VisitedEpoch = Array.Empty<int>();
+            public int Epoch;
+            public readonly PriorityQueue<int, float> Candidates = new();
+            public readonly PriorityQueue<int, float> Results = new();
+
+            public void Begin(int capacity)
+            {
+                if (VisitedEpoch.Length < capacity)
+                    Array.Resize(ref VisitedEpoch, Math.Max(capacity, VisitedEpoch.Length * 2));
+
+                // Wrap-around resets the whole array once every int.MaxValue searches.
+                if (++Epoch == int.MaxValue)
+                {
+                    Array.Clear(VisitedEpoch);
+                    Epoch = 1;
+                }
+
+                Candidates.Clear();
+                Results.Clear();
+            }
+
+            public bool Visit(int id)
+            {
+                if (VisitedEpoch[id] == Epoch) return false;
+                VisitedEpoch[id] = Epoch;
+                return true;
+            }
+        }
+
+        private readonly InsertScratch _insertScratch = new();
+
+        private (int Id, float Score)[] SearchLayerNearest(float[] query, int entryPoint, int level, int ef, InsertScratch? scratch = null)
+        {
+            HashSet<int>? visitedSet = null;
+            PriorityQueue<int, float> candidates;
+            PriorityQueue<int, float> results;
+
+            if (scratch is null)
+            {
+                visitedSet = new HashSet<int> { entryPoint };
+                candidates = new PriorityQueue<int, float>();
+                results = new PriorityQueue<int, float>();
+            }
+            else
+            {
+                scratch.Begin(_header.MaxCount);
+                scratch.Visit(entryPoint);
+                candidates = scratch.Candidates;
+                results = scratch.Results;
+            }
+
             float entryScore = CalculateScore(query, entryPoint);
-
-            var candidates = new PriorityQueue<int, float>();
             candidates.Enqueue(entryPoint, -entryScore);
-
-            var results = new PriorityQueue<int, float>();
             results.Enqueue(entryPoint, entryScore);
             float worstScore = entryScore;
 
@@ -1789,7 +1831,8 @@ namespace Qvec.Core
                     {
                         int neighbor = neighborBuffer[j];
                         if (neighbor < 0) break;
-                        if (!visited.Add(neighbor)) continue;
+                        bool firstVisit = visitedSet is null ? scratch!.Visit(neighbor) : visitedSet.Add(neighbor);
+                        if (!firstVisit) continue;
                         if (_deletedIndices.Contains(neighbor)) continue;
 
                         float score = CalculateScore(query, neighbor);
@@ -1926,44 +1969,26 @@ namespace Qvec.Core
             return resultArray;
         }
 
-        private void WriteNeighborsAtLevel(int nodeIndex, int level, (int Id, float Score)[] neighbors)
+        private unsafe void WriteNeighborsAtLevel(int nodeIndex, int level, (int Id, float Score)[] neighbors)
         {
             BeginWrite();
-            long position = NeighborPosition(nodeIndex, level);
             int slots = NeighborsAtLevel(level);
-
             int count = Math.Min(neighbors.Length, slots);
-            int[] toWrite = ArrayPool<int>.Shared.Rent(slots);
-            try
-            {
-                for (int i = 0; i < count; i++) toWrite[i] = neighbors[i].Id;
-                for (int i = count; i < slots; i++) toWrite[i] = -1;
-                _dataAccessor.WriteArray(position, toWrite, 0, slots);
-            }
-            finally
-            {
-                ArrayPool<int>.Shared.Return(toWrite);
-            }
+
+            int* target = NeighborPointer(nodeIndex, level);
+            for (int i = 0; i < count; i++) target[i] = neighbors[i].Id;
+            for (int i = count; i < slots; i++) target[i] = -1;
         }
 
-        private void WriteNeighborsAtLevel(int nodeIndex, int level, int[] neighborIds)
+        private unsafe void WriteNeighborsAtLevel(int nodeIndex, int level, int[] neighborIds)
         {
             BeginWrite();
-            long position = NeighborPosition(nodeIndex, level);
             int slots = NeighborsAtLevel(level);
-
             int count = Math.Min(neighborIds.Length, slots);
-            int[] toWrite = ArrayPool<int>.Shared.Rent(slots);
-            try
-            {
-                Array.Copy(neighborIds, toWrite, count);
-                for (int i = count; i < slots; i++) toWrite[i] = -1;
-                _dataAccessor.WriteArray(position, toWrite, 0, slots);
-            }
-            finally
-            {
-                ArrayPool<int>.Shared.Return(toWrite);
-            }
+
+            int* target = NeighborPointer(nodeIndex, level);
+            for (int i = 0; i < count; i++) target[i] = neighborIds[i];
+            for (int i = count; i < slots; i++) target[i] = -1;
         }
 
         /// <summary>
@@ -1994,60 +2019,37 @@ namespace Qvec.Core
                     if (neighbors[i] == newNode) return;
                 }
 
-                float[] existingVector = GetVector(existingNode);
+                // The list is full: re-run the selection heuristic over the existing neighbours
+                // plus the new node, all read in place from the mapped file. The new node's
+                // vector is already on disk at this point, so it needs no special casing.
                 int dim = _header.VectorDimension;
                 int candidateCount = slots + 1;
-                float[] candidateVectors = ArrayPool<float>.Shared.Rent(candidateCount * dim);
-                try
-                {
-                    var candidates = new (int Id, float Score)[candidateCount];
+                var candidates = new (int Id, float Score)[candidateCount];
+                var existingVector = StoredVector(existingNode);
 
-                    for (int i = 0; i < slots; i++)
-                    {
-                        ReadVectorInto(neighbors[i], candidateVectors, i * dim);
-                        candidates[i] = (
-                            neighbors[i],
-                            Similarity(existingVector.AsSpan(0, dim), candidateVectors.AsSpan(i * dim, dim)));
-                    }
+                for (int i = 0; i < slots; i++)
+                    candidates[i] = (neighbors[i], Similarity(existingVector, StoredVector(neighbors[i])));
 
-                    int newSlot = slots;
-                    newVector.AsSpan(0, dim).CopyTo(candidateVectors.AsSpan(newSlot * dim, dim));
-                    candidates[newSlot] = (newNode, Similarity(existingVector, newVector, dim));
+                candidates[slots] = (newNode, Similarity(existingVector, newVector.AsSpan(0, dim)));
 
-                    // Reorder candidates (and their vectors) by descending similarity so the
-                    // pruning pass can run entirely in memory.
-                    int[] order = Enumerable.Range(0, candidateCount).ToArray();
-                    Array.Sort(order, (a, b) => candidates[b].Score.CompareTo(candidates[a].Score));
+                // Sorted by descending similarity for the pruning pass. Array.Sort runs the same
+                // introsort over the same comparison outcomes as the index-array sort it
+                // replaces, so tie ordering, and therefore the graph, is unchanged.
+                Array.Sort(candidates, DescendingScore.Instance);
 
-                    var ordered = new (int Id, float Score)[candidateCount];
-                    float[] orderedVectors = ArrayPool<float>.Shared.Rent(candidateCount * dim);
-                    try
-                    {
-                        for (int i = 0; i < candidateCount; i++)
-                        {
-                            ordered[i] = candidates[order[i]];
-                            candidateVectors.AsSpan(order[i] * dim, dim)
-                                            .CopyTo(orderedVectors.AsSpan(i * dim, dim));
-                        }
-
-                        var selected = PruneNeighbors(ordered, orderedVectors, dim, slots);
-                        WriteNeighborsAtLevel(existingNode, level, selected);
-                    }
-                    finally
-                    {
-                        ArrayPool<float>.Shared.Return(orderedVectors);
-                    }
-                }
-                finally
-                {
-                    ArrayPool<float>.Shared.Return(candidateVectors);
-                    ArrayPool<float>.Shared.Return(existingVector);
-                }
+                var selected = PruneNeighbors(candidates, slots);
+                WriteNeighborsAtLevel(existingNode, level, selected);
             }
             finally
             {
                 ArrayPool<int>.Shared.Return(neighbors);
             }
+        }
+
+        private sealed class DescendingScore : IComparer<(int Id, float Score)>
+        {
+            public static readonly DescendingScore Instance = new();
+            public int Compare((int Id, float Score) a, (int Id, float Score) b) => b.Score.CompareTo(a.Score);
         }
 
         /// <summary>
@@ -2079,9 +2081,13 @@ namespace Qvec.Core
                + ((long)nodeIndex * GraphNodeStride
                   + (level == 0 ? 0L : (long)(level + 1) * _header.MaxNeighbors)) * sizeof(int);
 
-        private void GetNeighborsAtLevel(int nodeIndex, int level, int[] buffer)
+        private unsafe void GetNeighborsAtLevel(int nodeIndex, int level, int[] buffer)
         {
-            _dataAccessor.ReadArray(NeighborPosition(nodeIndex, level), buffer, 0, NeighborsAtLevel(level));
+            long bytes = (long)NeighborsAtLevel(level) * sizeof(int);
+            fixed (int* dest = buffer)
+            {
+                Buffer.MemoryCopy(NeighborPointer(nodeIndex, level), dest, bytes, bytes);
+            }
         }
 
         private int RandomLayer()
@@ -2092,20 +2098,28 @@ namespace Qvec.Core
             int level = (int)(-Math.Log(r) * _header.LayerProbability);
             return Math.Min(level, _header.MaxLayers - 1);
         }
-        private float CalculateScore(float[] query, int targetIndex)
-        {
-            float[] targetVector = ArrayPool<float>.Shared.Rent(_header.VectorDimension);
-            try
-            {
-                long offset = (long)targetIndex * _header.VectorDimension * sizeof(float);
-                _dataAccessor.ReadArray(offset, targetVector, 0, _header.VectorDimension);
-                return Similarity(query, targetVector, _header.VectorDimension);
-            }
-            finally
-            {
-                ArrayPool<float>.Shared.Return(targetVector);
-            }
-        }
+        private unsafe float CalculateScore(float[] query, int targetIndex)
+            => SimilarityUnsafe(query, VectorPointer(targetIndex), _header.VectorDimension);
+
+        /// <summary>
+        /// Address of a stored vector inside the mapped view. Scoring straight against this
+        /// instead of copying the row out first is what took index construction from being
+        /// dominated by <c>ReadArray</c> marshalling and pool traffic to being dominated by
+        /// the arithmetic it is supposed to be doing.
+        /// </summary>
+        private unsafe float* VectorPointer(int index)
+            => (float*)(DataBasePointer + (_vectorSectionOffset - HeaderSize)
+                        + (long)index * _header.VectorDimension * sizeof(float));
+
+        /// <summary>
+        /// A stored vector viewed in place. Valid only while the write lock is held or the view
+        /// is otherwise known not to be remapped, since growth replaces the mapping.
+        /// </summary>
+        private unsafe ReadOnlySpan<float> StoredVector(int index)
+            => new(VectorPointer(index), _header.VectorDimension);
+
+        private unsafe int* NeighborPointer(int nodeIndex, int level)
+            => (int*)(DataBasePointer + NeighborPosition(nodeIndex, level));
         /// <summary>
         /// Rebuilds the entire HNSW graph from the stored vectors.
         /// The previous implementation ran <c>Parallel.For</c> with no locking, wrote progress
@@ -2583,22 +2597,11 @@ namespace Qvec.Core
             }
         }
 
-        private void InitNeighborsAtLevel(int nodeIndex, int level)
+        private unsafe void InitNeighborsAtLevel(int nodeIndex, int level)
         {
             BeginWrite();
-            long position = NeighborPosition(nodeIndex, level);
             int slots = NeighborsAtLevel(level);
-
-            int[] empty = ArrayPool<int>.Shared.Rent(slots);
-            try
-            {
-                Array.Fill(empty, -1, 0, slots);
-                _dataAccessor.WriteArray(position, empty, 0, slots);
-            }
-            finally
-            {
-                ArrayPool<int>.Shared.Return(empty);
-            }
+            new Span<int>(NeighborPointer(nodeIndex, level), slots).Fill(-1);
         }
 
         /// <summary>

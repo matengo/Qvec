@@ -66,7 +66,12 @@ if (output is not null)
     Console.WriteLine($"Wrote {output}");
 }
 
-try { File.Delete(indexPath); } catch { /* best effort */ }
+// --keep-index leaves the file behind so two builds can be compared byte for byte, which is
+// how a change to the insert path proves it did not alter the graph.
+if (!arguments.Flag("keep-index"))
+{
+    try { File.Delete(indexPath); } catch { /* best effort */ }
+}
 
 return 0;
 
@@ -128,6 +133,7 @@ internal sealed class CommandLine
               --queries <int>     limit the number of queries
               --max-base <int>    index only a prefix of the base set (invalidates recall)
               --index <path>      where to put the .qvec file
+              --keep-index        do not delete the .qvec file afterwards
               --hardware <text>   hardware description to print with the results
               --out <path>        also write the Markdown report to a file
 
