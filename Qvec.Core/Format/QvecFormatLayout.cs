@@ -148,7 +148,9 @@ public static class QvecFormatLayout
         ref long offset)
     {
         AddSection(header.Sections[0], V4SectionIds.Vectors, ref offset, maxCount, checked((uint)(vectorDimension * sizeof(float))));
-        AddSection(header.Sections[1], V4SectionIds.Graph, ref offset, maxCount, checked((uint)(maxLayers * maxNeighbors * sizeof(int))));
+        // Layer 0 gets 2 * maxNeighbors slots (M0 = 2 * M) and every layer above it maxNeighbors,
+        // which sums to (maxLayers + 1) * maxNeighbors slots per node.
+        AddSection(header.Sections[1], V4SectionIds.Graph, ref offset, maxCount, checked((uint)((maxLayers + 1) * maxNeighbors * sizeof(int))));
         AddSection(header.Sections[2], V4SectionIds.MetadataDescriptors, ref offset, maxCount, 16);
         AddSection(header.Sections[3], V4SectionIds.Guids, ref offset, maxCount, 16);
         AddSection(header.Sections[4], V4SectionIds.Tombstones, ref offset, maxCount, 1);

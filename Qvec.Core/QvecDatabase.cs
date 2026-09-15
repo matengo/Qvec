@@ -148,7 +148,7 @@ namespace Qvec.Core
             _headerAccessor = _mmf.CreateViewAccessor(0, HeaderSize);
             _dataAccessor = _mmf.CreateViewAccessor(HeaderSize, totalSize - HeaderSize);
 
-            int totalSlots = _header.MaxLayers * _header.MaxNeighbors;
+            int totalSlots = GraphNodeStride;
             _cachedEmptyNeighbors = new int[totalSlots];
             Array.Fill(_cachedEmptyNeighbors, -1);
 
@@ -1535,7 +1535,7 @@ namespace Qvec.Core
             for (int level = Math.Min(newLevel, _header.MaxLayers - 1); level >= 0; level--)
             {
                 var candidates = SearchLayerNearest(newVector, currentElement, level, EfConstruction);
-                var nearest = SelectNeighborsHeuristic(candidates, _header.MaxNeighbors);
+                var nearest = SelectNeighborsHeuristic(candidates, NeighborsAtLevel(level));
 
                 WriteNeighborsAtLevel(newIndex, level, nearest);
 
@@ -1643,15 +1643,16 @@ namespace Qvec.Core
         {
             int current = entryPoint;
             float currentScore = CalculateScore(query, current);
-            int[] neighbors = ArrayPool<int>.Shared.Rent(_header.MaxNeighbors);
+            int[] neighbors = ArrayPool<int>.Shared.Rent(MaxNeighborsAnyLevel);
             try
             {
                 bool changed = true;
+                int slots = NeighborsAtLevel(level);
                 while (changed)
                 {
                     changed = false;
                     GetNeighborsAtLevel(current, level, neighbors);
-                    for (int j = 0; j < _header.MaxNeighbors; j++)
+                    for (int j = 0; j < slots; j++)
                     {
                         if (neighbors[j] == -1) break;
                         if (_deletedIndices.Contains(neighbors[j])) continue;
@@ -1683,9 +1684,10 @@ namespace Qvec.Core
             results.Enqueue(entryPoint, entryScore);
             float worstScore = entryScore;
 
-            int[] neighborBuffer = ArrayPool<int>.Shared.Rent(_header.MaxNeighbors);
+            int[] neighborBuffer = ArrayPool<int>.Shared.Rent(MaxNeighborsAnyLevel);
             try
             {
+                int slots = NeighborsAtLevel(level);
                 while (candidates.TryDequeue(out int candidateId, out float negScore))
                 {
                     float candidateScore = -negScore;
@@ -1693,7 +1695,7 @@ namespace Qvec.Core
                         break;
 
                     GetNeighborsAtLevel(candidateId, level, neighborBuffer);
-                    for (int j = 0; j < _header.MaxNeighbors; j++)
+                    for (int j = 0; j < slots; j++)
                     {
                         int neighbor = neighborBuffer[j];
                         if (neighbor < 0) break;
@@ -1786,9 +1788,10 @@ namespace Qvec.Core
             if (!_deletedIndices.Contains(entryPoint))
                 TryAdmit(entryPoint, entryScore);
 
-            int[] neighborBuffer = ArrayPool<int>.Shared.Rent(_header.MaxNeighbors);
+            int[] neighborBuffer = ArrayPool<int>.Shared.Rent(MaxNeighborsAnyLevel);
             try
             {
+                int slots = NeighborsAtLevel(level);
                 while (candidates.TryDequeue(out int candidateId, out float negScore))
                 {
                     // Stop only once the result set is full, since until then a worse-scoring
@@ -1803,7 +1806,7 @@ namespace Qvec.Core
                     }
 
                     GetNeighborsAtLevel(candidateId, level, neighborBuffer);
-                    for (int j = 0; j < _header.MaxNeighbors; j++)
+                    for (int j = 0; j < slots; j++)
                     {
                         int neighbor = neighborBuffer[j];
                         if (neighbor < 0) break;
@@ -1836,17 +1839,16 @@ namespace Qvec.Core
         private void WriteNeighborsAtLevel(int nodeIndex, int level, (int Id, float Score)[] neighbors)
         {
             BeginWrite();
-            long position = (_graphSectionOffset - HeaderSize) +
-                            (long)nodeIndex * _header.MaxLayers * _header.MaxNeighbors * sizeof(int) +
-                            (long)level * _header.MaxNeighbors * sizeof(int);
+            long position = NeighborPosition(nodeIndex, level);
+            int slots = NeighborsAtLevel(level);
 
-            int count = Math.Min(neighbors.Length, _header.MaxNeighbors);
-            int[] toWrite = ArrayPool<int>.Shared.Rent(_header.MaxNeighbors);
+            int count = Math.Min(neighbors.Length, slots);
+            int[] toWrite = ArrayPool<int>.Shared.Rent(slots);
             try
             {
                 for (int i = 0; i < count; i++) toWrite[i] = neighbors[i].Id;
-                for (int i = count; i < _header.MaxNeighbors; i++) toWrite[i] = -1;
-                _dataAccessor.WriteArray(position, toWrite, 0, _header.MaxNeighbors);
+                for (int i = count; i < slots; i++) toWrite[i] = -1;
+                _dataAccessor.WriteArray(position, toWrite, 0, slots);
             }
             finally
             {
@@ -1857,17 +1859,16 @@ namespace Qvec.Core
         private void WriteNeighborsAtLevel(int nodeIndex, int level, int[] neighborIds)
         {
             BeginWrite();
-            long position = (_graphSectionOffset - HeaderSize) +
-                            (long)nodeIndex * _header.MaxLayers * _header.MaxNeighbors * sizeof(int) +
-                            (long)level * _header.MaxNeighbors * sizeof(int);
+            long position = NeighborPosition(nodeIndex, level);
+            int slots = NeighborsAtLevel(level);
 
-            int count = Math.Min(neighborIds.Length, _header.MaxNeighbors);
-            int[] toWrite = ArrayPool<int>.Shared.Rent(_header.MaxNeighbors);
+            int count = Math.Min(neighborIds.Length, slots);
+            int[] toWrite = ArrayPool<int>.Shared.Rent(slots);
             try
             {
                 Array.Copy(neighborIds, toWrite, count);
-                for (int i = count; i < _header.MaxNeighbors; i++) toWrite[i] = -1;
-                _dataAccessor.WriteArray(position, toWrite, 0, _header.MaxNeighbors);
+                for (int i = count; i < slots; i++) toWrite[i] = -1;
+                _dataAccessor.WriteArray(position, toWrite, 0, slots);
             }
             finally
             {
@@ -1885,12 +1886,13 @@ namespace Qvec.Core
         /// </summary>
         private void AddNeighborConnection(int existingNode, int level, int newNode, float[] newVector)
         {
-            int[] neighbors = ArrayPool<int>.Shared.Rent(_header.MaxNeighbors);
+            int slots = NeighborsAtLevel(level);
+            int[] neighbors = ArrayPool<int>.Shared.Rent(slots);
             try
             {
                 GetNeighborsAtLevel(existingNode, level, neighbors);
 
-                for (int i = 0; i < _header.MaxNeighbors; i++)
+                for (int i = 0; i < slots; i++)
                 {
                     if (neighbors[i] == -1)
                     {
@@ -1904,13 +1906,13 @@ namespace Qvec.Core
 
                 float[] existingVector = GetVector(existingNode);
                 int dim = _header.VectorDimension;
-                int slots = _header.MaxNeighbors + 1;
-                float[] candidateVectors = ArrayPool<float>.Shared.Rent(slots * dim);
+                int candidateCount = slots + 1;
+                float[] candidateVectors = ArrayPool<float>.Shared.Rent(candidateCount * dim);
                 try
                 {
-                    var candidates = new (int Id, float Score)[slots];
+                    var candidates = new (int Id, float Score)[candidateCount];
 
-                    for (int i = 0; i < _header.MaxNeighbors; i++)
+                    for (int i = 0; i < slots; i++)
                     {
                         ReadVectorInto(neighbors[i], candidateVectors, i * dim);
                         candidates[i] = (
@@ -1918,27 +1920,27 @@ namespace Qvec.Core
                             DotProduct(existingVector.AsSpan(0, dim), candidateVectors.AsSpan(i * dim, dim)));
                     }
 
-                    int newSlot = _header.MaxNeighbors;
+                    int newSlot = slots;
                     newVector.AsSpan(0, dim).CopyTo(candidateVectors.AsSpan(newSlot * dim, dim));
                     candidates[newSlot] = (newNode, DotProduct(existingVector, newVector, dim));
 
                     // Reorder candidates (and their vectors) by descending similarity so the
                     // pruning pass can run entirely in memory.
-                    int[] order = Enumerable.Range(0, slots).ToArray();
+                    int[] order = Enumerable.Range(0, candidateCount).ToArray();
                     Array.Sort(order, (a, b) => candidates[b].Score.CompareTo(candidates[a].Score));
 
-                    var ordered = new (int Id, float Score)[slots];
-                    float[] orderedVectors = ArrayPool<float>.Shared.Rent(slots * dim);
+                    var ordered = new (int Id, float Score)[candidateCount];
+                    float[] orderedVectors = ArrayPool<float>.Shared.Rent(candidateCount * dim);
                     try
                     {
-                        for (int i = 0; i < slots; i++)
+                        for (int i = 0; i < candidateCount; i++)
                         {
                             ordered[i] = candidates[order[i]];
                             candidateVectors.AsSpan(order[i] * dim, dim)
                                             .CopyTo(orderedVectors.AsSpan(i * dim, dim));
                         }
 
-                        var selected = PruneNeighbors(ordered, orderedVectors, dim, _header.MaxNeighbors);
+                        var selected = PruneNeighbors(ordered, orderedVectors, dim, slots);
                         WriteNeighborsAtLevel(existingNode, level, selected);
                     }
                     finally
@@ -1958,13 +1960,38 @@ namespace Qvec.Core
             }
         }
 
+        /// <summary>
+        /// Slots available on a given layer. Malkov &amp; Yashunin recommend twice the fan-out on
+        /// the base layer (M0 = 2 * M): every node lives on layer 0 and it carries the final,
+        /// decisive refinement of a search, so a base layer as narrow as the sparse upper layers
+        /// caps achievable recall.
+        /// </summary>
+        private int NeighborsAtLevel(int level) => level == 0 ? _header.MaxNeighbors * 2 : _header.MaxNeighbors;
+
+        /// <summary>
+        /// Widest neighbour list any layer can hold. Scratch buffers are sized by this so one
+        /// buffer can serve a loop that walks several layers.
+        /// </summary>
+        private int MaxNeighborsAnyLevel => _header.MaxNeighbors * 2;
+
+        /// <summary>
+        /// Neighbour slots per node: 2 * M for layer 0 plus M for each layer above it.
+        /// </summary>
+        private int GraphNodeStride => (_header.MaxLayers + 1) * _header.MaxNeighbors;
+
+        /// <summary>
+        /// Byte position of a node's neighbour list on one layer, relative to the data accessor.
+        /// Layer 0 sits first in the node and is twice as wide, so every layer above it starts
+        /// one extra M into the node.
+        /// </summary>
+        private long NeighborPosition(int nodeIndex, int level)
+            => (_graphSectionOffset - HeaderSize)
+               + ((long)nodeIndex * GraphNodeStride
+                  + (level == 0 ? 0L : (long)(level + 1) * _header.MaxNeighbors)) * sizeof(int);
+
         private void GetNeighborsAtLevel(int nodeIndex, int level, int[] buffer)
         {
-            long position = (_graphSectionOffset - HeaderSize) +
-                            (long)nodeIndex * _header.MaxLayers * _header.MaxNeighbors * sizeof(int) +
-                            (long)level * _header.MaxNeighbors * sizeof(int);
-
-            _dataAccessor.ReadArray(position, buffer, 0, _header.MaxNeighbors);
+            _dataAccessor.ReadArray(NeighborPosition(nodeIndex, level), buffer, 0, NeighborsAtLevel(level));
         }
 
         private int RandomLayer()
@@ -2083,7 +2110,7 @@ namespace Qvec.Core
             for (int l = 0; l < _header.MaxLayers; l++) stats[l] = 0;
 
             _lock.EnterReadLock();
-            int[] neighbors = ArrayPool<int>.Shared.Rent(_header.MaxNeighbors);
+            int[] neighbors = ArrayPool<int>.Shared.Rent(MaxNeighborsAnyLevel);
             try
             {
                 for (int i = 0; i < _header.CurrentCount; i++)
@@ -2318,12 +2345,12 @@ namespace Qvec.Core
         /// Removes a node from the graph and repairs the hole it leaves behind.
         /// Simply deleting the back-references was not enough: the removed node was often the
         /// only bridge between its neighbours, so deleting it silently partitioned the graph and
-        /// made live entries unreachable from the entry point. Its neighbours are therefore
-        /// cross-linked to each other before the node is unlinked.
+        /// made live entries unreachable from the entry point. Its surviving neighbours are
+        /// therefore linked to each other before the node is unlinked.
         /// </summary>
         private void DisconnectNode(int deletedIndex)
         {
-            int[] neighbors = ArrayPool<int>.Shared.Rent(_header.MaxNeighbors);
+            int[] neighbors = ArrayPool<int>.Shared.Rent(MaxNeighborsAnyLevel);
             try
             {
                 for (int level = 0; level < _header.MaxLayers; level++)
@@ -2331,7 +2358,7 @@ namespace Qvec.Core
                     GetNeighborsAtLevel(deletedIndex, level, neighbors);
 
                     int count = 0;
-                    while (count < _header.MaxNeighbors && neighbors[count] != -1) count++;
+                    while (count < NeighborsAtLevel(level) && neighbors[count] != -1) count++;
                     if (count == 0)
                     {
                         InitNeighborsAtLevel(deletedIndex, level);
@@ -2344,26 +2371,7 @@ namespace Qvec.Core
                     for (int j = 0; j < count; j++)
                         RemoveNeighborReference(live[j], level, deletedIndex);
 
-                    // Bridge the survivors so the neighbourhood stays connected.
-                    for (int j = 0; j < count; j++)
-                    {
-                        if (IsDeleted(live[j])) continue;
-
-                        float[] vector = GetVector(live[j]);
-                        try
-                        {
-                            for (int k = 0; k < count; k++)
-                            {
-                                if (j == k || IsDeleted(live[k])) continue;
-                                AddNeighborConnection(live[k], level, live[j], vector);
-                            }
-                        }
-                        finally
-                        {
-                            ArrayPool<float>.Shared.Return(vector);
-                        }
-                    }
-
+                    BridgeSurvivors(live, level);
                     InitNeighborsAtLevel(deletedIndex, level);
                 }
             }
@@ -2373,9 +2381,56 @@ namespace Qvec.Core
             }
         }
 
+        /// <summary>
+        /// Re-links the survivors of a deleted node so the neighbourhood cannot fall apart.
+        /// They are joined into a cycle rather than cross-linked pairwise: a cycle already
+        /// guarantees the survivor set stays connected, and it costs O(n) link attempts instead
+        /// of O(n²). The quadratic version was affordable only while layer 0 held at most M
+        /// neighbours; with M0 = 2 * M it made deleting a node roughly an order of magnitude
+        /// more expensive, because each of the O(n²) attempts itself prunes over M0 candidates.
+        /// Neighbour lists are stored in descending similarity order, so consecutive survivors
+        /// are the most alike and the cycle links the pairs most worth linking.
+        /// </summary>
+        private void BridgeSurvivors(int[] live, int level)
+        {
+            var survivors = new List<int>(live.Length);
+            foreach (int candidate in live)
+            {
+                if (!IsDeleted(candidate)) survivors.Add(candidate);
+            }
+
+            if (survivors.Count < 2) return;
+
+            for (int j = 0; j < survivors.Count; j++)
+            {
+                int next = survivors[(j + 1) % survivors.Count];
+                float[] vector = GetVector(survivors[j]);
+                try
+                {
+                    // Both directions, since a neighbour list is not symmetric.
+                    AddNeighborConnection(next, level, survivors[j], vector);
+                }
+                finally
+                {
+                    ArrayPool<float>.Shared.Return(vector);
+                }
+
+                float[] nextVector = GetVector(next);
+                try
+                {
+                    AddNeighborConnection(survivors[j], level, next, nextVector);
+                }
+                finally
+                {
+                    ArrayPool<float>.Shared.Return(nextVector);
+                }
+            }
+        }
+
         private void RemoveNeighborReference(int nodeIndex, int level, int targetToRemove)
         {
-            int[] neighbors = ArrayPool<int>.Shared.Rent(_header.MaxNeighbors);
+            int slots = NeighborsAtLevel(level);
+            int[] neighbors = ArrayPool<int>.Shared.Rent(slots);
             try
             {
                 GetNeighborsAtLevel(nodeIndex, level, neighbors);
@@ -2384,7 +2439,7 @@ namespace Qvec.Core
                 // references to a deleted node behind, which reintroduced tombstones into search.
                 int write = 0;
                 bool changed = false;
-                for (int i = 0; i < _header.MaxNeighbors; i++)
+                for (int i = 0; i < slots; i++)
                 {
                     int n = neighbors[i];
                     if (n == targetToRemove) { changed = true; continue; }
@@ -2393,7 +2448,7 @@ namespace Qvec.Core
 
                 if (!changed) return;
 
-                for (int i = write; i < _header.MaxNeighbors; i++)
+                for (int i = write; i < slots; i++)
                     neighbors[i] = -1;
 
                 WriteNeighborsAtLevel(nodeIndex, level, neighbors);
@@ -2407,15 +2462,14 @@ namespace Qvec.Core
         private void InitNeighborsAtLevel(int nodeIndex, int level)
         {
             BeginWrite();
-            long position = (_graphSectionOffset - HeaderSize) +
-                            (long)nodeIndex * _header.MaxLayers * _header.MaxNeighbors * sizeof(int) +
-                            (long)level * _header.MaxNeighbors * sizeof(int);
+            long position = NeighborPosition(nodeIndex, level);
+            int slots = NeighborsAtLevel(level);
 
-            int[] empty = ArrayPool<int>.Shared.Rent(_header.MaxNeighbors);
+            int[] empty = ArrayPool<int>.Shared.Rent(slots);
             try
             {
-                Array.Fill(empty, -1, 0, _header.MaxNeighbors);
-                _dataAccessor.WriteArray(position, empty, 0, _header.MaxNeighbors);
+                Array.Fill(empty, -1, 0, slots);
+                _dataAccessor.WriteArray(position, empty, 0, slots);
             }
             finally
             {
@@ -2429,13 +2483,13 @@ namespace Qvec.Core
         /// </summary>
         private int GetNodeLevel(int nodeIndex)
         {
-            int[] buffer = ArrayPool<int>.Shared.Rent(_header.MaxNeighbors);
+            int[] buffer = ArrayPool<int>.Shared.Rent(MaxNeighborsAnyLevel);
             try
             {
                 for (int level = _header.MaxLayers - 1; level > 0; level--)
                 {
                     GetNeighborsAtLevel(nodeIndex, level, buffer);
-                    for (int i = 0; i < _header.MaxNeighbors; i++)
+                    for (int i = 0; i < NeighborsAtLevel(level); i++)
                     {
                         if (buffer[i] >= 0) return level;
                     }
