@@ -98,6 +98,8 @@ Or for the typed client:
 dotnet add package Qvec.Core.Client
 ```
 
+> **Upgrading from 1.0.x:** 2.0 is a rewrite. The on-disk format (v5) is not readable by 1.0.x and 1.0.x files are rejected with `QvecFormatException`; there is no in-place migration. Export from the old database and re-insert into a new one.
+
 ### Initialize and Add Data
 
 ```csharp
