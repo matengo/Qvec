@@ -2737,11 +2737,16 @@ namespace Qvec.Core
             for (; i < dim; i++) dot += left[i] * right[i];
             return dot;
         }
-        private string GetMetadata(int index)
+        // Reads through the raw mapping pointer rather than the accessor: every accessor call
+        // takes an interlocked ref on the shared SafeBuffer, and a top-100 result set makes a
+        // few hundred of them per query, which serialised concurrent searches on that one
+        // cache line (Cohere 1M, k = 100, 12 threads scaled 2× instead of 6×).
+        private unsafe string GetMetadata(int index)
         {
             long descriptorPos = (_metadataSectionOffset - HeaderSize) + (long)index * MetadataDescriptorSize;
-            long heapOffset = _dataAccessor.ReadInt64(descriptorPos);
-            int length = _dataAccessor.ReadInt32(descriptorPos + 8);
+            byte* descriptor = DataBasePointer + descriptorPos;
+            long heapOffset = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<long>(descriptor);
+            int length = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<int>(descriptor + 8);
 
             if (length <= 0) return string.Empty;
 
@@ -2752,16 +2757,7 @@ namespace Qvec.Core
                     $"heap capacity={_header.MetadataHeapCapacity}.");
             }
 
-            byte[] buffer = ArrayPool<byte>.Shared.Rent(length);
-            try
-            {
-                _dataAccessor.ReadArray((_metadataHeapOffset - HeaderSize) + heapOffset, buffer, 0, length);
-                return Encoding.UTF8.GetString(buffer, 0, length);
-            }
-            finally
-            {
-                ArrayPool<byte>.Shared.Return(buffer);
-            }
+            return Encoding.UTF8.GetString(DataBasePointer + (_metadataHeapOffset - HeaderSize) + heapOffset, length);
         }
 
         private void WriteGuidToDisk(int index, Guid guid)
@@ -2772,13 +2768,10 @@ namespace Qvec.Core
             _dataAccessor.WriteArray(offset, bytes, 0, GuidSize);
         }
 
-        private Guid ReadGuidFromDisk(int index)
+        private unsafe Guid ReadGuidFromDisk(int index)
         {
-            Span<byte> bytes = stackalloc byte[GuidSize];
             long offset = (_guidSectionOffset - HeaderSize) + (long)index * GuidSize;
-            for (int i = 0; i < GuidSize; i++)
-                bytes[i] = _dataAccessor.ReadByte(offset + i);
-            return new Guid(bytes);
+            return new Guid(new ReadOnlySpan<byte>(DataBasePointer + offset, GuidSize));
         }
 
         private void RebuildGuidIndex()
