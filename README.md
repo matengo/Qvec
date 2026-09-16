@@ -34,14 +34,14 @@ Measured on **SIFT-1M** ([TexMex corpus](http://corpus-texmex.irisa.fr/)) agains
 
 | efSearch | recall@1 | recall@10 | QPS | mean latency |
 | ---: | ---: | ---: | ---: | ---: |
-| 10 | 89.7 % | 85.9 % | 8,110 | 0.123 ms |
-| 20 | 95.3 % | 93.7 % | 5,128 | 0.195 ms |
-| 40 | 98.2 % | 97.8 % | 3,231 | 0.310 ms |
-| 80 | 99.0 % | 99.4 % | 1,873 | 0.534 ms |
-| 160 | 99.2 % | 99.8 % | 1,023 | 0.978 ms |
-| 320 | 99.2 % | 99.9 % | 573 | 1.744 ms |
+| 10 | 88.0 % | 84.4 % | 6,734 | 0.148 ms |
+| 20 | 94.5 % | 92.5 % | 4,341 | 0.230 ms |
+| 40 | 97.6 % | 97.0 % | 2,624 | 0.381 ms |
+| 80 | 98.8 % | 99.0 % | 1,576 | 0.634 ms |
+| 160 | 99.3 % | 99.7 % | 863 | 1.158 ms |
+| 320 | 99.3 % | 99.9 % | 498 | 2.010 ms |
 
-Index build: 2,762 s (362 inserts/s), producing a 1,324 MiB file, with `indexSeed` pinned so the run can be reproduced. Build throughput is still the weakest number here: the insert path is now dominated by the O(M0²) distance arithmetic of the neighbour-selection heuristic and by memory latency once the file outgrows the CPU caches. Query performance is not affected by it.
+Index build: 1,631 s (613 inserts/s), producing a 1,324 MiB file, with `indexSeed` pinned so the run can be reproduced. The previous graph, built with the full O(M0²) neighbour heuristic on every back-link, took 2,279 s on the same day and machine and scored 85.9 / 93.7 / 97.8 / 99.4 / 99.8 / 99.9 % recall@10 on the same rows; the incremental heuristic ([design doc](docs/design-insert-prune.md)) trades up to 1.5 points of recall at the narrowest beam, and nothing from efSearch 160 up, for the faster build. Query throughput of the two graphs is identical within run-to-run noise (±5 %). Build is still single-threaded and memory-bound once the file outgrows the CPU caches.
 
 A single recall figure would be misleading, because any ANN index reaches 99% by widening the beam until it has effectively scanned everything. The honest unit is the whole curve, so pick the row that matches your latency budget.
 
@@ -319,7 +319,7 @@ Planned cloud work is tracked in design documents and the roadmap below.
 - **Full Native AOT support for the typed client** — Remove or replace reflection, expression compilation, and reflection-based JSON paths.
 - **ProjectReference analyzer flow for source generation** — Ensure the `[QvecIndexed]` generator is available when consuming `Qvec.Core.Client` through project references.
 - **Published benchmark methodology** — ✅ Done. `benchmarks/Qvec.Benchmarks` measures recall vs. QPS against the TexMex SIFT/GIST corpora and their published ground truth.
-- **Faster index construction** — Partly done: removing marshalling, pool and allocation overhead from the insert path took SIFT-1M from 242 to 362 inserts/s and doubled query throughput. What remains is algorithmic (the O(M0²) neighbour heuristic) and memory-bound; parallel construction and multi-accumulator SIMD kernels are the next candidates.
+- **Faster index construction** — Partly done. Removing marshalling, pool and allocation overhead took SIFT-1M from 242 to 362 inserts/s; replacing the O(M0²) re-run of the neighbour heuristic on every full back-link with an incremental O(M0) update ([design doc](docs/design-insert-prune.md)) took Cohere 100K (768 dims) from 59 to 170 inserts/s. Insert is still single-threaded; parallel construction is the next lever.
 - **Multi-vector support** — Store and search multiple embeddings, such as image + text, for one logical entry.
 
 ## License
