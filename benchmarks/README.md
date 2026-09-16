@@ -45,6 +45,9 @@ FTP and `HttpClient` does not speak it.
 graph sections, which makes this the way to prove that an insert-path change did not alter the
 graph: build once from `master`, once from your branch, and compare the section bytes.
 
+`--quantization int8` builds the index with `VectorQuantization.Int8`. The report header records
+the mode so a float row and an int8 row cannot be confused for each other.
+
 ## Metric
 
 SIFT and GIST ground truth is **Euclidean**. Run them with `--distance Euclidean`, which is the

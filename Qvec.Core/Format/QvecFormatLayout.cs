@@ -14,9 +14,14 @@ public static class QvecFormatLayout
         int maxNeighbors,
         int maxLayers,
         long metadataHeapCapacity,
-        DistanceFunction distanceFunction = DistanceFunction.DotProduct)
+        DistanceFunction distanceFunction = DistanceFunction.DotProduct,
+        VectorQuantization quantization = VectorQuantization.None)
     {
         ValidateCreateArguments(vectorDimension, maxCount, maxNeighbors, maxLayers, metadataHeapCapacity, distanceFunction);
+        if (quantization is not VectorQuantization.None and not VectorQuantization.Int8)
+        {
+            throw new ArgumentOutOfRangeException(nameof(quantization), "Quantization must be None or Int8.");
+        }
 
         var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         var header = new V4Header
@@ -34,8 +39,8 @@ public static class QvecFormatLayout
             MetadataHeapUsed = 0,
             FreeListHead = -1,
             FreeListCount = 0,
-            QuantizationMode = 0,
-            QuantizationSectionId = 0,
+            QuantizationMode = (int)quantization,
+            QuantizationSectionId = quantization == VectorQuantization.None ? 0 : (int)V4SectionIds.QuantizedVectors,
             MetadataHeapCapacity = metadataHeapCapacity,
             CreatedUnixTimeSeconds = now,
             UpdatedUnixTimeSeconds = now,
@@ -138,6 +143,11 @@ public static class QvecFormatLayout
         return Math.Max(requiredEnd, Math.Max(geometric, stepped));
     }
 
+    /// <summary>
+    /// Sections come in a fixed order. Slot 0 is vector storage in whichever form the header's
+    /// quantization mode calls for; slots 1–6 are identical in both modes so code that walks the
+    /// graph and metadata never has to care. Int8 files add the parameter section in slot 7.
+    /// </summary>
     private static void LayOutSections(
         V4Header header,
         long maxCount,
@@ -147,7 +157,15 @@ public static class QvecFormatLayout
         long metadataHeapCapacity,
         ref long offset)
     {
-        AddSection(header.Sections[0], V4SectionIds.Vectors, ref offset, maxCount, checked((uint)(vectorDimension * sizeof(float))));
+        bool quantized = header.QuantizationMode != 0;
+        if (quantized)
+        {
+            AddSection(header.Sections[0], V4SectionIds.QuantizedVectors, ref offset, maxCount, checked((uint)vectorDimension));
+        }
+        else
+        {
+            AddSection(header.Sections[0], V4SectionIds.Vectors, ref offset, maxCount, checked((uint)(vectorDimension * sizeof(float))));
+        }
         // Layer 0 gets 2 * maxNeighbors slots (M0 = 2 * M) and every layer above it maxNeighbors,
         // which sums to (maxLayers + 1) * maxNeighbors slots per node.
         AddSection(header.Sections[1], V4SectionIds.Graph, ref offset, maxCount, checked((uint)((maxLayers + 1) * maxNeighbors * sizeof(int))));
@@ -156,6 +174,10 @@ public static class QvecFormatLayout
         AddSection(header.Sections[4], V4SectionIds.Tombstones, ref offset, maxCount, 1);
         AddSection(header.Sections[5], V4SectionIds.FreeList, ref offset, maxCount, 8);
         AddByteSection(header.Sections[6], V4SectionIds.MetadataHeap, ref offset, metadataHeapCapacity, SectionFlags.AppendOnly);
+        if (quantized)
+        {
+            AddSection(header.Sections[7], V4SectionIds.QuantizationVectorParameters, ref offset, maxCount, 16);
+        }
     }
 
     public static long RecommendMetadataHeapCapacity(long maxCount)

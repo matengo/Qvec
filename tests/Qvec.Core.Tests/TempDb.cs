@@ -28,8 +28,9 @@ public sealed class TempDb : IDisposable
         int maxNeighbors = 32,
         int maxLayers = 5,
         DistanceFunction distance = DistanceFunction.DotProduct,
-        int? indexSeed = null)
-        => new(Path, dim, max, maxNeighbors, maxLayers, distance, indexSeed);
+        int? indexSeed = null,
+        VectorQuantization quantization = VectorQuantization.None)
+        => new(Path, dim, max, maxNeighbors, maxLayers, distance, indexSeed, quantization);
 
     public void Dispose()
     {

@@ -17,6 +17,7 @@ Unlike client-server vector DBs, Qvec runs in-process, using **MemoryMappedFiles
 *   **Growable, Sparse Files:** Capacity is a starting point, not a limit. The file is created sparse and grows geometrically — both row capacity and the metadata heap — when it runs out of room. Set `AutoGrow = false` for a hard ceiling.
 *   **Three Distance Metrics:** `DotProduct`, `Cosine` and `Euclidean` (L2). Cosine normalizes stored copies; the other two store vectors untouched. Euclidean is the metric most image and audio embeddings — and every published ANN benchmark corpus — are defined against.
 *   **Hardware-Accelerated Math:** Uses .NET vector APIs and unsafe pointer paths for SIMD-friendly scoring.
+*   **Optional int8 Scalar Quantization:** Pass `quantization: VectorQuantization.Int8` to store one byte per dimension instead of four (plus 16 bytes of per-vector scale/offset). Scoring runs on the bytes with a widening SIMD integer kernel, so queries get faster as well as smaller. Float mode is untouched and byte-for-byte identical to before. See [docs/design-quantization-int8.md](docs/design-quantization-int8.md) for the accuracy trade-off.
 *   **Reproducible Index Builds:** HNSW layer assignment is randomized by default, so two builds of the same data normally produce different graphs. Pass `indexSeed:` to pin it — necessary for benchmarks and recall regression tests to be re-derivable.
 *   **Guid Document IDs:** `AddEntry` returns a stable `Guid` document identifier; external IDs can be supplied for deduplication and sync scenarios.
 *   **Update and Delete:** Supports tombstone-based delete, metadata updates, and vector updates by delete-and-reinsert. `Vacuum()` compacts the file, reuses tombstoned rows, reclaims orphaned metadata, and rebuilds the HNSW graph.
@@ -45,6 +46,21 @@ Index build: 2,762 s (362 inserts/s), producing a 1,324 MiB file, with `indexSee
 A single recall figure would be misleading, because any ANN index reaches 99% by widening the beam until it has effectively scanned everything. The honest unit is the whole curve, so pick the row that matches your latency budget.
 
 Reproduce with `dotnet run -c Release --project benchmarks/Qvec.Benchmarks -- --dataset sift --download`. See [benchmarks/README.md](benchmarks/README.md).
+
+### int8 quantization on siftsmall
+
+Same code, `--dataset siftsmall` (10,000 vectors, 128 dimensions, 100 queries), float versus `--quantization int8`, same seed:
+
+| | efSearch | recall@10 | QPS | file |
+| --- | ---: | ---: | ---: | ---: |
+| float | 10 | 98.6 % | 14,161 | 13.8 MiB |
+| int8 | 10 | 97.9 % | 32,686 | 10.3 MiB |
+| float | 40 | 100.0 % | 9,335 | |
+| int8 | 40 | 99.3 % | 11,579 | |
+| float | 160 | 100.0 % | 3,689 | |
+| int8 | 160 | 99.3 % | 4,453 | |
+
+The vector section shrinks 4× (5.1 → 1.3 MiB); the rest of the file is the HNSW graph, which quantization does not touch, so total file size drops less than 4×. int8 recall plateaus below float — 99.3 % here — because the ranking is done on the quantized codes and the floats are not kept for rescoring. SIFT descriptors are natively 8-bit so this is close to a best case; on tight clusters under `Cosine` the loss is larger (see the design doc).
 
 > **Note on the previous numbers.** Earlier versions of this README reported "~85% recall@1 at efSearch=50", measured on randomly generated uniform vectors and scored against Qvec's own linear scan. That figure understated real-world behaviour substantially: in high dimensions uniform random vectors are all roughly equidistant, which is an artificially hard case that no real embedding model produces.
 
@@ -295,7 +311,7 @@ Planned cloud work is tracked in design documents and the roadmap below.
 ## 📜 Roadmap / Not yet implemented
 
 - **Storage format v5** — The on-disk format is self-describing (magic, version, CRC-32 over the header, a section table, and a `WriteInProgress` flag). There is **no migration** from earlier formats; older files are rejected with `QvecFormatException`.
-- **int8 scalar quantization** — ~4× smaller vectors on disk and in memory. The format reserves space for the metadata this needs.
+- **int8 scalar quantization** — ✅ Done. `quantization: VectorQuantization.Int8` stores one byte per dimension and scores on integers. Not done: keeping the floats alongside for exact rescoring of the final top-k, which is what closes the remaining recall gap.
 - **Sync Engine** — Opt-in edge-cloud synchronization. Connect multiple local Qvec databases to a central sync server so connected instances can stay in sync automatically. The current design discusses Azure Append Blob and Azure Web PubSub, but this is not implemented. See [design doc](docs/design-sync-engine.md).
 - **Azure Blob Storage and Managed Identity integration** — Planned as part of the sync/cloud work; no Azure SDK dependency is shipped today.
 - **Container packaging** — A `Dockerfile` for `Qvec.Api` is included. Chiseled base images are not used yet.

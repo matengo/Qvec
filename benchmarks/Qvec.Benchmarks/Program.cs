@@ -46,6 +46,7 @@ var options = new BenchmarkOptions
     Distance = Enum.Parse<DistanceFunction>(arguments.Value("distance") ?? nameof(DistanceFunction.Euclidean), ignoreCase: true),
     MaxNeighbors = arguments.Int("m") ?? 32,
     MaxLayers = arguments.Int("layers") ?? 5,
+    Quantization = Enum.Parse<VectorQuantization>(arguments.Value("quantization") ?? nameof(VectorQuantization.None), ignoreCase: true),
     TopK = arguments.Int("k") ?? 10,
     QueryCount = arguments.Int("queries") ?? int.MaxValue,
     EfSearchSweep = arguments.Ints("ef") ?? [10, 20, 40, 80, 160, 320, 640],
@@ -128,6 +129,7 @@ internal sealed class CommandLine
               --distance <name>   Euclidean (default), Cosine, DotProduct
               --m <int>           maxNeighbors, default 32
               --layers <int>      maxLayers, default 5
+              --quantization <q>  None (default) or Int8; int8 stores one byte per dimension
               --k <int>           top-k for recall@k, default 10
               --ef <list>         comma-separated efSearch sweep, default 10,20,40,80,160,320,640
               --queries <int>     limit the number of queries

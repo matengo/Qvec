@@ -506,10 +506,20 @@ public sealed class V4Header
         Require(header.EntryPointLevel >= 0 && header.EntryPointLevel < header.MaxLayers,
             $"EntryPointLevel must be in the range 0..{header.MaxLayers - 1} but was {header.EntryPointLevel}.");
         Require(header.DistanceFunctionRaw is 0 or 1 or 2, $"DistanceFunction must be 0 (DotProduct), 1 (Cosine) or 2 (Euclidean) but was {header.DistanceFunctionRaw}.");
-        Require(header.QuantizationMode == 0,
-            $"QuantizationMode is {header.QuantizationMode}; this build reserves quantization modes but does not implement them.");
-        Require(header.QuantizationSectionId == 0,
-            $"QuantizationSectionId must be 0 when quantization is disabled but was {header.QuantizationSectionId}.");
+        Require(header.QuantizationMode is 0 or 2,
+            header.QuantizationMode == 1
+                ? "QuantizationMode 1 (per-dataset int8) is reserved by the format but not implemented in this build."
+                : $"QuantizationMode is {header.QuantizationMode}; this build supports 0 (none) and 2 (per-vector int8).");
+        if (header.QuantizationMode == 0)
+        {
+            Require(header.QuantizationSectionId == 0,
+                $"QuantizationSectionId must be 0 when quantization is disabled but was {header.QuantizationSectionId}.");
+        }
+        else
+        {
+            Require(header.QuantizationSectionId == V4SectionIds.QuantizedVectors,
+                $"QuantizationSectionId must be {V4SectionIds.QuantizedVectors} for int8 quantization but was {header.QuantizationSectionId}.");
+        }
     }
 
     private static void ValidateSections(V4Header header, long actualFileLength)
@@ -545,7 +555,7 @@ public sealed class V4Header
 
             Require(seenIds.Add(entry.SectionId), $"Duplicate section id {entry.SectionId} is not allowed.");
 
-            if (!IsKnownRequiredSection(entry.SectionId) && (entry.SectionFlags & SectionFlags.Required) != 0)
+            if (!IsKnownRequiredSection(header, entry.SectionId) && (entry.SectionFlags & SectionFlags.Required) != 0)
             {
                 throw new QvecFormatException($"Required section id {entry.SectionId} is not supported by the v4 reader.");
             }
@@ -560,7 +570,7 @@ public sealed class V4Header
 
     private static void ValidateRequiredSections(V4Header header)
     {
-        for (uint sectionId = V4SectionIds.Vectors; sectionId <= V4SectionIds.FreeList; sectionId++)
+        foreach (var sectionId in RequiredSectionIds(header))
         {
             var found = false;
             foreach (var entry in header.Sections)
@@ -578,9 +588,31 @@ public sealed class V4Header
         }
     }
 
+    /// <summary>
+    /// The sections every valid file must carry. Vector storage depends on the quantization
+    /// mode: float files carry <see cref="V4SectionIds.Vectors"/>, int8 files carry the code and
+    /// parameter sections instead.
+    /// </summary>
+    private static IEnumerable<uint> RequiredSectionIds(V4Header header)
+    {
+        if (header.QuantizationMode == 0)
+        {
+            yield return V4SectionIds.Vectors;
+        }
+        else
+        {
+            yield return V4SectionIds.QuantizedVectors;
+            yield return V4SectionIds.QuantizationVectorParameters;
+        }
+
+        for (uint sectionId = V4SectionIds.Graph; sectionId <= V4SectionIds.FreeList; sectionId++)
+        {
+            yield return sectionId;
+        }
+    }
+
     private static void ValidateKnownSectionShapes(V4Header header)
     {
-        var vectors = header.GetRequiredSection(V4SectionIds.Vectors);
         var graph = header.GetRequiredSection(V4SectionIds.Graph);
         var descriptors = header.GetRequiredSection(V4SectionIds.MetadataDescriptors);
         var heap = header.GetRequiredSection(V4SectionIds.MetadataHeap);
@@ -588,11 +620,30 @@ public sealed class V4Header
         var tombstones = header.GetRequiredSection(V4SectionIds.Tombstones);
         var freeList = header.GetRequiredSection(V4SectionIds.FreeList);
 
-        var vectorElementSize = checked((uint)(header.VectorDimension * sizeof(float)));
-        Require(vectors.ElementSize == vectorElementSize,
-            $"Vectors ElementSize must be VectorDimension * 4 ({vectorElementSize}) but was {vectors.ElementSize}.");
-        Require(vectors.Length >= CheckedLength(header.MaxCountRaw, vectorElementSize, V4SectionIds.Vectors),
-            "Vectors length is too small for MaxCount and VectorDimension.");
+        if (header.QuantizationMode == 0)
+        {
+            var vectors = header.GetRequiredSection(V4SectionIds.Vectors);
+            var vectorElementSize = checked((uint)(header.VectorDimension * sizeof(float)));
+            Require(vectors.ElementSize == vectorElementSize,
+                $"Vectors ElementSize must be VectorDimension * 4 ({vectorElementSize}) but was {vectors.ElementSize}.");
+            Require(vectors.Length >= CheckedLength(header.MaxCountRaw, vectorElementSize, V4SectionIds.Vectors),
+                "Vectors length is too small for MaxCount and VectorDimension.");
+        }
+        else
+        {
+            var codes = header.GetRequiredSection(V4SectionIds.QuantizedVectors);
+            var codeElementSize = checked((uint)header.VectorDimension);
+            Require(codes.ElementSize == codeElementSize,
+                $"QuantizedVectors ElementSize must be VectorDimension ({codeElementSize}) but was {codes.ElementSize}.");
+            Require(codes.Length >= CheckedLength(header.MaxCountRaw, codeElementSize, V4SectionIds.QuantizedVectors),
+                "QuantizedVectors length is too small for MaxCount and VectorDimension.");
+
+            var parameters = header.GetRequiredSection(V4SectionIds.QuantizationVectorParameters);
+            Require(parameters.ElementSize == 16,
+                $"QuantizationVectorParameters ElementSize must be 16 but was {parameters.ElementSize}.");
+            Require(parameters.Length >= CheckedLength(header.MaxCountRaw, 16, V4SectionIds.QuantizationVectorParameters),
+                "QuantizationVectorParameters length is too small for MaxCount.");
+        }
 
         // Layer 0 is allocated 2 * MaxNeighbors slots (M0 = 2 * M, per Malkov & Yashunin) and
         // every layer above it MaxNeighbors, which sums to (MaxLayers + 1) * MaxNeighbors.
@@ -665,8 +716,13 @@ public sealed class V4Header
         }
     }
 
-    private static bool IsKnownRequiredSection(uint sectionId) =>
-        sectionId is >= V4SectionIds.Vectors and <= V4SectionIds.FreeList;
+    private static bool IsKnownRequiredSection(V4Header header, uint sectionId)
+    {
+        if (sectionId is >= V4SectionIds.Graph and <= V4SectionIds.FreeList) return true;
+        return header.QuantizationMode == 0
+            ? sectionId == V4SectionIds.Vectors
+            : sectionId is V4SectionIds.QuantizedVectors or V4SectionIds.QuantizationVectorParameters;
+    }
 
     private static bool ContainsNonZero(ReadOnlySpan<byte> bytes)
     {
