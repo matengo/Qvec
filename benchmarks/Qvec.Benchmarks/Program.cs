@@ -29,7 +29,8 @@ if (arguments.Flag("download"))
 }
 else
 {
-    directory = Path.Combine(cacheDirectory, datasetName);
+    string directoryName = AnnDataset.Known.TryGetValue(datasetName, out var source) ? source.Name : datasetName;
+    directory = Path.Combine(cacheDirectory, directoryName);
     if (!Directory.Exists(directory)) directory = cacheDirectory;
 }
 
@@ -43,13 +44,19 @@ var options = new BenchmarkOptions
 {
     Dataset = dataset,
     IndexPath = indexPath,
-    Distance = Enum.Parse<DistanceFunction>(arguments.Value("distance") ?? nameof(DistanceFunction.Euclidean), ignoreCase: true),
+    // Default to the metric the ground truth was computed under; overriding it is allowed but
+    // produces a recall number that means nothing (see --help).
+    Distance = arguments.Value("distance") is { } distanceName
+        ? Enum.Parse<DistanceFunction>(distanceName, ignoreCase: true)
+        : dataset.Metric,
     MaxNeighbors = arguments.Int("m") ?? 32,
     MaxLayers = arguments.Int("layers") ?? 5,
     Quantization = Enum.Parse<VectorQuantization>(arguments.Value("quantization") ?? nameof(VectorQuantization.None), ignoreCase: true),
     TopK = arguments.Int("k") ?? 10,
     QueryCount = arguments.Int("queries") ?? int.MaxValue,
     EfSearchSweep = arguments.Ints("ef") ?? [10, 20, 40, 80, 160, 320, 640],
+    Concurrency = arguments.Int("concurrency") ?? 1,
+    ReuseIndex = arguments.Flag("reuse-index"),
 };
 
 var report = RecallBenchmark.Run(options);
@@ -123,25 +130,30 @@ internal sealed class CommandLine
         Console.WriteLine("""
             Qvec recall/QPS benchmark.
 
-              --dataset <name>    siftsmall (default), sift, gist
+              --dataset <name>    siftsmall (default), sift, gist, cohere100k, cohere1m
               --download          fetch and cache the dataset if it is not already present
               --data <dir>        dataset cache directory (default: %TEMP%/qvec-ann-datasets)
-              --distance <name>   Euclidean (default), Cosine, DotProduct
+              --distance <name>   Euclidean, Cosine or DotProduct; default is the dataset's own metric
               --m <int>           maxNeighbors, default 32
               --layers <int>      maxLayers, default 5
               --quantization <q>  None (default) or Int8; int8 stores one byte per dimension
               --k <int>           top-k for recall@k, default 10
               --ef <list>         comma-separated efSearch sweep, default 10,20,40,80,160,320,640
               --queries <int>     limit the number of queries
+              --concurrency <n>   query threads, default 1; QPS is aggregate over all threads
               --max-base <int>    index only a prefix of the base set (invalidates recall)
               --index <path>      where to put the .qvec file
               --keep-index        do not delete the .qvec file afterwards
+              --reuse-index       open the existing --index file instead of rebuilding it
               --hardware <text>   hardware description to print with the results
               --out <path>        also write the Markdown report to a file
 
-            Note: SIFT and GIST ground truth is Euclidean. Measuring them under Cosine or
-            DotProduct compares against neighbours that are not the ones the dataset means,
-            and the resulting recall number says nothing useful.
+            Note: SIFT and GIST ground truth is Euclidean, Cohere is Cosine. Measuring a dataset
+            under another metric compares against neighbours that are not the ones the dataset
+            means, and the resulting recall number says nothing useful.
+
+            VectorDBBench (what Zvec and Milvus publish against) reports recall@100 under
+            12-20 concurrent clients; use --k 100 --concurrency 16 to compare with those.
             """);
     }
 }

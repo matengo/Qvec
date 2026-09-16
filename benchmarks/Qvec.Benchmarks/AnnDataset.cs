@@ -1,5 +1,6 @@
 using System.Formats.Tar;
 using System.IO.Compression;
+using Qvec.Core;
 
 namespace Qvec.Benchmarks;
 
@@ -17,15 +18,22 @@ namespace Qvec.Benchmarks;
 /// </summary>
 public sealed class AnnDataset
 {
-    private AnnDataset(string name, VecBlock<float> baseVectors, VecBlock<float> queries, VecBlock<int> groundTruth)
+    private AnnDataset(string name, DistanceFunction metric, VecBlock<float> baseVectors, VecBlock<float> queries, VecBlock<int> groundTruth)
     {
         Name = name;
+        Metric = metric;
         Base = baseVectors;
         Queries = queries;
         GroundTruth = groundTruth;
     }
 
     public string Name { get; }
+
+    /// <summary>
+    /// The metric the ground truth was computed under. Measuring under any other metric compares
+    /// the index against neighbours the dataset does not mean, and the recall number is noise.
+    /// </summary>
+    public DistanceFunction Metric { get; }
 
     /// <summary>Vectors to index.</summary>
     public VecBlock<float> Base { get; }
@@ -39,7 +47,7 @@ public sealed class AnnDataset
     /// </summary>
     public VecBlock<int> GroundTruth { get; }
 
-    /// <summary>The known TexMex corpora, keyed by the name used on the command line.</summary>
+    /// <summary>The known corpora, keyed by the name used on the command line.</summary>
     public static IReadOnlyDictionary<string, AnnDatasetSource> Known { get; } =
         new Dictionary<string, AnnDatasetSource>(StringComparer.OrdinalIgnoreCase)
         {
@@ -47,22 +55,44 @@ public sealed class AnnDataset
                 "siftsmall",
                 "ftp://ftp.irisa.fr/local/texmex/corpus/siftsmall.tar.gz",
                 BaseCount: 10_000,
-                Dimension: 128),
+                Dimension: 128,
+                DistanceFunction.Euclidean,
+                DatasetFormat.TexMex),
             ["sift"] = new(
                 "sift",
                 "ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz",
                 BaseCount: 1_000_000,
-                Dimension: 128),
+                Dimension: 128,
+                DistanceFunction.Euclidean,
+                DatasetFormat.TexMex),
             ["gist"] = new(
                 "gist",
                 "ftp://ftp.irisa.fr/local/texmex/corpus/gist.tar.gz",
                 BaseCount: 1_000_000,
-                Dimension: 960),
+                Dimension: 960,
+                DistanceFunction.Euclidean,
+                DatasetFormat.TexMex),
+            // The VectorDBBench corpora Zvec, Milvus and most vendor benchmarks publish against.
+            // Cohere ground truth is cosine; VectorDBBench scores recall@100.
+            ["cohere100k"] = new(
+                "cohere_small_100k",
+                "https://assets.zilliz.com/benchmark/cohere_small_100k/",
+                BaseCount: 100_000,
+                Dimension: 768,
+                DistanceFunction.Cosine,
+                DatasetFormat.VectorDbBenchParquet),
+            ["cohere1m"] = new(
+                "cohere_medium_1m",
+                "https://assets.zilliz.com/benchmark/cohere_medium_1m/",
+                BaseCount: 1_000_000,
+                Dimension: 768,
+                DistanceFunction.Cosine,
+                DatasetFormat.VectorDbBenchParquet),
         };
 
     /// <summary>
-    /// Loads a dataset from <paramref name="directory"/>, which must contain the four
-    /// <c>{name}_*.fvecs</c> / <c>.ivecs</c> files as they come out of the TexMex tarball.
+    /// Loads a dataset from <paramref name="directory"/>: either the four TexMex
+    /// <c>{name}_*.fvecs</c> / <c>.ivecs</c> files, or the VectorDBBench parquet triple.
     /// </summary>
     /// <param name="maxBaseCount">
     /// Index only the first N base vectors. Note that the shipped ground truth refers to the
@@ -71,23 +101,41 @@ public sealed class AnnDataset
     /// </param>
     public static AnnDataset Load(string directory, string name, int maxBaseCount = int.MaxValue)
     {
-        string Require(string suffix)
+        if (!Known.TryGetValue(name, out var source))
         {
-            string path = Path.Combine(directory, $"{name}_{suffix}");
-            if (!File.Exists(path))
-            {
-                throw new FileNotFoundException(
-                    $"Dataset file '{path}' was not found. Pass --download to fetch it, or point " +
-                    "--data at a directory holding the extracted TexMex files.",
-                    path);
-            }
-
-            return path;
+            throw new ArgumentException(
+                $"Unknown dataset '{name}'. Known datasets: {string.Join(", ", Known.Keys)}.",
+                nameof(name));
         }
 
-        var baseVectors = VecFile.ReadFvecs(Require("base.fvecs"), maxBaseCount);
-        var queries = VecFile.ReadFvecs(Require("query.fvecs"));
-        var groundTruth = VecFile.ReadIvecs(Require("groundtruth.ivecs"));
+        VecBlock<float> baseVectors;
+        VecBlock<float> queries;
+        VecBlock<int> groundTruth;
+
+        if (source.Format == DatasetFormat.VectorDbBenchParquet)
+        {
+            (baseVectors, queries, groundTruth) = ParquetDataset.Load(directory, maxBaseCount);
+        }
+        else
+        {
+            string Require(string suffix)
+            {
+                string path = Path.Combine(directory, $"{source.Name}_{suffix}");
+                if (!File.Exists(path))
+                {
+                    throw new FileNotFoundException(
+                        $"Dataset file '{path}' was not found. Pass --download to fetch it, or point " +
+                        "--data at a directory holding the extracted TexMex files.",
+                        path);
+                }
+
+                return path;
+            }
+
+            baseVectors = VecFile.ReadFvecs(Require("base.fvecs"), maxBaseCount);
+            queries = VecFile.ReadFvecs(Require("query.fvecs"));
+            groundTruth = VecFile.ReadIvecs(Require("groundtruth.ivecs"));
+        }
 
         if (queries.Dimension != baseVectors.Dimension)
         {
@@ -102,12 +150,12 @@ public sealed class AnnDataset
                 $"Ground truth has {groundTruth.Count} rows but there are {queries.Count} queries.");
         }
 
-        return new AnnDataset(name, baseVectors, queries, groundTruth);
+        return new AnnDataset(name, source.Metric, baseVectors, queries, groundTruth);
     }
 
     /// <summary>
-    /// Downloads and extracts a known dataset into <paramref name="cacheDirectory"/> unless the
-    /// files are already there. Returns the directory that holds the extracted files.
+    /// Downloads a known dataset into <paramref name="cacheDirectory"/> unless the files are
+    /// already there. Returns the directory that holds the files.
     /// </summary>
     public static async Task<string> EnsureDownloadedAsync(
         string cacheDirectory,
@@ -123,6 +171,22 @@ public sealed class AnnDataset
 
         Directory.CreateDirectory(cacheDirectory);
         string extracted = Path.Combine(cacheDirectory, source.Name);
+
+        if (source.Format == DatasetFormat.VectorDbBenchParquet)
+        {
+            Directory.CreateDirectory(extracted);
+            foreach (string file in new[] { ParquetDataset.TestFile, ParquetDataset.NeighborsFile, ParquetDataset.TrainFile })
+            {
+                string destination = Path.Combine(extracted, file);
+                if (File.Exists(destination)) continue;
+
+                string url = source.Url + file;
+                Console.WriteLine($"Downloading {url} ...");
+                await DownloadAsync(url, destination, cancellationToken).ConfigureAwait(false);
+            }
+
+            return extracted;
+        }
 
         if (File.Exists(Path.Combine(extracted, $"{source.Name}_base.fvecs")))
         {
@@ -183,8 +247,25 @@ public sealed class AnnDataset
 }
 
 /// <summary>Where a known dataset lives and what it should contain once unpacked.</summary>
-/// <param name="Name">File-name prefix inside the archive, also the command-line name.</param>
-/// <param name="Url">Download location.</param>
+/// <param name="Name">Directory name under the cache (and file-name prefix for TexMex).</param>
+/// <param name="Url">Download location: a tarball for TexMex, a directory URL for parquet.</param>
 /// <param name="BaseCount">Expected number of base vectors, for a sanity check.</param>
 /// <param name="Dimension">Expected dimensionality, for a sanity check.</param>
-public sealed record AnnDatasetSource(string Name, string Url, int BaseCount, int Dimension);
+/// <param name="Metric">Metric the shipped ground truth was computed under.</param>
+/// <param name="Format">On-disk layout.</param>
+public sealed record AnnDatasetSource(
+    string Name,
+    string Url,
+    int BaseCount,
+    int Dimension,
+    DistanceFunction Metric,
+    DatasetFormat Format);
+
+public enum DatasetFormat
+{
+    /// <summary><c>.fvecs</c> / <c>.ivecs</c> as shipped by the TexMex corpora.</summary>
+    TexMex,
+
+    /// <summary><c>train/test/neighbors.parquet</c> as shipped by VectorDBBench.</summary>
+    VectorDbBenchParquet,
+}
