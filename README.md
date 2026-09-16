@@ -50,6 +50,17 @@ A single recall figure would be misleading, because any ANN index reaches 99% by
 
 Reproduce with `dotnet run -c Release --project benchmarks/Qvec.Benchmarks -- --dataset sift --download`. See [benchmarks/README.md](benchmarks/README.md).
 
+### Cohere 1M under concurrent load
+
+The configuration Zvec publishes for Cohere 1M (768 dims, cosine, recall@100, `M = 15`, `efSearch = 180`, 12 concurrent clients), on the same 12-core laptop:
+
+| mode | build (12 threads) | file | recall@100 | QPS 1 thread | QPS 12 threads |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| float | 419 s | 3,376 MiB | 94.8 % | 565 | 3,764 |
+| int8 | 181 s | 1,194 MiB | 93.2 % | 839 | 6,841 |
+
+The full sweep, the single-threaded rows and what can and cannot be read into a comparison with Zvec's 16-vCPU figures are in [benchmarks/README.md](benchmarks/README.md#cohere-1m-measured).
+
 ### int8 quantization on siftsmall
 
 Same code, `--dataset siftsmall` (10,000 vectors, 128 dimensions, 100 queries), float versus `--quantization int8`, same seed:

@@ -58,6 +58,15 @@ the mode so a float row and an int8 row cannot be confused for each other.
 it, so `--k`, `--ef` and `--concurrency` can be swept without paying for the build again. The
 build time is reported as zero in that case, not as the previous run's number.
 
+`--passes <n>` runs the query set `n` times per `efSearch` row inside the timed region. Cohere
+ships only 1,000 queries, which at several thousand QPS is over in a fraction of a second — too
+short to be a throughput number. Use 5–10 there. Recall is unaffected (the results are
+deterministic and only the first pass is scored). Each row is also preceded by a warm-up on the
+same thread count that runs at least one full pass and at least two seconds, because a fresh
+process must soft-fault every page of a multi-gigabyte mapping into its working set even when
+the OS has the file cached; without that the first row of a sweep looked 2–3× slower than the
+second for reasons unrelated to `efSearch`.
+
 ### Windows power throttling
 
 On startup the benchmark asks Windows to exempt it from power throttling (EcoQoS) and prints
@@ -114,7 +123,49 @@ at a cost of 0.1 pp recall@100. The float rows use the incremental prune
 1,696 s (59 inserts/s) and reached 97.9 % / 99.3 % at efSearch 100 / 180 — the graph is not
 byte-identical, so recall is re-measured rather than assumed. The int8 row shows the other open
 item plainly: without rescoring on the floats, int8 recall@100 plateaus at 96.8 % on Cohere,
-which is why Zvec's published figures use int8 *with* a refiner.
+which is why Zvec's published Cohere 10M figures use int8 *with* a refiner (their 1M run does not).
+
+### Cohere 1M, measured
+
+Zvec's published Cohere 1M run is `--quantize-type int8 --m 15 --ef-search 180` under 12–20
+concurrent clients on a 16-vCPU g9i.4xlarge ([their reproduction
+guide](https://zvec.org/en/docs/db/benchmarks/#cohere-1m)). The matching invocation here is
+
+```bash
+dotnet run -c Release --project benchmarks/Qvec.Benchmarks -- --dataset cohere1m --k 100 --m 15 --ef 100,180,320 --threads 0 --concurrency 12 --passes 10 [--quantization int8]
+```
+
+Snapdragon X Elite (12 cores, ARM64, laptop), Windows 11, throttling exemption in place, both
+indexes built the same evening with 12 threads, queries at `--concurrency 12`:
+
+| mode | build | inserts/s | file | efSearch | recall@1 | recall@100 | QPS 1 thread | QPS 12 threads | latency @ 12 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| float | 419 s | 2,385 | 3,376 MiB | 100 | 97.1 % | 90.3 % | — ‡ | 6,441 | 1.86 ms |
+| float | | | | 180 | 98.1 % | 94.8 % | 565 | 3,764 | 3.19 ms |
+| float | | | | 320 | 98.8 % | 97.4 % | 351 | 2,207 | 5.44 ms |
+| int8 | 181 s | 5,516 | 1,194 MiB | 100 | 93.1 % | 89.3 % | 1,395 | 13,540 | 0.89 ms |
+| int8 | | | | 180 | 94.4 % | 93.2 % | 839 | 6,841 | 1.75 ms |
+| int8 | | | | 320 | 95.4 % | 95.3 % | 502 | 4,714 | 2.55 ms |
+
+‡ The single-threaded float sweep was measured at `--passes 2`, where the first row had not
+finished faulting the 3.4 GB mapping in; it is omitted rather than reported wrong.
+
+Twelve query threads give 6.7× (float) and 8.2× (int8) over one. Zvec's chart for the same
+configuration reads as roughly 8–9 thousand QPS at recall@100 ≈ 0.93–0.94 on 16 vCPUs; the
+exact values are only published as an image, so treat that as approximate. Per core, the int8
+row at efSearch 180 (6,841 QPS / 12 cores) is in the same range, on different hardware, a
+different OS and a different day — which is as far as the comparison honestly goes. What the
+table does show without caveats is Qvec's own shape: int8 is 1.8× the float QPS at the same
+efSearch but loses 1.6 pp recall@100 at 180 and plateaus around 95 %, so a float refiner
+(`quantization-rescoring`) is the lever that would make the int8 row competitive on recall.
+
+Measuring this uncovered a scaling bug in the search path, fixed on the same branch. Result
+materialisation read the Guid and metadata of every hit through `MemoryMappedViewAccessor`,
+whose every call takes an interlocked reference on the shared `SafeBuffer`; at `k = 100` that is
+a few hundred atomic operations per query on one cache line, and twelve threads serialised on
+it. Cohere 1M float at efSearch 100 went from 1,883 to 6,441 QPS on 12 threads once the reads
+went through the raw mapping pointer like the distance computations already did. Single-threaded
+throughput was unaffected, which is why the SIFT numbers in the main README did not move.
 
 ## Metric
 

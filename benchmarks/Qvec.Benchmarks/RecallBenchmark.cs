@@ -191,34 +191,29 @@ public static class RecallBenchmark
         int queryCount = Math.Min(options.QueryCount, dataset.Queries.Count);
         int topK = options.TopK;
 
-        // Warm up so the first measured query is not paying for page faults on the mapped file
-        // and JIT of the search path. Without this the first efSearch in the sweep looks slow
-        // for reasons that have nothing to do with efSearch.
-        for (int q = 0; q < Math.Min(options.WarmupQueries, queryCount); q++)
-        {
-            db.Search(dataset.Queries.ToArray(q), topK, efSearch);
-        }
-
-        double recallAt1 = 0;
-        double recallAtK = 0;
-
         var queries = new float[queryCount][];
         for (int q = 0; q < queryCount; q++) queries[q] = dataset.Queries.ToArray(q);
 
-        var stopwatch = Stopwatch.StartNew();
         var results = new List<(Guid Id, float Score, string Metadata)>[queryCount];
-        if (options.Concurrency <= 1)
+
+        // Runs `count` queries (cycling through the set) on the configured number of threads.
+        // Each thread takes the next query off a shared counter, the way VectorDBBench's
+        // concurrent clients each run their own serial loop. Aggregate QPS is queries over
+        // wall-clock time, so a slow thread shows up honestly instead of being averaged away.
+        // Results are deterministic, so only the first pass is recorded for scoring.
+        void RunQueries(int count, bool record)
         {
-            for (int q = 0; q < queryCount; q++)
+            if (options.Concurrency <= 1)
             {
-                results[q] = db.Search(queries[q], topK, efSearch);
+                for (int i = 0; i < count; i++)
+                {
+                    int q = i % queryCount;
+                    var r = db.Search(queries[q], topK, efSearch);
+                    if (record && i < queryCount) results[q] = r;
+                }
+                return;
             }
-        }
-        else
-        {
-            // Each thread takes the next query off a shared counter, the way VectorDBBench's
-            // concurrent clients each run their own serial loop. Aggregate QPS is queries over
-            // wall-clock time, so a slow thread shows up honestly instead of being averaged away.
+
             int next = -1;
             var threads = new Thread[options.Concurrency];
             for (int t = 0; t < threads.Length; t++)
@@ -227,9 +222,11 @@ public static class RecallBenchmark
                 {
                     while (true)
                     {
-                        int q = Interlocked.Increment(ref next);
-                        if (q >= queryCount) break;
-                        results[q] = db.Search(queries[q], topK, efSearch);
+                        int i = Interlocked.Increment(ref next);
+                        if (i >= count) break;
+                        int q = i % queryCount;
+                        var r = db.Search(queries[q], topK, efSearch);
+                        if (record && i < queryCount) results[q] = r;
                     }
                 });
                 threads[t].Start();
@@ -237,6 +234,30 @@ public static class RecallBenchmark
 
             foreach (var thread in threads) thread.Join();
         }
+
+        // Warm up so the first measured query is not paying for page faults on the mapped file,
+        // thread start-up or tiered JIT of the search path. Without this the first efSearch in
+        // the sweep looks slow for reasons that have nothing to do with efSearch. The warm-up
+        // uses the same thread count as the measurement and runs at least one full pass over
+        // the query set and at least two seconds: a fresh process has to soft-fault every page
+        // of a multi-gigabyte mapping into its working set even when the file is cached.
+        var warmup = Stopwatch.StartNew();
+        RunQueries(Math.Max(options.WarmupQueries, queryCount), record: false);
+        while (warmup.Elapsed < options.MinimumWarmup)
+        {
+            RunQueries(queryCount, record: false);
+        }
+
+        double recallAt1 = 0;
+        double recallAtK = 0;
+
+        // With only 1,000 queries (Cohere) a row is over in half a second, which is mostly noise
+        // rather than throughput. Passes repeat the query set inside the timed region.
+        int passes = Math.Max(options.QueryPasses, 1);
+        int total = queryCount * passes;
+
+        var stopwatch = Stopwatch.StartNew();
+        RunQueries(total, record: true);
         stopwatch.Stop();
 
         // Scoring happens outside the timed region: mapping Guids back to base indices is our
@@ -267,13 +288,13 @@ public static class RecallBenchmark
 
         // With N threads the wall time per query understates what one caller waits; multiply
         // back up so the column is an estimate of per-query latency under that load.
-        double meanLatencyMs = stopwatch.Elapsed.TotalMilliseconds * Math.Max(options.Concurrency, 1) / queryCount;
+        double meanLatencyMs = stopwatch.Elapsed.TotalMilliseconds * Math.Max(options.Concurrency, 1) / total;
 
         return new RecallQpsPoint(
             efSearch,
             recallAt1 / queryCount,
             recallAtK / queryCount,
-            queryCount / Math.Max(seconds, 1e-9),
+            total / Math.Max(seconds, 1e-9),
             meanLatencyMs);
     }
 }
@@ -290,11 +311,17 @@ public sealed class BenchmarkOptions
     public int TopK { get; init; } = 10;
     public int QueryCount { get; init; } = int.MaxValue;
     public int WarmupQueries { get; init; } = 100;
+
+    /// <summary>Each efSearch row warms up for at least this long before the timed region.</summary>
+    public TimeSpan MinimumWarmup { get; init; } = TimeSpan.FromSeconds(2);
     public int ProgressEvery { get; init; } = 100_000;
     public IReadOnlyList<int> EfSearchSweep { get; init; } = [10, 20, 40, 80, 160, 320, 640];
 
     /// <summary>Number of threads issuing queries; 1 is the single-threaded latency view.</summary>
     public int Concurrency { get; init; } = 1;
+
+    /// <summary>How many times the query set is run per efSearch row; QPS covers all passes.</summary>
+    public int QueryPasses { get; init; } = 1;
 
     /// <summary>
     /// Threads used to build the index through <see cref="QvecDatabase.AddEntries"/>; 1 gives
