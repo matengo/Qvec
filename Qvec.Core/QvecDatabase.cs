@@ -48,11 +48,19 @@ namespace Qvec.Core
         private const int HeaderSize = V4Header.HeaderSizeValue;
         private const int MetadataDescriptorSize = 16;
         private const int GuidSize = 16;
-        private long _vectorSectionOffset;
+        /// <summary>Offset of the float vector section (1). Set in float mode and in rescored int8 mode.</summary>
+        private long _floatVectorSectionOffset;
+        /// <summary>Offset of section 8 (int8 codes); only meaningful when <see cref="_quantized"/>.</summary>
+        private long _codesSectionOffset;
         /// <summary>Offset of section 10 (per-vector int8 parameters); only meaningful when <see cref="_quantized"/>.</summary>
         private long _quantParamsSectionOffset;
-        /// <summary>True when vectors live as byte codes in section 8 instead of floats in section 1.</summary>
+        /// <summary>True when the graph is walked on byte codes in section 8 instead of floats in section 1.</summary>
         private bool _quantized;
+        /// <summary>
+        /// True when the file is int8 but also keeps the original floats, so search candidates are
+        /// re-ranked exactly and <see cref="GetByGuid"/> returns the original vector.
+        /// </summary>
+        private bool _rescore;
         private long _graphSectionOffset;
         private long _metadataSectionOffset;
         private long _metadataHeapOffset;
@@ -255,8 +263,8 @@ namespace Qvec.Core
             if (header.MaxLayers != maxLayers) mismatches.Add(Describe("maxLayers", header.MaxLayers, maxLayers));
             if (header.DistanceFunction != distanceFunction)
                 mismatches.Add($"distanceFunction: file has {header.DistanceFunction}, caller requested {distanceFunction}");
-            if (header.QuantizationMode != (int)quantization)
-                mismatches.Add($"quantization: file has {(VectorQuantization)header.QuantizationMode}, caller requested {quantization}");
+            if (QvecFormatLayout.EffectiveQuantization(header) != quantization)
+                mismatches.Add($"quantization: file has {QvecFormatLayout.EffectiveQuantization(header)}, caller requested {quantization}");
 
             if (mismatches.Count > 0)
             {
@@ -383,8 +391,12 @@ namespace Qvec.Core
         /// <summary>The distance function this database was created with, read from its header.</summary>
         public DistanceFunction DistanceFunction => _header.DistanceFunction;
 
-        /// <summary>How vectors are stored on disk, read from the header.</summary>
-        public VectorQuantization Quantization => (VectorQuantization)_header.QuantizationMode;
+        /// <summary>
+        /// How vectors are stored on disk, derived from the header and its section table.
+        /// <see cref="VectorQuantization.Int8Rescored"/> is reported when an int8 file also
+        /// carries the optional float section.
+        /// </summary>
+        public VectorQuantization Quantization => QvecFormatLayout.EffectiveQuantization(_header);
 
         /// <summary>Maximalt antal poster databasen kan rymma.</summary>
         public int MaxCount => _header.MaxCount;
@@ -714,14 +726,17 @@ namespace Qvec.Core
         private void CaptureSectionOffsets()
         {
             _quantized = _header.QuantizationMode != 0;
+            _rescore = QvecFormatLayout.HasRescoringFloats(_header);
             if (_quantized)
             {
-                _vectorSectionOffset = _header.GetRequiredSection(V4SectionIds.QuantizedVectors).Offset;
+                _codesSectionOffset = _header.GetRequiredSection(V4SectionIds.QuantizedVectors).Offset;
                 _quantParamsSectionOffset = _header.GetRequiredSection(V4SectionIds.QuantizationVectorParameters).Offset;
+                _floatVectorSectionOffset = _rescore ? _header.GetRequiredSection(V4SectionIds.Vectors).Offset : 0;
             }
             else
             {
-                _vectorSectionOffset = _header.GetRequiredSection(V4SectionIds.Vectors).Offset;
+                _floatVectorSectionOffset = _header.GetRequiredSection(V4SectionIds.Vectors).Offset;
+                _codesSectionOffset = 0;
                 _quantParamsSectionOffset = 0;
             }
             _graphSectionOffset = _header.GetRequiredSection(V4SectionIds.Graph).Offset;
@@ -1171,7 +1186,7 @@ namespace Qvec.Core
             {
                 var parameters = Int8Quantizer.Quantize(vector.AsSpan(0, dim), new Span<byte>(CodesPointer(index), dim));
                 parameters.WriteTo(new Span<byte>(ParamsPointer(index), Int8VectorParameters.Size));
-                return;
+                if (!_rescore) return;
             }
 
             long bytes = (long)dim * sizeof(float);
@@ -1450,7 +1465,7 @@ namespace Qvec.Core
                 foreach (int i in candidates)
                 {
                     if (_deletedIndices.Contains(i)) continue;
-                    scored.Add((i, CalculateScore(prepared, i)));
+                    scored.Add((i, FinalScore(prepared, i)));
                 }
 
                 return scored
@@ -1550,7 +1565,7 @@ namespace Qvec.Core
                     string meta = GetMetadata(i);
                     if (filter != null && !filter(meta)) continue;
 
-                    candidates.Add((i, CalculateScore(prepared, i)));
+                    candidates.Add((i, FinalScore(prepared, i)));
                 }
 
                 return candidates.OrderByDescending(c => c.Score)
@@ -1611,7 +1626,7 @@ namespace Qvec.Core
                     return;
                 }
 
-                partialResults[i] = (i, CalculateScore(prepared, i));
+                partialResults[i] = (i, FinalScore(prepared, i));
             });
 
             return partialResults
@@ -1661,6 +1676,7 @@ namespace Qvec.Core
 
                 var nearest = SearchLayerFiltered(
                     prepared, entryPoint, 0, ef, filter, visitBudget, out _);
+                RescoreCandidates(prepared, nearest);
 
                 var matches = nearest
                     .OrderByDescending(r => r.Score)
@@ -1709,7 +1725,7 @@ namespace Qvec.Core
                 string meta = GetMetadata(i);
                 if (!filter(meta)) continue;
 
-                matches.Add((i, CalculateScore(query, i), meta));
+                matches.Add((i, FinalScore(query, i), meta));
             }
 
             return matches.OrderByDescending(m => m.Score)
@@ -1748,6 +1764,9 @@ namespace Qvec.Core
 
                 int ef = Math.Max(topK, efSearch);
                 var nearest = SearchLayerNearest(prepared, entryPoint, 0, ef);
+                // Rescored files: the walk ranked ef candidates on int8 codes; the exact floats
+                // decide the final order and the reported scores.
+                RescoreCandidates(prepared, nearest);
 
                 return nearest
                     .OrderByDescending(r => r.Score)
@@ -2454,6 +2473,45 @@ namespace Qvec.Core
             return SimilarityUnsafe(query.Floats, VectorPointer(targetIndex), dim);
         }
 
+        /// <summary>
+        /// The score a search result is reported with. In rescored int8 mode this is the exact
+        /// float similarity read from the optional float section; otherwise it is the same score
+        /// the graph walk used. Callers must hold the read lock.
+        /// </summary>
+        private unsafe float FinalScore(PreparedQuery query, int targetIndex)
+        {
+            if (_rescore)
+            {
+                return SimilarityUnsafe(query.Floats, VectorPointer(targetIndex), _header.VectorDimension);
+            }
+
+            return CalculateScore(query, targetIndex);
+        }
+
+        /// <summary>
+        /// Re-ranks the candidates a graph walk produced against the exact floats. A no-op unless
+        /// the file is rescored, so float and plain int8 searches pay nothing for it.
+        /// </summary>
+        private void RescoreCandidates(PreparedQuery query, (int Id, float Score)[] candidates)
+        {
+            if (!_rescore) return;
+            for (int i = 0; i < candidates.Length; i++)
+            {
+                if (candidates[i].Id < 0) continue;
+                candidates[i].Score = FinalScore(query, candidates[i].Id);
+            }
+        }
+
+        private void RescoreCandidates(PreparedQuery query, (int Id, float Score, string Meta)[] candidates)
+        {
+            if (!_rescore) return;
+            for (int i = 0; i < candidates.Length; i++)
+            {
+                if (candidates[i].Id < 0) continue;
+                candidates[i].Score = FinalScore(query, candidates[i].Id);
+            }
+        }
+
         /// <summary>Score between two stored rows, read in place.</summary>
         private unsafe float StoredSimilarity(int left, int right)
         {
@@ -2471,7 +2529,7 @@ namespace Qvec.Core
 
         /// <summary>Address of a row's byte codes in section 8. Only valid when <see cref="_quantized"/>.</summary>
         private unsafe byte* CodesPointer(int index)
-            => DataBasePointer + (_vectorSectionOffset - HeaderSize) + (long)index * _header.VectorDimension;
+            => DataBasePointer + (_codesSectionOffset - HeaderSize) + (long)index * _header.VectorDimension;
 
         /// <summary>Address of a row's 16-byte parameter block in section 10. Only valid when <see cref="_quantized"/>.</summary>
         private unsafe byte* ParamsPointer(int index)
@@ -2481,13 +2539,14 @@ namespace Qvec.Core
             => Int8VectorParameters.ReadFrom(ParamsPointer(index));
 
         /// <summary>
-        /// Address of a stored vector inside the mapped view. Scoring straight against this
-        /// instead of copying the row out first is what took index construction from being
-        /// dominated by <c>ReadArray</c> marshalling and pool traffic to being dominated by
-        /// the arithmetic it is supposed to be doing.
+        /// Address of a stored float vector inside the mapped view. Valid in float mode and in
+        /// rescored int8 mode (section 1 in both); never in plain int8 mode. Scoring straight
+        /// against this instead of copying the row out first is what took index construction
+        /// from being dominated by <c>ReadArray</c> marshalling and pool traffic to being
+        /// dominated by the arithmetic it is supposed to be doing.
         /// </summary>
         private unsafe float* VectorPointer(int index)
-            => (float*)(DataBasePointer + (_vectorSectionOffset - HeaderSize)
+            => (float*)(DataBasePointer + (_floatVectorSectionOffset - HeaderSize)
                         + (long)index * _header.VectorDimension * sizeof(float));
 
         /// <summary>
@@ -2651,7 +2710,7 @@ namespace Qvec.Core
         {
             int dim = _header.VectorDimension;
 
-            if (_quantized)
+            if (_quantized && !_rescore)
             {
                 Int8Quantizer.Dequantize(
                     new ReadOnlySpan<byte>(CodesPointer(index), dim),

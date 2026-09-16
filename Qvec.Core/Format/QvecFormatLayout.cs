@@ -18,10 +18,15 @@ public static class QvecFormatLayout
         VectorQuantization quantization = VectorQuantization.None)
     {
         ValidateCreateArguments(vectorDimension, maxCount, maxNeighbors, maxLayers, metadataHeapCapacity, distanceFunction);
-        if (quantization is not VectorQuantization.None and not VectorQuantization.Int8)
+        if (quantization is not VectorQuantization.None and not VectorQuantization.Int8 and not VectorQuantization.Int8Rescored)
         {
-            throw new ArgumentOutOfRangeException(nameof(quantization), "Quantization must be None or Int8.");
+            throw new ArgumentOutOfRangeException(nameof(quantization), "Quantization must be None, Int8 or Int8Rescored.");
         }
+
+        // Rescoring is not a header mode of its own: the file is an int8 file that also carries
+        // the float section, so QuantizationMode stays 2 and older readers open it as plain int8.
+        bool storeFloats = quantization == VectorQuantization.Int8Rescored;
+        int headerMode = quantization == VectorQuantization.None ? 0 : (int)VectorQuantization.Int8;
 
         var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         var header = new V4Header
@@ -39,15 +44,16 @@ public static class QvecFormatLayout
             MetadataHeapUsed = 0,
             FreeListHead = -1,
             FreeListCount = 0,
-            QuantizationMode = (int)quantization,
-            QuantizationSectionId = quantization == VectorQuantization.None ? 0 : (int)V4SectionIds.QuantizedVectors,
+            QuantizationMode = headerMode,
+            QuantizationSectionId = headerMode == 0 ? 0 : (int)V4SectionIds.QuantizedVectors,
+            HeaderFlags = storeFloats ? V4HeaderFlags.HasOptionalSections : V4HeaderFlags.None,
             MetadataHeapCapacity = metadataHeapCapacity,
             CreatedUnixTimeSeconds = now,
             UpdatedUnixTimeSeconds = now,
         };
 
         var offset = (long)V4Header.HeaderSizeValue;
-        LayOutSections(header, maxCount, vectorDimension, maxNeighbors, maxLayers, metadataHeapCapacity, ref offset);
+        LayOutSections(header, maxCount, vectorDimension, maxNeighbors, maxLayers, metadataHeapCapacity, storeFloats, ref offset);
 
         header.NextSectionDataOffset = offset;
         header.FileLength = offset;
@@ -95,10 +101,14 @@ public static class QvecFormatLayout
         grown.MetadataHeapCapacity = newMetadataHeapCapacity;
         grown.UpdatedUnixTimeSeconds = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
 
+        // CloneState copies the scalar state, not the section table, so whether the file carries
+        // the optional float section has to be read off the current table.
+        bool storeFloats = HasRescoringFloats(current);
+
         var offset = (long)V4Header.HeaderSizeValue;
         LayOutSections(
             grown, newMaxCount, current.VectorDimension, current.MaxNeighbors, current.MaxLayers,
-            newMetadataHeapCapacity, ref offset);
+            newMetadataHeapCapacity, storeFloats, ref offset);
 
         grown.NextSectionDataOffset = offset;
         grown.FileLength = offset;
@@ -144,9 +154,27 @@ public static class QvecFormatLayout
     }
 
     /// <summary>
+    /// True when an int8 header also carries the optional float <see cref="V4SectionIds.Vectors"/>
+    /// section, i.e. the file was created with <see cref="VectorQuantization.Int8Rescored"/>.
+    /// </summary>
+    public static bool HasRescoringFloats(V4Header header)
+    {
+        ArgumentNullException.ThrowIfNull(header);
+        return header.QuantizationMode != 0 && header.TryGetSection(V4SectionIds.Vectors, out _);
+    }
+
+    /// <summary>
+    /// The API-level quantization a header describes: the header mode, promoted to
+    /// <see cref="VectorQuantization.Int8Rescored"/> when the optional float section is present.
+    /// </summary>
+    public static VectorQuantization EffectiveQuantization(V4Header header)
+        => HasRescoringFloats(header) ? VectorQuantization.Int8Rescored : (VectorQuantization)header.QuantizationMode;
+
+    /// <summary>
     /// Sections come in a fixed order. Slot 0 is vector storage in whichever form the header's
     /// quantization mode calls for; slots 1–6 are identical in both modes so code that walks the
-    /// graph and metadata never has to care. Int8 files add the parameter section in slot 7.
+    /// graph and metadata never has to care. Int8 files add the parameter section in slot 7, and
+    /// rescored int8 files add the float vectors as an optional (non-Required) section in slot 8.
     /// </summary>
     private static void LayOutSections(
         V4Header header,
@@ -155,16 +183,18 @@ public static class QvecFormatLayout
         int maxNeighbors,
         int maxLayers,
         long metadataHeapCapacity,
+        bool storeFloats,
         ref long offset)
     {
         bool quantized = header.QuantizationMode != 0;
+        uint floatElementSize = checked((uint)(vectorDimension * sizeof(float)));
         if (quantized)
         {
             AddSection(header.Sections[0], V4SectionIds.QuantizedVectors, ref offset, maxCount, checked((uint)vectorDimension));
         }
         else
         {
-            AddSection(header.Sections[0], V4SectionIds.Vectors, ref offset, maxCount, checked((uint)(vectorDimension * sizeof(float))));
+            AddSection(header.Sections[0], V4SectionIds.Vectors, ref offset, maxCount, floatElementSize);
         }
         // Layer 0 gets 2 * maxNeighbors slots (M0 = 2 * M) and every layer above it maxNeighbors,
         // which sums to (maxLayers + 1) * maxNeighbors slots per node.
@@ -177,6 +207,14 @@ public static class QvecFormatLayout
         if (quantized)
         {
             AddSection(header.Sections[7], V4SectionIds.QuantizationVectorParameters, ref offset, maxCount, 16);
+        }
+        if (storeFloats)
+        {
+            if (!quantized)
+            {
+                throw new ArgumentException("Float vectors are already the primary storage of an unquantized file.", nameof(storeFloats));
+            }
+            AddSection(header.Sections[8], V4SectionIds.Vectors, ref offset, maxCount, floatElementSize, required: false);
         }
     }
 
@@ -196,9 +234,10 @@ public static class QvecFormatLayout
         ref long offset,
         long elementCount,
         uint elementSize,
-        SectionFlags additionalFlags = SectionFlags.None)
+        SectionFlags additionalFlags = SectionFlags.None,
+        bool required = true)
     {
-        AddByteSection(entry, sectionId, ref offset, checked(elementCount * (long)elementSize), additionalFlags, elementSize);
+        AddByteSection(entry, sectionId, ref offset, checked(elementCount * (long)elementSize), additionalFlags, elementSize, required);
     }
 
     private static void AddByteSection(
@@ -207,11 +246,13 @@ public static class QvecFormatLayout
         ref long offset,
         long length,
         SectionFlags additionalFlags,
-        uint elementSize = 1)
+        uint elementSize = 1,
+        bool required = true)
     {
         offset = Align(offset);
         entry.SectionId = sectionId;
-        entry.SectionFlags = SectionFlags.Present | SectionFlags.Required | SectionFlags.Mutable | SectionFlags.MayMoveOnGrow | additionalFlags;
+        entry.SectionFlags = SectionFlags.Present | SectionFlags.Mutable | SectionFlags.MayMoveOnGrow | additionalFlags;
+        if (required) entry.SectionFlags |= SectionFlags.Required;
         entry.Offset = offset;
         entry.Length = length;
         entry.ElementSize = elementSize;

@@ -643,6 +643,17 @@ public sealed class V4Header
                 $"QuantizationVectorParameters ElementSize must be 16 but was {parameters.ElementSize}.");
             Require(parameters.Length >= CheckedLength(header.MaxCountRaw, 16, V4SectionIds.QuantizationVectorParameters),
                 "QuantizationVectorParameters length is too small for MaxCount.");
+
+            // Optional in int8 mode: present only for rescored files. When it is there it must be
+            // shaped like a float vector section, otherwise rescoring would read garbage.
+            if (header.TryGetSection(V4SectionIds.Vectors, out var floats))
+            {
+                var vectorElementSize = checked((uint)(header.VectorDimension * sizeof(float)));
+                Require(floats.ElementSize == vectorElementSize,
+                    $"Vectors ElementSize must be VectorDimension * 4 ({vectorElementSize}) but was {floats.ElementSize}.");
+                Require(floats.Length >= CheckedLength(header.MaxCountRaw, vectorElementSize, V4SectionIds.Vectors),
+                    "Vectors length is too small for MaxCount and VectorDimension.");
+            }
         }
 
         // Layer 0 is allocated 2 * MaxNeighbors slots (M0 = 2 * M, per Malkov & Yashunin) and
