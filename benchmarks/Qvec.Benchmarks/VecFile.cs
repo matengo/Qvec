@@ -27,6 +27,9 @@ public sealed class VecBlock<T>
     /// <summary>Number of components per vector.</summary>
     public int Dimension { get; }
 
+    /// <summary>The flat backing array, <see cref="Count"/> × <see cref="Dimension"/> long.</summary>
+    public T[] Values => _values;
+
     /// <summary>Returns vector <paramref name="index"/> as a view into the backing array.</summary>
     public ReadOnlySpan<T> this[int index]
     {

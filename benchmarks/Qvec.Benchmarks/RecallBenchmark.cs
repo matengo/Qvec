@@ -80,7 +80,11 @@ public static class RecallBenchmark
                 $"topK of {options.TopK} exceeds the ground-truth depth of {dataset.GroundTruth.Dimension}.");
         }
 
-        if (File.Exists(options.IndexPath)) File.Delete(options.IndexPath);
+        // --reuse-index opens an index left behind by an earlier --keep-index run instead of
+        // rebuilding it. Building takes minutes to hours; sweeping --concurrency or --k does not
+        // need a fresh graph, and the build time is reported as zero so it cannot be mistaken.
+        bool reuse = options.ReuseIndex && File.Exists(options.IndexPath);
+        if (!reuse && File.Exists(options.IndexPath)) File.Delete(options.IndexPath);
 
         using var db = new QvecDatabase(
             options.IndexPath,
@@ -95,12 +99,27 @@ public static class RecallBenchmark
             indexSeed: options.IndexSeed,
             quantization: options.Quantization);
 
-        var buildTime = BuildIndex(db, dataset, options);
+        TimeSpan buildTime;
+        if (reuse)
+        {
+            if (db.LiveCount != dataset.Base.Count)
+            {
+                throw new InvalidOperationException(
+                    $"'{options.IndexPath}' holds {db.LiveCount:N0} vectors but the dataset has {dataset.Base.Count:N0}; " +
+                    "it was built from something else. Drop --reuse-index.");
+            }
+
+            Console.WriteLine($"Reusing index {options.IndexPath} ({db.LiveCount:N0} vectors); build time not measured.");
+            buildTime = TimeSpan.Zero;
+        }
+        else
+        {
+            buildTime = BuildIndex(db, dataset, options);
+        }
 
         long fileSizeBytes = new FileInfo(options.IndexPath).Length;
         Console.WriteLine(
-            $"Built in {buildTime.TotalSeconds:F1}s " +
-            $"({dataset.Base.Count / Math.Max(buildTime.TotalSeconds, 0.001):N0} inserts/s), " +
+            (reuse ? "Reused, " : $"Built in {buildTime.TotalSeconds:F1}s ({dataset.Base.Count / Math.Max(buildTime.TotalSeconds, 0.001):N0} inserts/s), ") +
             $"file {fileSizeBytes / 1024.0 / 1024.0:F1} MiB.");
 
         var points = new List<RecallQpsPoint>();
@@ -124,6 +143,7 @@ public static class RecallBenchmark
             options.MaxLayers,
             options.Quantization,
             options.TopK,
+            options.Concurrency,
             buildTime,
             fileSizeBytes,
             points);
@@ -178,9 +198,35 @@ public static class RecallBenchmark
 
         var stopwatch = Stopwatch.StartNew();
         var results = new List<(Guid Id, float Score, string Metadata)>[queryCount];
-        for (int q = 0; q < queryCount; q++)
+        if (options.Concurrency <= 1)
         {
-            results[q] = db.Search(queries[q], topK, efSearch);
+            for (int q = 0; q < queryCount; q++)
+            {
+                results[q] = db.Search(queries[q], topK, efSearch);
+            }
+        }
+        else
+        {
+            // Each thread takes the next query off a shared counter, the way VectorDBBench's
+            // concurrent clients each run their own serial loop. Aggregate QPS is queries over
+            // wall-clock time, so a slow thread shows up honestly instead of being averaged away.
+            int next = -1;
+            var threads = new Thread[options.Concurrency];
+            for (int t = 0; t < threads.Length; t++)
+            {
+                threads[t] = new Thread(() =>
+                {
+                    while (true)
+                    {
+                        int q = Interlocked.Increment(ref next);
+                        if (q >= queryCount) break;
+                        results[q] = db.Search(queries[q], topK, efSearch);
+                    }
+                });
+                threads[t].Start();
+            }
+
+            foreach (var thread in threads) thread.Join();
         }
         stopwatch.Stop();
 
@@ -210,12 +256,16 @@ public static class RecallBenchmark
 
         double seconds = stopwatch.Elapsed.TotalSeconds;
 
+        // With N threads the wall time per query understates what one caller waits; multiply
+        // back up so the column is an estimate of per-query latency under that load.
+        double meanLatencyMs = stopwatch.Elapsed.TotalMilliseconds * Math.Max(options.Concurrency, 1) / queryCount;
+
         return new RecallQpsPoint(
             efSearch,
             recallAt1 / queryCount,
             recallAtK / queryCount,
             queryCount / Math.Max(seconds, 1e-9),
-            stopwatch.Elapsed.TotalMilliseconds / queryCount);
+            meanLatencyMs);
     }
 }
 
@@ -234,6 +284,12 @@ public sealed class BenchmarkOptions
     public int ProgressEvery { get; init; } = 100_000;
     public IReadOnlyList<int> EfSearchSweep { get; init; } = [10, 20, 40, 80, 160, 320, 640];
 
+    /// <summary>Number of threads issuing queries; 1 is the single-threaded latency view.</summary>
+    public int Concurrency { get; init; } = 1;
+
+    /// <summary>Open an existing index at <see cref="IndexPath"/> instead of rebuilding it.</summary>
+    public bool ReuseIndex { get; init; }
+
     /// <summary>
     /// Seed for the HNSW layer assignment, so a published curve can be reproduced exactly.
     /// </summary>
@@ -251,6 +307,7 @@ public sealed record BenchmarkReport(
     int MaxLayers,
     VectorQuantization Quantization,
     int TopK,
+    int Concurrency,
     TimeSpan BuildTime,
     long FileSizeBytes,
     IReadOnlyList<RecallQpsPoint> Points)
@@ -263,7 +320,7 @@ public sealed record BenchmarkReport(
         writer.WriteLine($"Dataset: **{Dataset}** — {BaseCount:N0} base vectors, {Dimension} dimensions, {QueryCount:N0} queries.");
         writer.WriteLine($"Metric: `{Distance}`. Index: `maxNeighbors = {MaxNeighbors}`, `maxLayers = {MaxLayers}`, `quantization = {Quantization}`.");
         writer.WriteLine($"Build: {BuildTime.TotalSeconds:F1} s ({BaseCount / Math.Max(BuildTime.TotalSeconds, 0.001):N0} inserts/s). File: {FileSizeBytes / 1024.0 / 1024.0:F1} MiB.");
-        writer.WriteLine($"Hardware: {hardware}. Single-threaded queries.");
+        writer.WriteLine($"Hardware: {hardware}. {(Concurrency <= 1 ? "Single-threaded queries." : $"{Concurrency} concurrent query threads; QPS is aggregate, latency is estimated per query under that load.")}");
         writer.WriteLine();
         writer.WriteLine($"| efSearch | recall@1 | recall@{TopK} | QPS | mean latency |");
         writer.WriteLine("| ---: | ---: | ---: | ---: | ---: |");

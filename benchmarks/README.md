@@ -48,10 +48,36 @@ graph: build once from `master`, once from your branch, and compare the section 
 `--quantization int8` builds the index with `VectorQuantization.Int8`. The report header records
 the mode so a float row and an int8 row cannot be confused for each other.
 
+`--reuse-index` opens the file a previous `--keep-index` run left behind instead of rebuilding
+it, so `--k`, `--ef` and `--concurrency` can be swept without paying for the build again. The
+build time is reported as zero in that case, not as the previous run's number.
+
+## Cohere (VectorDBBench)
+
+`--dataset cohere100k` and `--dataset cohere1m` load the Cohere corpora that
+[VectorDBBench](https://github.com/zilliztech/VectorDBBench) ships — 768-dimensional, **cosine**
+ground truth — which is what Zvec, Milvus and most vendor benchmarks publish against. The files
+are the VectorDBBench parquet triple (`train`, `test`, `neighbors`); the ground truth refers to
+train ids rather than row positions and is remapped on load.
+
+VectorDBBench reports **recall@100** under **12–20 concurrent clients**, so the comparable
+invocation is:
+
+```bash
+dotnet run -c Release --project benchmarks/Qvec.Benchmarks -- --dataset cohere1m --download --k 100 --ef 120,180 --concurrency 16
+```
+
+Two things differ from what the vendors publish and should be kept in mind when reading the
+numbers side by side. VectorDBBench runs each concurrency level for a fixed duration and reports
+the best; this benchmark runs every query once per `efSearch` and reports the aggregate. And
+VectorDBBench's index build is parallel, while Qvec's insert path is single-threaded, so the
+build time is not comparable at all — it is the honest measurement of where Qvec stands, not a
+like-for-like number.
+
 ## Metric
 
-SIFT and GIST ground truth is **Euclidean**. Run them with `--distance Euclidean`, which is the
-default. Measuring them under `Cosine` or `DotProduct` compares the index against neighbours that
+SIFT and GIST ground truth is **Euclidean**, Cohere is **Cosine**. The benchmark defaults to the
+dataset's own metric. Overriding it with `--distance` compares the index against neighbours that
 are not the ones the dataset means, and the resulting recall number says nothing useful — it is
 not a low score, it is a meaningless one.
 

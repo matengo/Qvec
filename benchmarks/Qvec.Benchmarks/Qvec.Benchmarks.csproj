@@ -16,4 +16,8 @@
     <ProjectReference Include="..\..\Qvec.Core\Qvec.Core.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <PackageReference Include="Parquet.Net" />    <!-- Transitive dependency of Parquet.Net; lifted here to a version without GHSA-pggp-6c3x-2xmx. -->    <PackageReference Include="Snappier" />
+  </ItemGroup>
+
 </Project>
