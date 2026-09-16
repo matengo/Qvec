@@ -995,7 +995,7 @@ namespace Qvec.Core
                 {
                     // If every earlier node was deleted there is nothing to attach to, so the
                     // new node has to become the entry point itself.
-                    if (!ConnectNewNode(index, vector, level) || level > _header.EntryPointLevel)
+                    if (!ConnectNewNode(index, vector, level, _insertScratch) || level > _header.EntryPointLevel)
                     {
                         _header.EntryPoint = index;
                         _header.EntryPointLevel = level;
@@ -1007,6 +1007,161 @@ namespace Qvec.Core
             }
             finally { _lock.ExitWriteLock(); }
         }
+
+        /// <summary>
+        /// Inserts a batch of entries, building the graph links for several entries at once.
+        /// Returns one id per input entry, in input order. Entries whose
+        /// <see cref="QvecInsert.ExternalId"/> already exists, in the database or earlier in the
+        /// batch, are skipped and the existing id is returned for them, as
+        /// <see cref="AddEntry"/> does.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// The database's write lock is held for the whole call, so searches wait until the batch
+        /// is complete. Within the batch, rows are allocated and written serially, then wired
+        /// into the graph by up to <paramref name="maxDegreeOfParallelism"/> threads, each with
+        /// its own search scratch space. Neighbour lists are updated under per-node striped
+        /// locks; the entry point changes under a separate lock and is rare.
+        /// </para>
+        /// <para>
+        /// With more than one thread the order in which nodes are linked depends on scheduling,
+        /// so two builds of the same data are not byte-identical even with an index seed. The
+        /// graph is still a valid HNSW graph and recall is measured to be within noise of a
+        /// serial build. A degree of parallelism of one reproduces the serial build exactly.
+        /// </para>
+        /// </remarks>
+        /// <param name="entries">Vectors, metadata and optional ids to insert.</param>
+        /// <param name="maxDegreeOfParallelism">
+        /// Threads used to link nodes into the graph. -1 (the default) uses
+        /// <see cref="Environment.ProcessorCount"/>; 1 gives the same graph as calling
+        /// <see cref="AddEntry"/> in a loop.
+        /// </param>
+        public IReadOnlyList<Guid> AddEntries(IReadOnlyList<QvecInsert> entries, int maxDegreeOfParallelism = -1)
+        {
+            ArgumentNullException.ThrowIfNull(entries);
+            if (maxDegreeOfParallelism == 0 || maxDegreeOfParallelism < -1)
+                throw new ArgumentOutOfRangeException(nameof(maxDegreeOfParallelism), maxDegreeOfParallelism, "Use -1 for all processors or a positive thread count.");
+
+            for (int i = 0; i < entries.Count; i++)
+            {
+                ValidateVector(entries[i].Vector, nameof(entries));
+                ArgumentNullException.ThrowIfNull(entries[i].Metadata, nameof(entries));
+            }
+
+            var ids = new Guid[entries.Count];
+            if (entries.Count == 0) return ids;
+
+            int threads = maxDegreeOfParallelism == -1 ? Environment.ProcessorCount : maxDegreeOfParallelism;
+
+            _lock.EnterWriteLock();
+            try
+            {
+                // Bounds how many prepared vectors are held in memory at a time and how much
+                // work sits behind a single header commit.
+                const int chunkSize = 8192;
+                var pending = new List<PendingInsert>(Math.Min(chunkSize, entries.Count));
+
+                for (int start = 0; start < entries.Count; start += chunkSize)
+                {
+                    int end = Math.Min(start + chunkSize, entries.Count);
+                    pending.Clear();
+
+                    // Phase A, serial: rows, ids, levels. Growth may remap the file here, which
+                    // is why no other thread touches the mapping yet.
+                    for (int i = start; i < end; i++)
+                    {
+                        var entry = entries[i];
+                        Guid docId = entry.ExternalId ?? Guid.NewGuid();
+                        ids[i] = docId;
+                        if (_guidIndex.ContainsKey(docId)) continue;
+
+                        int index = AllocateSlot();
+                        int level = RandomLayer();
+                        float[] vector = PrepareVector(entry.Vector);
+
+                        WriteVectorToDisk(index, vector);
+                        WriteMetadataToDisk(index, entry.Metadata);
+                        WriteGuidToDisk(index, docId);
+                        InitNeighborsOnDisk(index);
+                        _guidIndex[docId] = index;
+
+                        pending.Add(new PendingInsert(index, level, vector));
+                    }
+
+                    if (pending.Count == 0) continue;
+
+                    // Phase B, parallel: link the rows into the graph.
+                    LinkPending(pending, threads);
+                    CommitHeader();
+                }
+
+                return ids;
+            }
+            finally { _lock.ExitWriteLock(); }
+        }
+
+        private readonly record struct PendingInsert(int Index, int Level, float[] Vector);
+
+        /// <summary>Guards the entry point while <see cref="AddEntries"/> links nodes concurrently.</summary>
+        private readonly ReaderWriterLockSlim _topologyLock = new(LockRecursionPolicy.NoRecursion);
+
+        private void LinkPending(List<PendingInsert> pending, int threads)
+        {
+            int first = 0;
+            if (!HasLiveEntryPoint())
+            {
+                // Nothing to attach to yet: the first row becomes the entry point serially so the
+                // rest of the batch has a graph to descend from.
+                var seed = pending[0];
+                ConnectNewNode(seed.Index, seed.Vector, seed.Level, _insertScratch);
+                _header.EntryPoint = seed.Index;
+                _header.EntryPointLevel = seed.Level;
+                first = 1;
+            }
+
+            if (threads == 1 || pending.Count - first < 2)
+            {
+                for (int i = first; i < pending.Count; i++)
+                    LinkOne(pending[i], _insertScratch);
+                return;
+            }
+
+            using var scratch = new ThreadLocal<InsertScratch>(() => new InsertScratch());
+            var options = new ParallelOptions { MaxDegreeOfParallelism = threads };
+            Parallel.For(first, pending.Count, options, i => LinkOne(pending[i], scratch.Value!));
+        }
+
+        private bool HasLiveEntryPoint()
+        {
+            int entryPoint = _header.EntryPoint;
+            return entryPoint >= 0 && entryPoint < _header.CurrentCount && !_deletedIndices.Contains(entryPoint);
+        }
+
+        private void LinkOne(PendingInsert node, InsertScratch scratch)
+        {
+            _topologyLock.EnterReadLock();
+            try
+            {
+                if (node.Level <= _header.EntryPointLevel && ConnectNewNode(node.Index, node.Vector, node.Level, scratch))
+                    return;
+            }
+            finally { _topologyLock.ExitReadLock(); }
+
+            // The node reaches above the current entry point, or found nothing to attach to.
+            // Either way it becomes the new entry point, which must not happen while other
+            // threads are descending from the old one.
+            _topologyLock.EnterWriteLock();
+            try
+            {
+                if (!ConnectNewNode(node.Index, node.Vector, node.Level, scratch) || node.Level > _header.EntryPointLevel)
+                {
+                    _header.EntryPoint = node.Index;
+                    _header.EntryPointLevel = node.Level;
+                }
+            }
+            finally { _topologyLock.ExitWriteLock(); }
+        }
+
         private unsafe void WriteVectorToDisk(int index, float[] vector)
         {
             BeginWrite();
@@ -1607,7 +1762,14 @@ namespace Qvec.Core
         /// Wires a freshly written node into the graph. Returns false when there is no live
         /// node to attach to, in which case the caller must promote the new node to entry point.
         /// </summary>
-        private bool ConnectNewNode(int newIndex, float[] newVector, int newLevel)
+        /// <remarks>
+        /// Safe to run for several new nodes at once from <see cref="AddEntries"/>: every
+        /// read-modify-write of a neighbour list happens under that node's stripe lock, and the
+        /// new node's own list is merged with any back-links other threads have already written
+        /// into it rather than overwritten. Searches read neighbour lists without locking, which
+        /// is fine because slots are written as whole int32s and hold either a valid row or -1.
+        /// </remarks>
+        private bool ConnectNewNode(int newIndex, float[] newVector, int newLevel, InsertScratch scratch)
         {
             int currentElement = ResolveEntryPoint();
             if (currentElement < 0 || currentElement == newIndex) return false;
@@ -1619,15 +1781,21 @@ namespace Qvec.Core
 
             for (int level = Math.Min(newLevel, _header.MaxLayers - 1); level >= 0; level--)
             {
-                var candidates = SearchLayerNearest(query, currentElement, level, EfConstruction, _insertScratch);
+                var candidates = SearchLayerNearest(query, currentElement, level, EfConstruction, scratch);
                 var nearest = SelectNeighborsHeuristic(candidates, NeighborsAtLevel(level));
 
-                WriteNeighborsAtLevel(newIndex, level, nearest);
+                lock (NodeLock(newIndex))
+                {
+                    MergeNeighborsAtLevel(newIndex, level, nearest);
+                }
 
                 foreach (var (neighborId, _) in nearest)
                 {
                     if (neighborId < 0) break;
-                    AddNeighborConnection(neighborId, level, newIndex);
+                    lock (NodeLock(neighborId))
+                    {
+                        AddNeighborConnection(neighborId, level, newIndex);
+                    }
                 }
 
                 if (candidates.Length > 0 && candidates[0].Id >= 0)
@@ -1637,6 +1805,71 @@ namespace Qvec.Core
             }
 
             return true;
+        }
+
+        private const int NodeLockCount = 1024;
+        private readonly object[] _nodeLocks = CreateNodeLocks();
+
+        private static object[] CreateNodeLocks()
+        {
+            var locks = new object[NodeLockCount];
+            for (int i = 0; i < locks.Length; i++) locks[i] = new object();
+            return locks;
+        }
+
+        /// <summary>
+        /// Striped lock for one node's neighbour lists. Never taken nested, so two stripes can
+        /// not deadlock; the stripe count only bounds how often unrelated nodes collide.
+        /// </summary>
+        private object NodeLock(int nodeIndex) => _nodeLocks[nodeIndex & (NodeLockCount - 1)];
+
+        /// <summary>
+        /// Writes a new node's selected neighbours, keeping any back-links that concurrent
+        /// inserts have already placed in the list. On the serial path the list is still all -1
+        /// from <see cref="InitNeighborsOnDisk"/>, so this is a plain write there.
+        /// </summary>
+        private unsafe void MergeNeighborsAtLevel(int nodeIndex, int level, (int Id, float Score)[] nearest)
+        {
+            int slots = NeighborsAtLevel(level);
+            int* target = NeighborPointer(nodeIndex, level);
+
+            int existing = 0;
+            while (existing < slots && target[existing] != -1) existing++;
+
+            if (existing == 0)
+            {
+                WriteNeighborsAtLevel(nodeIndex, level, nearest);
+                return;
+            }
+
+            int[] merged = ArrayPool<int>.Shared.Rent(slots);
+            try
+            {
+                int count = 0;
+                for (int i = 0; i < nearest.Length && count < slots; i++)
+                {
+                    if (nearest[i].Id < 0) break;
+                    merged[count++] = nearest[i].Id;
+                }
+
+                for (int i = 0; i < existing && count < slots; i++)
+                {
+                    int id = target[i];
+                    bool duplicate = false;
+                    for (int j = 0; j < count; j++)
+                    {
+                        if (merged[j] == id) { duplicate = true; break; }
+                    }
+                    if (!duplicate) merged[count++] = id;
+                }
+
+                for (int i = count; i < slots; i++) merged[i] = -1;
+                WriteNeighborsAtLevel(nodeIndex, level, merged.AsSpan(0, slots));
+            }
+            finally
+            {
+                ArrayPool<int>.Shared.Return(merged);
+            }
         }
 
         /// <summary>
@@ -1992,7 +2225,7 @@ namespace Qvec.Core
             for (int i = count; i < slots; i++) target[i] = -1;
         }
 
-        private unsafe void WriteNeighborsAtLevel(int nodeIndex, int level, int[] neighborIds)
+        private unsafe void WriteNeighborsAtLevel(int nodeIndex, int level, ReadOnlySpan<int> neighborIds)
         {
             BeginWrite();
             int slots = NeighborsAtLevel(level);
@@ -2303,7 +2536,7 @@ namespace Qvec.Core
                             continue;
                         }
 
-                        if (!ConnectNewNode(index, vector, level) || level > _header.EntryPointLevel)
+                        if (!ConnectNewNode(index, vector, level, _insertScratch) || level > _header.EntryPointLevel)
                         {
                             _header.EntryPoint = index;
                             _header.EntryPointLevel = level;
@@ -2931,7 +3164,7 @@ namespace Qvec.Core
             }
             else
             {
-                if (!ConnectNewNode(index, vector, level) || level > _header.EntryPointLevel)
+                if (!ConnectNewNode(index, vector, level, _insertScratch) || level > _header.EntryPointLevel)
                 {
                     _header.EntryPoint = index;
                     _header.EntryPointLevel = level;
@@ -2980,6 +3213,7 @@ namespace Qvec.Core
             _dataAccessor.Dispose();
             _mmf.Dispose();
             _lock.Dispose();
+            _topologyLock.Dispose();
         }
     }
 }

@@ -18,6 +18,13 @@ if (arguments.Help)
     return 0;
 }
 
+if (!arguments.Flag("allow-throttling"))
+{
+    Console.WriteLine(PowerThrottling.TryDisable()
+        ? "Power throttling (EcoQoS) disabled for this process."
+        : "Power throttling exemption not available; results may vary with the OS power plan.");
+}
+
 string datasetName = arguments.Value("dataset") ?? "siftsmall";
 string cacheDirectory = arguments.Value("data")
     ?? Path.Combine(Path.GetTempPath(), "qvec-ann-datasets");
@@ -56,6 +63,7 @@ var options = new BenchmarkOptions
     QueryCount = arguments.Int("queries") ?? int.MaxValue,
     EfSearchSweep = arguments.Ints("ef") ?? [10, 20, 40, 80, 160, 320, 640],
     Concurrency = arguments.Int("concurrency") ?? 1,
+    BuildThreads = arguments.Int("threads") ?? 1,
     ReuseIndex = arguments.Flag("reuse-index"),
 };
 
@@ -141,6 +149,8 @@ internal sealed class CommandLine
               --ef <list>         comma-separated efSearch sweep, default 10,20,40,80,160,320,640
               --queries <int>     limit the number of queries
               --concurrency <n>   query threads, default 1; QPS is aggregate over all threads
+              --threads <n>       index build threads (AddEntries), default 1; 0 = all cores.
+                                  Builds with more than one thread are not byte-reproducible.
               --max-base <int>    index only a prefix of the base set (invalidates recall)
               --index <path>      where to put the .qvec file
               --keep-index        do not delete the .qvec file afterwards

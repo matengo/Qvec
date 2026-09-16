@@ -144,6 +144,7 @@ public static class RecallBenchmark
             options.Quantization,
             options.TopK,
             options.Concurrency,
+            options.BuildThreads <= 0 ? Environment.ProcessorCount : options.BuildThreads,
             buildTime,
             fileSizeBytes,
             points);
@@ -151,21 +152,29 @@ public static class RecallBenchmark
 
     private static TimeSpan BuildIndex(QvecDatabase db, AnnDataset dataset, BenchmarkOptions options)
     {
-        Console.WriteLine($"Indexing {dataset.Base.Count:N0} vectors (M={options.MaxNeighbors}, layers={options.MaxLayers}, {options.Distance}) ...");
+        int threads = options.BuildThreads <= 0 ? Environment.ProcessorCount : options.BuildThreads;
+        Console.WriteLine($"Indexing {dataset.Base.Count:N0} vectors (M={options.MaxNeighbors}, layers={options.MaxLayers}, {options.Distance}, {threads} build thread{(threads == 1 ? "" : "s")}) ...");
 
-        var vector = new float[dataset.Base.Dimension];
+        // Batches keep the prepared vectors handed to AddEntries bounded in memory and give
+        // progress output at the same cadence as the old one-by-one loop.
+        int batchSize = options.ProgressEvery > 0 ? Math.Min(options.ProgressEvery, 50_000) : 50_000;
+        var batch = new List<QvecInsert>(batchSize);
         var stopwatch = Stopwatch.StartNew();
 
-        for (int i = 0; i < dataset.Base.Count; i++)
+        for (int start = 0; start < dataset.Base.Count; start += batchSize)
         {
-            dataset.Base[i].CopyTo(vector);
-            db.AddEntry(vector, string.Empty, IdForBaseIndex(i));
+            int end = Math.Min(start + batchSize, dataset.Base.Count);
+            batch.Clear();
+            for (int i = start; i < end; i++)
+                batch.Add(new QvecInsert(dataset.Base.ToArray(i), string.Empty, IdForBaseIndex(i)));
 
-            if (options.ProgressEvery > 0 && (i + 1) % options.ProgressEvery == 0)
+            db.AddEntries(batch, threads);
+
+            if (options.ProgressEvery > 0 && (end % options.ProgressEvery == 0 || end == dataset.Base.Count))
             {
                 Console.WriteLine(
-                    $"  {i + 1:N0}/{dataset.Base.Count:N0} " +
-                    $"({(i + 1) / stopwatch.Elapsed.TotalSeconds:N0} inserts/s)");
+                    $"  {end:N0}/{dataset.Base.Count:N0} " +
+                    $"({end / stopwatch.Elapsed.TotalSeconds:N0} inserts/s)");
             }
         }
 
@@ -287,6 +296,12 @@ public sealed class BenchmarkOptions
     /// <summary>Number of threads issuing queries; 1 is the single-threaded latency view.</summary>
     public int Concurrency { get; init; } = 1;
 
+    /// <summary>
+    /// Threads used to build the index through <see cref="QvecDatabase.AddEntries"/>; 1 gives
+    /// the same graph as one-by-one <see cref="QvecDatabase.AddEntry"/>, 0 means all cores.
+    /// </summary>
+    public int BuildThreads { get; init; } = 1;
+
     /// <summary>Open an existing index at <see cref="IndexPath"/> instead of rebuilding it.</summary>
     public bool ReuseIndex { get; init; }
 
@@ -308,6 +323,7 @@ public sealed record BenchmarkReport(
     VectorQuantization Quantization,
     int TopK,
     int Concurrency,
+    int BuildThreads,
     TimeSpan BuildTime,
     long FileSizeBytes,
     IReadOnlyList<RecallQpsPoint> Points)
@@ -319,7 +335,7 @@ public sealed record BenchmarkReport(
 
         writer.WriteLine($"Dataset: **{Dataset}** — {BaseCount:N0} base vectors, {Dimension} dimensions, {QueryCount:N0} queries.");
         writer.WriteLine($"Metric: `{Distance}`. Index: `maxNeighbors = {MaxNeighbors}`, `maxLayers = {MaxLayers}`, `quantization = {Quantization}`.");
-        writer.WriteLine($"Build: {BuildTime.TotalSeconds:F1} s ({BaseCount / Math.Max(BuildTime.TotalSeconds, 0.001):N0} inserts/s). File: {FileSizeBytes / 1024.0 / 1024.0:F1} MiB.");
+        writer.WriteLine($"Build: {BuildTime.TotalSeconds:F1} s ({BaseCount / Math.Max(BuildTime.TotalSeconds, 0.001):N0} inserts/s, {BuildThreads} build thread{(BuildThreads == 1 ? "" : "s")}). File: {FileSizeBytes / 1024.0 / 1024.0:F1} MiB.");
         writer.WriteLine($"Hardware: {hardware}. {(Concurrency <= 1 ? "Single-threaded queries." : $"{Concurrency} concurrent query threads; QPS is aggregate, latency is estimated per query under that load.")}");
         writer.WriteLine();
         writer.WriteLine($"| efSearch | recall@1 | recall@{TopK} | QPS | mean latency |");

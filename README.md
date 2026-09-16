@@ -18,7 +18,8 @@ Unlike client-server vector DBs, Qvec runs in-process, using **MemoryMappedFiles
 *   **Three Distance Metrics:** `DotProduct`, `Cosine` and `Euclidean` (L2). Cosine normalizes stored copies; the other two store vectors untouched. Euclidean is the metric most image and audio embeddings — and every published ANN benchmark corpus — are defined against.
 *   **Hardware-Accelerated Math:** Uses .NET vector APIs and unsafe pointer paths for SIMD-friendly scoring.
 *   **Optional int8 Scalar Quantization:** Pass `quantization: VectorQuantization.Int8` to store one byte per dimension instead of four (plus 16 bytes of per-vector scale/offset). Scoring runs on the bytes with a widening SIMD integer kernel, so queries get faster as well as smaller. Float mode is untouched and byte-for-byte identical to before. See [docs/design-quantization-int8.md](docs/design-quantization-int8.md) for the accuracy trade-off.
-*   **Reproducible Index Builds:** HNSW layer assignment is randomized by default, so two builds of the same data normally produce different graphs. Pass `indexSeed:` to pin it — necessary for benchmarks and recall regression tests to be re-derivable.
+*   **Reproducible Index Builds:** HNSW layer assignment is randomized by default, so two builds of the same data normally produce different graphs. Pass `indexSeed:` to pin it — necessary for benchmarks and recall regression tests to be re-derivable. (Multi-threaded `AddEntries` builds keep the seeded layers but not the link order, so they are not byte-reproducible.)
+*   **Parallel Bulk Loading:** `AddEntries` inserts a batch with every core linking nodes into the graph at once — hnswlib-style striped node locks, one write lock for the whole batch. 6.3× faster than one-by-one `AddEntry` on 12 cores at a cost of ~0.1 pp recall. See [docs/design-insert-parallel.md](docs/design-insert-parallel.md).
 *   **Guid Document IDs:** `AddEntry` returns a stable `Guid` document identifier; external IDs can be supplied for deduplication and sync scenarios.
 *   **Update and Delete:** Supports tombstone-based delete, metadata updates, and vector updates by delete-and-reinsert. `Vacuum()` compacts the file, reuses tombstoned rows, reclaims orphaned metadata, and rebuilds the HNSW graph.
 *   **Metadata Filtering:** General metadata predicates are supported after HNSW retrieval; `[QvecIndexed]` equality filters can pre-filter via an in-memory inverted index.
@@ -34,14 +35,16 @@ Measured on **SIFT-1M** ([TexMex corpus](http://corpus-texmex.irisa.fr/)) agains
 
 | efSearch | recall@1 | recall@10 | QPS | mean latency |
 | ---: | ---: | ---: | ---: | ---: |
-| 10 | 88.0 % | 84.4 % | 6,734 | 0.148 ms |
-| 20 | 94.5 % | 92.5 % | 4,341 | 0.230 ms |
-| 40 | 97.6 % | 97.0 % | 2,624 | 0.381 ms |
-| 80 | 98.8 % | 99.0 % | 1,576 | 0.634 ms |
-| 160 | 99.3 % | 99.7 % | 863 | 1.158 ms |
-| 320 | 99.3 % | 99.9 % | 498 | 2.010 ms |
+| 10 | 88.0 % | 84.4 % | 8,710 | 0.115 ms |
+| 20 | 94.5 % | 92.5 % | 5,625 | 0.178 ms |
+| 40 | 97.6 % | 97.0 % | 3,416 | 0.293 ms |
+| 80 | 98.8 % | 99.1 % | 1,923 | 0.520 ms |
+| 160 | 99.3 % | 99.7 % | 1,084 | 0.922 ms |
+| 320 | 99.3 % | 99.9 % | 607 | 1.648 ms |
 
-Index build: 1,631 s (613 inserts/s), producing a 1,324 MiB file, with `indexSeed` pinned so the run can be reproduced. The previous graph, built with the full O(M0²) neighbour heuristic on every back-link, took 2,279 s on the same day and machine and scored 85.9 / 93.7 / 97.8 / 99.4 / 99.8 / 99.9 % recall@10 on the same rows; the incremental heuristic ([design doc](docs/design-insert-prune.md)) trades up to 1.5 points of recall at the narrowest beam, and nothing from efSearch 160 up, for the faster build. Query throughput of the two graphs is identical within run-to-run noise (±5 %). Build is still single-threaded and memory-bound once the file outgrows the CPU caches.
+Index build: 1,146 s (873 inserts/s) single-threaded with `AddEntry`, or **142 s (7,037 inserts/s)** with `AddEntries` on 12 build threads — 8.1× — producing a 1,324 MiB file either way. The parallel graph scored 84.5 / 92.6 / 97.0 / 99.0 / 99.7 / 99.9 % recall@10 on the same rows, i.e. identical within 0.1 pp; it is not byte-reproducible though, so the table above is from the seeded serial build. The previous graph, built with the full O(M0²) neighbour heuristic on every back-link, scored 85.9 / 93.7 / 97.8 / 99.4 / 99.8 / 99.9 %; the incremental heuristic ([design doc](docs/design-insert-prune.md)) trades up to 1.5 points of recall at the narrowest beam, and nothing from efSearch 160 up, for a 1.4× faster build.
+
+These numbers are higher than earlier revisions of this table because the benchmark now opts out of Windows 11 power throttling (EcoQoS), which had been silently capping background console processes at roughly a third of the machine — see [benchmarks/README.md](benchmarks/README.md#windows-power-throttling). Earlier figures were measured throttled and are not comparable.
 
 A single recall figure would be misleading, because any ANN index reaches 99% by widening the beam until it has effectively scanned everything. The honest unit is the whole curve, so pick the row that matches your latency budget.
 
@@ -92,6 +95,11 @@ using var db = new QvecDatabase("vectors.qvec", dim: 1536, max: 10_000);
 
 float[] embedding = GetEmbedding("Hello World");
 Guid id = db.AddEntry(embedding, "{\"id\":1,\"category\":\"text\"}");
+
+// Bulk load: links the batch into the graph on every core. Same result as a
+// loop of AddEntry (ids in input order, duplicates skipped), 6× faster on 12 cores.
+IReadOnlyList<Guid> ids = db.AddEntries(
+    documents.Select(d => new QvecInsert(d.Embedding, d.MetadataJson, d.Id)).ToList());
 ```
 
 > **Capacity note:** `max` is a **starting** size, not a ceiling. The file is laid out for that capacity up front and **grows geometrically** when it runs out of rows or metadata heap space. It is also created **sparse**, so `dim: 1536, max: 1_000_000` describes a ~7.3 GB layout while consuming only the pages you actually write. Set `AutoGrow = false` if you want a hard bound instead — a full database then throws `QvecFullException`.
@@ -319,7 +327,7 @@ Planned cloud work is tracked in design documents and the roadmap below.
 - **Full Native AOT support for the typed client** — Remove or replace reflection, expression compilation, and reflection-based JSON paths.
 - **ProjectReference analyzer flow for source generation** — Ensure the `[QvecIndexed]` generator is available when consuming `Qvec.Core.Client` through project references.
 - **Published benchmark methodology** — ✅ Done. `benchmarks/Qvec.Benchmarks` measures recall vs. QPS against the TexMex SIFT/GIST corpora and their published ground truth.
-- **Faster index construction** — Partly done. Removing marshalling, pool and allocation overhead took SIFT-1M from 242 to 362 inserts/s; replacing the O(M0²) re-run of the neighbour heuristic on every full back-link with an incremental O(M0) update ([design doc](docs/design-insert-prune.md)) took Cohere 100K (768 dims) from 59 to 170 inserts/s. Insert is still single-threaded; parallel construction is the next lever.
+- **Faster index construction** — Done in three steps. Removing marshalling, pool and allocation overhead took SIFT-1M from 242 to 362 inserts/s; replacing the O(M0²) re-run of the neighbour heuristic on every full back-link with an incremental O(M0) update ([design doc](docs/design-insert-prune.md)) took Cohere 100K (768 dims) from 59 to 170 inserts/s; parallel construction through `AddEntries` ([design doc](docs/design-insert-parallel.md)) gives a further 6.3× on 12 cores. Remaining lever: hub-node lock contention during back-linking (~20 % of thread time on Cohere).
 - **Multi-vector support** — Store and search multiple embeddings, such as image + text, for one logical entry.
 
 ## License
