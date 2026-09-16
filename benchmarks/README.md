@@ -74,6 +74,29 @@ VectorDBBench's index build is parallel, while Qvec's insert path is single-thre
 build time is not comparable at all — it is the honest measurement of where Qvec stands, not a
 like-for-like number.
 
+### Cohere 100K, measured
+
+`--dataset cohere100k --k 100`, `maxNeighbors = 32`, 12 logical cores, Windows 11. Build is
+single-threaded; queries at `--concurrency 12`.
+
+| mode | build | inserts/s | file | efSearch | recall@100 | QPS 1 thread | QPS 12 threads |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| float | 589 s | 170 | 382 MiB | 100 | 97.6 % | 381 | 1,652 |
+| float | | | | 180 | 99.0 % | 263 | 1,097 |
+| int8 | 672 s | 149 | 164 MiB | 100 | 95.7 % | 549 | — |
+| int8 | | | | 180 | 96.6 % | 395 | — |
+| int8 | | | | 300 | 96.8 % | 308 | — |
+
+The float row is the incremental-prune build ([design doc](../docs/design-insert-prune.md)).
+Before it the same build took 1,696 s (59 inserts/s) and reached 97.9 % / 99.3 % at efSearch
+100 / 180 — the graph is not byte-identical, so recall is re-measured rather than assumed.
+Absolute QPS on this laptop varies by up to 40 % between sessions (the same index file gave
+585 and 347 QPS single-threaded on two different days), so compare QPS only within one table
+measured back to back; the design doc does that for old versus new graph. The int8 row was
+built with the old prune and shows the other open item plainly: without rescoring on the
+floats, int8 recall@100 plateaus at 96.8 % on Cohere, which is why Zvec's published figures
+use int8 *with* a refiner.
+
 ## Metric
 
 SIFT and GIST ground truth is **Euclidean**, Cohere is **Cosine**. The benchmark defaults to the
