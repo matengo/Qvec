@@ -145,7 +145,8 @@ internal sealed class CommandLine
               --distance <name>   Euclidean, Cosine or DotProduct; default is the dataset's own metric
               --m <int>           maxNeighbors, default 32
               --layers <int>      maxLayers, default 5
-              --quantization <q>  None (default) or Int8; int8 stores one byte per dimension
+              --quantization <q>  None (default), Int8 or Int8Rescored; int8 stores one byte per
+                                  dimension, int8rescored also keeps the floats and re-ranks on them
               --k <int>           top-k for recall@k, default 10
               --ef <list>         comma-separated efSearch sweep, default 10,20,40,80,160,320,640
               --queries <int>     limit the number of queries

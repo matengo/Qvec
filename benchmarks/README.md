@@ -51,8 +51,11 @@ scheduling), so compare those by recall instead.
 nodes concurrently ([design doc](../docs/design-insert-parallel.md)); `0` means every core. The
 default is 1, which produces exactly the graph a loop of `AddEntry` calls would.
 
-`--quantization int8` builds the index with `VectorQuantization.Int8`. The report header records
-the mode so a float row and an int8 row cannot be confused for each other.
+`--quantization int8` builds the index with `VectorQuantization.Int8`; `--quantization
+int8rescored` uses `VectorQuantization.Int8Rescored`, which walks the graph on the int8 codes
+but keeps the floats and re-ranks the `efSearch` candidates on them
+([design doc](../docs/design-quantization-rescoring.md)). The report header records the mode
+so rows from different modes cannot be confused for each other.
 
 `--reuse-index` opens the file a previous `--keep-index` run left behind instead of rebuilding
 it, so `--k`, `--ef` and `--concurrency` can be swept without paying for the build again. The
@@ -121,9 +124,10 @@ Parallel construction ([design doc](../docs/design-insert-parallel.md)) gives 6.
 at a cost of 0.1 pp recall@100. The float rows use the incremental prune
 ([design doc](../docs/design-insert-prune.md)); before it the same single-threaded build took
 1,696 s (59 inserts/s) and reached 97.9 % / 99.3 % at efSearch 100 / 180 — the graph is not
-byte-identical, so recall is re-measured rather than assumed. The int8 row shows the other open
-item plainly: without rescoring on the floats, int8 recall@100 plateaus at 96.8 % on Cohere,
-which is why Zvec's published Cohere 10M figures use int8 *with* a refiner (their 1M run does not).
+byte-identical, so recall is re-measured rather than assumed. The int8 row shows the plain-int8
+ceiling: without rescoring on the floats, int8 recall@100 plateaus at 96.8 % on Cohere, which is
+why Zvec's published Cohere 10M figures use int8 *with* a refiner (their 1M run does not). The
+`int8rescored` mode measured on 1M below is Qvec's equivalent.
 
 ### Cohere 1M, measured
 
@@ -132,11 +136,11 @@ concurrent clients on a 16-vCPU g9i.4xlarge ([their reproduction
 guide](https://zvec.org/en/docs/db/benchmarks/#cohere-1m)). The matching invocation here is
 
 ```bash
-dotnet run -c Release --project benchmarks/Qvec.Benchmarks -- --dataset cohere1m --k 100 --m 15 --ef 100,180,320 --threads 0 --concurrency 12 --passes 10 [--quantization int8]
+dotnet run -c Release --project benchmarks/Qvec.Benchmarks -- --dataset cohere1m --k 100 --m 15 --ef 100,180,320 --threads 0 --concurrency 12 --passes 10 [--quantization int8|int8rescored]
 ```
 
-Snapdragon X Elite (12 cores, ARM64, laptop), Windows 11, throttling exemption in place, both
-indexes built the same evening with 12 threads, queries at `--concurrency 12`:
+Snapdragon X Elite (12 cores, ARM64, laptop), Windows 11, throttling exemption in place, all
+indexes built with 12 threads, queries at `--concurrency 12`:
 
 | mode | build | inserts/s | file | efSearch | recall@1 | recall@100 | QPS 1 thread | QPS 12 threads | latency @ 12 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -146,18 +150,33 @@ indexes built the same evening with 12 threads, queries at `--concurrency 12`:
 | int8 | 181 s | 5,516 | 1,194 MiB | 100 | 93.1 % | 89.3 % | 1,395 | 13,540 | 0.89 ms |
 | int8 | | | | 180 | 94.4 % | 93.2 % | 839 | 6,841 | 1.75 ms |
 | int8 | | | | 320 | 95.4 % | 95.3 % | 502 | 4,714 | 2.55 ms |
+| int8 rescored | 170 s | 5,885 | 4,124 MiB | 100 | 96.4 % | 89.2 % | 1,200 | 11,231 | 1.07 ms |
+| int8 rescored | | | | 180 | 97.9 % | **94.7 %** | 630 | **6,778** | 1.77 ms |
+| int8 rescored | | | | 320 | 98.9 % | **97.4 %** | 421 | **3,884** | 3.09 ms |
 
 ‡ The single-threaded float sweep was measured at `--passes 2`, where the first row had not
 finished faulting the 3.4 GB mapping in; it is omitted rather than reported wrong.
 
-Twelve query threads give 6.7× (float) and 8.2× (int8) over one. Zvec's chart for the same
-configuration reads as roughly 8–9 thousand QPS at recall@100 ≈ 0.93–0.94 on 16 vCPUs; the
-exact values are only published as an image, so treat that as approximate. Per core, the int8
-row at efSearch 180 (6,841 QPS / 12 cores) is in the same range, on different hardware, a
-different OS and a different day — which is as far as the comparison honestly goes. What the
-table does show without caveats is Qvec's own shape: int8 is 1.8× the float QPS at the same
-efSearch but loses 1.6 pp recall@100 at 180 and plateaus around 95 %, so a float refiner
-(`quantization-rescoring`) is the lever that would make the int8 row competitive on recall.
+The float and int8 rows were measured a few days before the rescored ones. Re-querying those two
+kept indexes on the rescored run's day gave 6,409 / 3,713 / 2,200 QPS (float) and 12,539 /
+7,256 / 4,377 QPS (int8) at 12 threads, within 6 % of the table, so the three modes can be read
+against each other.
+
+Twelve query threads give 6.7× (float), 8.2× (int8) and 9–11× (rescored) over one. Zvec's
+chart for the same configuration reads as roughly 8–9 thousand QPS at recall@100 ≈ 0.93–0.94
+on 16 vCPUs; the exact values are only published as an image, so treat that as approximate. Per
+core, the int8 rows at efSearch 180 (6.8 thousand QPS / 12 cores) are in the same range, on
+different hardware, a different OS and a different day — which is as far as the comparison
+honestly goes.
+
+What the table shows without caveats is Qvec's own shape. Plain int8 is 1.8× the float QPS at
+the same efSearch but loses 1.6 pp recall@100 at 180 and plateaus around 95 %. Rescored int8
+([design doc](../docs/design-quantization-rescoring.md)) walks the same int8 graph and then
+re-ranks the `efSearch` candidates on the floats: at 180 and 320 it returns float recall
+(94.7 / 97.4 %) at 99 % and 82 % of the int8 QPS, i.e. 1.8× the float QPS with no recall loss,
+and the build is 2.5× faster than float. The costs are a file 22 % larger than float, and no
+recall gain at all when `efSearch == k` (the 100 row): re-ranking reorders the candidate set
+but cannot add to it, so there the row is bounded by what the int8 walk found.
 
 Measuring this uncovered a scaling bug in the search path, fixed on the same branch. Result
 materialisation read the Guid and metadata of every hit through `MemoryMappedViewAccessor`,

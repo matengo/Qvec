@@ -10,9 +10,11 @@ namespace Qvec.Core
     /// header; every later open adopts whatever the file says.
     /// </summary>
     /// <remarks>
-    /// The numeric values are the header's <c>QuantizationMode</c> field, so they must not be
-    /// renumbered. Mode 1 (one scale for the whole dataset) is reserved in the format but not
-    /// implemented, which is why the enum skips it.
+    /// <see cref="None"/> and <see cref="Int8"/> equal the header's <c>QuantizationMode</c>
+    /// field, so they must not be renumbered. Mode 1 (one scale for the whole dataset) is
+    /// reserved in the format but not implemented, which is why the enum skips it.
+    /// <see cref="Int8Rescored"/> is an API-level value: on disk it is mode 2 plus an optional
+    /// float <c>Vectors</c> section, so a reader that predates it opens the file as plain int8.
     /// </remarks>
     public enum VectorQuantization : uint
     {
@@ -25,6 +27,14 @@ namespace Qvec.Core
         /// <see cref="QvecDatabase.GetByGuid"/> returns the dequantised vector, not the original.
         /// </summary>
         Int8 = 2,
+
+        /// <summary>
+        /// Int8 codes drive the graph walk exactly as in <see cref="Int8"/>, but the original
+        /// floats are kept as well and the <c>efSearch</c> candidates are re-ranked against them,
+        /// so returned scores and top-k are the float ones. Costs float storage plus roughly a
+        /// quarter on top; buys int8 build and walk speed with float recall.
+        /// </summary>
+        Int8Rescored = 3,
     }
 }
 

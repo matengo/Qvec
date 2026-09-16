@@ -738,6 +738,9 @@ Viktigt: sparse påverkar fysisk allokering, inte den logiska `FileInfo.Length`.
 
 v4 reserverade formatkrokar utan att designa algoritmen. Mode `2` (`Int8ScalarPerVector`) är
 sedan implementerad utan versionsbump; se [design-quantization-int8.md](design-quantization-int8.md).
+Rescoring (`Int8Rescored` i API:t) är mode `2` plus en optional, icke-`Required` sektion 1
+(`Vectors`) i slot 8 med `HasOptionalSections` satt; se
+[design-quantization-rescoring.md](design-quantization-rescoring.md).
 
 Headerfält:
 

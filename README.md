@@ -18,6 +18,7 @@ Unlike client-server vector DBs, Qvec runs in-process, using **MemoryMappedFiles
 *   **Three Distance Metrics:** `DotProduct`, `Cosine` and `Euclidean` (L2). Cosine normalizes stored copies; the other two store vectors untouched. Euclidean is the metric most image and audio embeddings — and every published ANN benchmark corpus — are defined against.
 *   **Hardware-Accelerated Math:** Uses .NET vector APIs and unsafe pointer paths for SIMD-friendly scoring.
 *   **Optional int8 Scalar Quantization:** Pass `quantization: VectorQuantization.Int8` to store one byte per dimension instead of four (plus 16 bytes of per-vector scale/offset). Scoring runs on the bytes with a widening SIMD integer kernel, so queries get faster as well as smaller. Float mode is untouched and byte-for-byte identical to before. See [docs/design-quantization-int8.md](docs/design-quantization-int8.md) for the accuracy trade-off.
+*   **int8 with Float Rescoring:** `VectorQuantization.Int8Rescored` builds and walks the graph on int8 but keeps the floats and re-ranks the `efSearch` candidates on them, so you get float recall and exact scores at roughly int8 speed. Costs ~1.25× float storage. See [docs/design-quantization-rescoring.md](docs/design-quantization-rescoring.md).
 *   **Reproducible Index Builds:** HNSW layer assignment is randomized by default, so two builds of the same data normally produce different graphs. Pass `indexSeed:` to pin it — necessary for benchmarks and recall regression tests to be re-derivable. (Multi-threaded `AddEntries` builds keep the seeded layers but not the link order, so they are not byte-reproducible.)
 *   **Parallel Bulk Loading:** `AddEntries` inserts a batch with every core linking nodes into the graph at once — hnswlib-style striped node locks, one write lock for the whole batch. 6.3× faster than one-by-one `AddEntry` on 12 cores at a cost of ~0.1 pp recall. See [docs/design-insert-parallel.md](docs/design-insert-parallel.md).
 *   **Guid Document IDs:** `AddEntry` returns a stable `Guid` document identifier; external IDs can be supplied for deduplication and sync scenarios.
@@ -58,8 +59,9 @@ The configuration Zvec publishes for Cohere 1M (768 dims, cosine, recall@100, `M
 | --- | ---: | ---: | ---: | ---: | ---: |
 | float | 419 s | 3,376 MiB | 94.8 % | 565 | 3,764 |
 | int8 | 181 s | 1,194 MiB | 93.2 % | 839 | 6,841 |
+| int8 rescored | 170 s | 4,124 MiB | 94.7 % | 630 | 6,778 |
 
-The full sweep, the single-threaded rows and what can and cannot be read into a comparison with Zvec's 16-vCPU figures are in [benchmarks/README.md](benchmarks/README.md#cohere-1m-measured).
+Rescored int8 walks the int8 graph and re-ranks the candidates on the floats: float recall at int8 throughput, paid for in storage. It cannot help when `efSearch == k`, since re-ranking reorders the candidate set but does not add to it. The full sweep, the single-threaded rows and what can and cannot be read into a comparison with Zvec's 16-vCPU figures are in [benchmarks/README.md](benchmarks/README.md#cohere-1m-measured).
 
 ### int8 quantization on siftsmall
 
@@ -74,7 +76,7 @@ Same code, `--dataset siftsmall` (10,000 vectors, 128 dimensions, 100 queries), 
 | float | 160 | 100.0 % | 3,689 | |
 | int8 | 160 | 99.3 % | 4,453 | |
 
-The vector section shrinks 4× (5.1 → 1.3 MiB); the rest of the file is the HNSW graph, which quantization does not touch, so total file size drops less than 4×. int8 recall plateaus below float — 99.3 % here — because the ranking is done on the quantized codes and the floats are not kept for rescoring. SIFT descriptors are natively 8-bit so this is close to a best case; on tight clusters under `Cosine` the loss is larger (see the design doc).
+The vector section shrinks 4× (5.1 → 1.3 MiB); the rest of the file is the HNSW graph, which quantization does not touch, so total file size drops less than 4×. int8 recall plateaus below float — 99.3 % here — because the ranking is done on the quantized codes and the floats are not kept for rescoring; `Int8Rescored` keeps them and closes that gap (99.8 % recall@10 at efSearch 80 on the same dataset, above float's 99.5 %). SIFT descriptors are natively 8-bit so this is close to a best case; on tight clusters under `Cosine` the loss is larger (see the design doc).
 
 > **Note on the previous numbers.** Earlier versions of this README reported "~85% recall@1 at efSearch=50", measured on randomly generated uniform vectors and scored against Qvec's own linear scan. That figure understated real-world behaviour substantially: in high dimensions uniform random vectors are all roughly equidistant, which is an artificially hard case that no real embedding model produces.
 
@@ -330,7 +332,7 @@ Planned cloud work is tracked in design documents and the roadmap below.
 ## 📜 Roadmap / Not yet implemented
 
 - **Storage format v5** — The on-disk format is self-describing (magic, version, CRC-32 over the header, a section table, and a `WriteInProgress` flag). There is **no migration** from earlier formats; older files are rejected with `QvecFormatException`.
-- **int8 scalar quantization** — ✅ Done. `quantization: VectorQuantization.Int8` stores one byte per dimension and scores on integers. Not done: keeping the floats alongside for exact rescoring of the final top-k, which is what closes the remaining recall gap.
+- **int8 scalar quantization** — ✅ Done. `quantization: VectorQuantization.Int8` stores one byte per dimension and scores on integers. `VectorQuantization.Int8Rescored` additionally keeps the floats and re-ranks the candidates on them, closing the recall gap at ~1.25× float storage.
 - **Sync Engine** — Opt-in edge-cloud synchronization. Connect multiple local Qvec databases to a central sync server so connected instances can stay in sync automatically. The current design discusses Azure Append Blob and Azure Web PubSub, but this is not implemented. See [design doc](docs/design-sync-engine.md).
 - **Azure Blob Storage and Managed Identity integration** — Planned as part of the sync/cloud work; no Azure SDK dependency is shipped today.
 - **Container packaging** — A `Dockerfile` for `Qvec.Api` is included. Chiseled base images are not used yet.
