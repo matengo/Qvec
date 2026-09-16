@@ -38,10 +38,9 @@ insert-grafen och sökningen ser exakt samma avstånd.
 
 ## Vad som *inte* gjordes
 
-- **Ingen rescoring.** Floats sparas inte, så top-k kan inte omrankas exakt. Det är det som
-  lämnar recall-gapet nedan. Att spara floats i en extra optional sektion (`Vectors` bredvid
-  `QuantizedVectors`) och omranka de sista `k` kandidaterna är en naturlig påbyggnad och
-  kräver ingen headerändring.
+- **Ingen rescoring i detta läge.** Floats sparas inte, så top-k kan inte omrankas exakt.
+  Det är det som lämnar recall-gapet nedan. Det är löst i det separata läget
+  `Int8Rescored`, se [design-quantization-rescoring.md](design-quantization-rescoring.md).
 - **Ingen per-dataset-skalning** (`QuantizationMode = 1`). Reserverad, avvisas.
 - **Ingen migrering** float → int8 i samma fil. Skapa en ny databas och läs in.
 - `GetByGuid`/`GetVector` returnerar den dekvantiserade approximationen, inte originalet.
