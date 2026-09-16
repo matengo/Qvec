@@ -6,6 +6,7 @@ using System.Numerics;
 using System.Runtime.InteropServices;
 using System.Text;
 using Qvec.Core.Format;
+using Qvec.Core.Quantization;
 
 namespace Qvec.Core
 {
@@ -48,6 +49,10 @@ namespace Qvec.Core
         private const int MetadataDescriptorSize = 16;
         private const int GuidSize = 16;
         private long _vectorSectionOffset;
+        /// <summary>Offset of section 10 (per-vector int8 parameters); only meaningful when <see cref="_quantized"/>.</summary>
+        private long _quantParamsSectionOffset;
+        /// <summary>True when vectors live as byte codes in section 8 instead of floats in section 1.</summary>
+        private bool _quantized;
         private long _graphSectionOffset;
         private long _metadataSectionOffset;
         private long _metadataHeapOffset;
@@ -74,8 +79,13 @@ namespace Qvec.Core
         /// seed makes index construction reproducible, which is what benchmarks and recall
         /// regression tests need in order to be re-derivable.
         /// </param>
-        public QvecDatabase(string path, int dim = 1536, int max = 1000, int maxNeighbors = 32, int maxLayers = 5, DistanceFunction distanceFunction = DistanceFunction.DotProduct, int? indexSeed = null)
-            : this(path, dim, max, maxNeighbors, maxLayers, distanceFunction, honourHeaderSilently: false, indexSeed: indexSeed)
+        /// <param name="quantization">
+        /// How vectors are stored. <see cref="VectorQuantization.Int8"/> cuts vector storage to
+        /// roughly a quarter at the cost of approximate scores. Recorded in the file header, so
+        /// a reopen must pass the same value (or use <see cref="Open(string)"/>).
+        /// </param>
+        public QvecDatabase(string path, int dim = 1536, int max = 1000, int maxNeighbors = 32, int maxLayers = 5, DistanceFunction distanceFunction = DistanceFunction.DotProduct, int? indexSeed = null, VectorQuantization quantization = VectorQuantization.None)
+            : this(path, dim, max, maxNeighbors, maxLayers, distanceFunction, honourHeaderSilently: false, indexSeed: indexSeed, quantization: quantization)
         {
         }
 
@@ -97,7 +107,7 @@ namespace Qvec.Core
 
         private QvecDatabase(string path, int dim, int max, int maxNeighbors, int maxLayers,
                              DistanceFunction distanceFunction, bool honourHeaderSilently,
-                             int? indexSeed = null)
+                             int? indexSeed = null, VectorQuantization quantization = VectorQuantization.None)
         {
             _layerRng = indexSeed is int seed ? new Random(seed) : null;
             ArgumentException.ThrowIfNullOrWhiteSpace(path);
@@ -122,7 +132,7 @@ namespace Qvec.Core
 
                 if (!honourHeaderSilently)
                 {
-                    EnsureHeaderMatchesRequest(path, _header, dim, max, maxNeighbors, maxLayers, distanceFunction);
+                    EnsureHeaderMatchesRequest(path, _header, dim, max, maxNeighbors, maxLayers, distanceFunction, quantization);
                 }
             }
             else
@@ -132,7 +142,8 @@ namespace Qvec.Core
                 _header = QvecFormatLayout.CreateInitial(
                     dim, max, maxNeighbors, maxLayers,
                     QvecFormatLayout.RecommendMetadataHeapCapacity(max),
-                    distanceFunction);
+                    distanceFunction,
+                    quantization);
             }
 
             // From here on, only header values are used. Never the constructor arguments.
@@ -230,7 +241,8 @@ namespace Qvec.Core
         /// </summary>
         private static void EnsureHeaderMatchesRequest(
             string path, V4Header header,
-            int dim, int max, int maxNeighbors, int maxLayers, DistanceFunction distanceFunction)
+            int dim, int max, int maxNeighbors, int maxLayers, DistanceFunction distanceFunction,
+            VectorQuantization quantization)
         {
             static string Describe(string name, int stored, int requested)
                 => $"{name}: file has {stored}, caller requested {requested}";
@@ -243,6 +255,8 @@ namespace Qvec.Core
             if (header.MaxLayers != maxLayers) mismatches.Add(Describe("maxLayers", header.MaxLayers, maxLayers));
             if (header.DistanceFunction != distanceFunction)
                 mismatches.Add($"distanceFunction: file has {header.DistanceFunction}, caller requested {distanceFunction}");
+            if (header.QuantizationMode != (int)quantization)
+                mismatches.Add($"quantization: file has {(VectorQuantization)header.QuantizationMode}, caller requested {quantization}");
 
             if (mismatches.Count > 0)
             {
@@ -368,6 +382,9 @@ namespace Qvec.Core
 
         /// <summary>The distance function this database was created with, read from its header.</summary>
         public DistanceFunction DistanceFunction => _header.DistanceFunction;
+
+        /// <summary>How vectors are stored on disk, read from the header.</summary>
+        public VectorQuantization Quantization => (VectorQuantization)_header.QuantizationMode;
 
         /// <summary>Maximalt antal poster databasen kan rymma.</summary>
         public int MaxCount => _header.MaxCount;
@@ -519,15 +536,10 @@ namespace Qvec.Core
 
         /// <summary>
         /// The single place that decides what "closer" means. Every scoring call site goes
-        /// through here or through its span/pointer siblings, so adding a metric is a change
+        /// through here or through its pointer sibling, so adding a metric is a change
         /// in one switch rather than in a dozen scattered loops.
         /// Higher is always better, whichever metric is configured.
         /// </summary>
-        private float Similarity(float[] query, float[] stored, int count) =>
-            _header.DistanceFunction == DistanceFunction.Euclidean
-                ? NegativeSquaredDistance(query, stored, count)
-                : DotProduct(query, stored, count);
-
         private float Similarity(ReadOnlySpan<float> query, ReadOnlySpan<float> stored) =>
             _header.DistanceFunction == DistanceFunction.Euclidean
                 ? NegativeSquaredDistance(query, stored)
@@ -642,7 +654,8 @@ namespace Qvec.Core
                         _header.MaxCount,
                         _header.MaxNeighbors,
                         _header.MaxLayers,
-                        _header.DistanceFunction))
+                        _header.DistanceFunction,
+                        quantization: Quantization))
                     {
                         foreach (var entry in live)
                         {
@@ -700,7 +713,17 @@ namespace Qvec.Core
         /// </summary>
         private void CaptureSectionOffsets()
         {
-            _vectorSectionOffset = _header.GetRequiredSection(V4SectionIds.Vectors).Offset;
+            _quantized = _header.QuantizationMode != 0;
+            if (_quantized)
+            {
+                _vectorSectionOffset = _header.GetRequiredSection(V4SectionIds.QuantizedVectors).Offset;
+                _quantParamsSectionOffset = _header.GetRequiredSection(V4SectionIds.QuantizationVectorParameters).Offset;
+            }
+            else
+            {
+                _vectorSectionOffset = _header.GetRequiredSection(V4SectionIds.Vectors).Offset;
+                _quantParamsSectionOffset = 0;
+            }
             _graphSectionOffset = _header.GetRequiredSection(V4SectionIds.Graph).Offset;
             _metadataSectionOffset = _header.GetRequiredSection(V4SectionIds.MetadataDescriptors).Offset;
             _metadataHeapOffset = _header.GetRequiredSection(V4SectionIds.MetadataHeap).Offset;
@@ -984,15 +1007,23 @@ namespace Qvec.Core
             }
             finally { _lock.ExitWriteLock(); }
         }
-        private void WriteVectorToDisk(int index, float[] vector)
+        private unsafe void WriteVectorToDisk(int index, float[] vector)
         {
             BeginWrite();
-            // Beräkna offset: Hoppa över Header, sedan alla tidigare vektorer
-            long offset = _vectorSectionOffset + (long)index * _header.VectorDimension * sizeof(float);
+            int dim = _header.VectorDimension;
 
-            // Vi skriver arrayen direkt till den mappade vyn
-            // offset - HeaderSize eftersom _dataAccessor startar efter headern
-            _dataAccessor.WriteArray(offset - HeaderSize, vector, 0, _header.VectorDimension);
+            if (_quantized)
+            {
+                var parameters = Int8Quantizer.Quantize(vector.AsSpan(0, dim), new Span<byte>(CodesPointer(index), dim));
+                parameters.WriteTo(new Span<byte>(ParamsPointer(index), Int8VectorParameters.Size));
+                return;
+            }
+
+            long bytes = (long)dim * sizeof(float);
+            fixed (float* source = vector)
+            {
+                Buffer.MemoryCopy(source, VectorPointer(index), bytes, bytes);
+            }
         }
         private void WriteMetadataToDisk(int index, string metadata)
         {
@@ -1258,25 +1289,13 @@ namespace Qvec.Core
             _lock.EnterReadLock();
             try
             {
-                query = PrepareVector(query);
+                var prepared = Prepare(query);
 
                 var scored = new List<(int Index, float Score)>(candidates.Count);
-                float[] v = ArrayPool<float>.Shared.Rent(_header.VectorDimension);
-                try
+                foreach (int i in candidates)
                 {
-                    foreach (int i in candidates)
-                    {
-                        if (_deletedIndices.Contains(i)) continue;
-
-                        long offset = (long)i * _header.VectorDimension * sizeof(float);
-                        _dataAccessor.ReadArray(offset, v, 0, _header.VectorDimension);
-                        float score = Similarity(query, v, _header.VectorDimension);
-                        scored.Add((i, score));
-                    }
-                }
-                finally
-                {
-                    ArrayPool<float>.Shared.Return(v);
+                    if (_deletedIndices.Contains(i)) continue;
+                    scored.Add((i, CalculateScore(prepared, i)));
                 }
 
                 return scored
@@ -1367,7 +1386,7 @@ namespace Qvec.Core
             {
                 if (IsEffectivelyEmpty) return new List<(Guid, float, string)>();
 
-                query = PrepareVector(query);
+                var prepared = Prepare(query);
 
                 var candidates = new List<(int Index, float Score)>();
                 for (int i = 0; i < _header.CurrentCount; i++)
@@ -1376,17 +1395,7 @@ namespace Qvec.Core
                     string meta = GetMetadata(i);
                     if (filter != null && !filter(meta)) continue;
 
-                    float[] v = ArrayPool<float>.Shared.Rent(_header.VectorDimension);
-                    try
-                    {
-                        _dataAccessor.ReadArray((long)i * _header.VectorDimension * sizeof(float), v, 0, _header.VectorDimension);
-                        float score = Similarity(query, v, _header.VectorDimension);
-                        candidates.Add((i, score));
-                    }
-                    finally
-                    {
-                        ArrayPool<float>.Shared.Return(v);
-                    }
+                    candidates.Add((i, CalculateScore(prepared, i)));
                 }
 
                 return candidates.OrderByDescending(c => c.Score)
@@ -1423,49 +1432,32 @@ namespace Qvec.Core
         {
             if (IsEffectivelyEmpty) return new List<(Guid, float, string)>();
 
-            query = PrepareVector(query);
+            var prepared = Prepare(query);
 
             int count = _header.CurrentCount;
-            int dim = _header.VectorDimension;
 
             var partialResults = new (int Index, float Score)[count];
 
-            byte* basePtr = null;
-            _dataAccessor.SafeMemoryMappedViewHandle.AcquirePointer(ref basePtr);
+            // Force the lazily acquired base pointer before fanning out: the first access
+            // initialises a shared field and is not safe to race.
+            _ = DataBasePointer;
 
-            try
+            Parallel.For(0, count, i =>
             {
-                basePtr += _dataAccessor.PointerOffset;
-
-                // The vector section does not necessarily start at the beginning of the data
-                // accessor. It happens to today, which is exactly why omitting this term was a
-                // latent bug rather than a visible one.
-                float* vectorBasePtr = (float*)(basePtr + (_vectorSectionOffset - HeaderSize));
-
-                Parallel.For(0, count, i =>
+                if (_deletedIndices.Contains(i))
                 {
-                    if (_deletedIndices.Contains(i))
-                    {
-                        partialResults[i] = (i, float.MinValue);
-                        return;
-                    }
-                    string meta = GetMetadata(i);
-                    if (filter != null && !filter(meta))
-                    {
-                        partialResults[i] = (i, float.MinValue);
-                        return;
-                    }
+                    partialResults[i] = (i, float.MinValue);
+                    return;
+                }
+                string meta = GetMetadata(i);
+                if (filter != null && !filter(meta))
+                {
+                    partialResults[i] = (i, float.MinValue);
+                    return;
+                }
 
-                    float* currentVecPtr = vectorBasePtr + (i * dim);
-
-                    float score = SimilarityUnsafe(query, currentVecPtr, dim);
-                    partialResults[i] = (i, score);
-                });
-            }
-            finally
-            {
-                _dataAccessor.SafeMemoryMappedViewHandle.ReleasePointer();
-            }
+                partialResults[i] = (i, CalculateScore(prepared, i));
+            });
 
             return partialResults
                 .Where(r => r.Score > float.MinValue)
@@ -1493,14 +1485,14 @@ namespace Qvec.Core
             {
                 if (IsEffectivelyEmpty) return new List<(Guid, float, string)>();
 
-                query = PrepareVector(query);
+                var prepared = Prepare(query);
 
                 int entryPoint = ResolveEntryPoint();
                 if (entryPoint < 0) return new List<(Guid, float, string)>();
 
                 for (int level = _header.EntryPointLevel; level >= 1; level--)
                 {
-                    entryPoint = GreedyClosest(query, entryPoint, level);
+                    entryPoint = GreedyClosest(prepared, entryPoint, level);
                 }
 
                 int liveCount = LiveCount;
@@ -1513,7 +1505,7 @@ namespace Qvec.Core
                 int visitBudget = Math.Min(liveCount, Math.Max(ef * 16, 1024));
 
                 var nearest = SearchLayerFiltered(
-                    query, entryPoint, 0, ef, filter, visitBudget, out _);
+                    prepared, entryPoint, 0, ef, filter, visitBudget, out _);
 
                 var matches = nearest
                     .OrderByDescending(r => r.Score)
@@ -1529,7 +1521,7 @@ namespace Qvec.Core
                 // cheaply, and under-returning silently is the worse failure, so fall back to an
                 // exact scan. This only costs O(N) when the filter really does match fewer than
                 // topK reachable entries.
-                return ExhaustiveFilteredSearch(query, filter, topK);
+                return ExhaustiveFilteredSearch(prepared, filter, topK);
             }
             finally { _lock.ExitReadLock(); }
         }
@@ -1549,7 +1541,7 @@ namespace Qvec.Core
         /// The caller must already hold the read lock and have prepared the query vector.
         /// </summary>
         private List<(Guid Id, float Score, string Metadata)> ExhaustiveFilteredSearch(
-            float[] query, Func<string, bool> filter, int topK)
+            PreparedQuery query, Func<string, bool> filter, int topK)
         {
             Interlocked.Increment(ref _filteredFallbackCount);
 
@@ -1562,15 +1554,7 @@ namespace Qvec.Core
                 string meta = GetMetadata(i);
                 if (!filter(meta)) continue;
 
-                float[] vector = GetVector(i);
-                try
-                {
-                    matches.Add((i, Similarity(query, vector, _header.VectorDimension), meta));
-                }
-                finally
-                {
-                    ArrayPool<float>.Shared.Return(vector);
-                }
+                matches.Add((i, CalculateScore(query, i), meta));
             }
 
             return matches.OrderByDescending(m => m.Score)
@@ -1597,18 +1581,18 @@ namespace Qvec.Core
             {
                 if (IsEffectivelyEmpty) return new List<(Guid, float, string)>();
 
-                query = PrepareVector(query);
+                var prepared = Prepare(query);
 
                 int entryPoint = ResolveEntryPoint();
                 if (entryPoint < 0) return new List<(Guid, float, string)>();
 
                 for (int level = _header.EntryPointLevel; level >= 1; level--)
                 {
-                    entryPoint = GreedyClosest(query, entryPoint, level);
+                    entryPoint = GreedyClosest(prepared, entryPoint, level);
                 }
 
                 int ef = Math.Max(topK, efSearch);
-                var nearest = SearchLayerNearest(query, entryPoint, 0, ef);
+                var nearest = SearchLayerNearest(prepared, entryPoint, 0, ef);
 
                 return nearest
                     .OrderByDescending(r => r.Score)
@@ -1627,14 +1611,15 @@ namespace Qvec.Core
         {
             int currentElement = ResolveEntryPoint();
             if (currentElement < 0 || currentElement == newIndex) return false;
+            var query = StoredQuery(newIndex, newVector);
             for (int level = _header.EntryPointLevel; level > newLevel; level--)
             {
-                currentElement = GreedyClosest(newVector, currentElement, level);
+                currentElement = GreedyClosest(query, currentElement, level);
             }
 
             for (int level = Math.Min(newLevel, _header.MaxLayers - 1); level >= 0; level--)
             {
-                var candidates = SearchLayerNearest(newVector, currentElement, level, EfConstruction, _insertScratch);
+                var candidates = SearchLayerNearest(query, currentElement, level, EfConstruction, _insertScratch);
                 var nearest = SelectNeighborsHeuristic(candidates, NeighborsAtLevel(level));
 
                 WriteNeighborsAtLevel(newIndex, level, nearest);
@@ -1642,7 +1627,7 @@ namespace Qvec.Core
                 foreach (var (neighborId, _) in nearest)
                 {
                     if (neighborId < 0) break;
-                    AddNeighborConnection(neighborId, level, newIndex, newVector);
+                    AddNeighborConnection(neighborId, level, newIndex);
                 }
 
                 if (candidates.Length > 0 && candidates[0].Id >= 0)
@@ -1695,13 +1680,12 @@ namespace Qvec.Core
             for (int i = 0; i < ordered.Length && selected.Count < m; i++)
             {
                 var candidate = ordered[i];
-                var candidateVector = StoredVector(candidate.Id);
 
                 bool closerToOwnerThanToNeighbours = true;
                 foreach (var (selectedId, _) in selected)
                 {
                     // Score is a similarity: higher means closer.
-                    if (Similarity(candidateVector, StoredVector(selectedId)) > candidate.Score)
+                    if (StoredSimilarity(candidate.Id, selectedId) > candidate.Score)
                     {
                         closerToOwnerThanToNeighbours = false;
                         break;
@@ -1721,7 +1705,7 @@ namespace Qvec.Core
 
             return selected.ToArray();
         }
-        private int GreedyClosest(float[] query, int entryPoint, int level)
+        private int GreedyClosest(PreparedQuery query, int entryPoint, int level)
         {
             int current = entryPoint;
             float currentScore = CalculateScore(query, current);
@@ -1791,7 +1775,7 @@ namespace Qvec.Core
 
         private readonly InsertScratch _insertScratch = new();
 
-        private (int Id, float Score)[] SearchLayerNearest(float[] query, int entryPoint, int level, int ef, InsertScratch? scratch = null)
+        private (int Id, float Score)[] SearchLayerNearest(PreparedQuery query, int entryPoint, int level, int ef, InsertScratch? scratch = null)
         {
             HashSet<int>? visitedSet = null;
             PriorityQueue<int, float> candidates;
@@ -1887,7 +1871,7 @@ namespace Qvec.Core
         /// </para>
         /// </remarks>
         private (int Id, float Score, string Meta)[] SearchLayerFiltered(
-            float[] query, int entryPoint, int level, int ef,
+            PreparedQuery query, int entryPoint, int level, int ef,
             Func<string, bool> filter, int visitBudget, out bool budgetExhausted)
         {
             budgetExhausted = false;
@@ -1999,7 +1983,7 @@ namespace Qvec.Core
         /// leaving whole groups of entries with outgoing edges only — unreachable from the
         /// entry point, and therefore invisible to search.
         /// </summary>
-        private void AddNeighborConnection(int existingNode, int level, int newNode, float[] newVector)
+        private void AddNeighborConnection(int existingNode, int level, int newNode)
         {
             int slots = NeighborsAtLevel(level);
             int[] neighbors = ArrayPool<int>.Shared.Rent(slots);
@@ -2022,15 +2006,13 @@ namespace Qvec.Core
                 // The list is full: re-run the selection heuristic over the existing neighbours
                 // plus the new node, all read in place from the mapped file. The new node's
                 // vector is already on disk at this point, so it needs no special casing.
-                int dim = _header.VectorDimension;
                 int candidateCount = slots + 1;
                 var candidates = new (int Id, float Score)[candidateCount];
-                var existingVector = StoredVector(existingNode);
 
                 for (int i = 0; i < slots; i++)
-                    candidates[i] = (neighbors[i], Similarity(existingVector, StoredVector(neighbors[i])));
+                    candidates[i] = (neighbors[i], StoredSimilarity(existingNode, neighbors[i]));
 
-                candidates[slots] = (newNode, Similarity(existingVector, newVector.AsSpan(0, dim)));
+                candidates[slots] = (newNode, StoredSimilarity(existingNode, newNode));
 
                 // Sorted by descending similarity for the pruning pass. Array.Sort runs the same
                 // introsort over the same comparison outcomes as the index-array sort it
@@ -2098,8 +2080,88 @@ namespace Qvec.Core
             int level = (int)(-Math.Log(r) * _header.LayerProbability);
             return Math.Min(level, _header.MaxLayers - 1);
         }
-        private unsafe float CalculateScore(float[] query, int targetIndex)
-            => SimilarityUnsafe(query, VectorPointer(targetIndex), _header.VectorDimension);
+        /// <summary>
+        /// A query vector in whatever form the stored rows can be scored against directly:
+        /// prepared floats for a float database, byte codes plus parameters for an int8 one.
+        /// Built once per search or insert so the per-candidate scoring loop never re-quantises.
+        /// </summary>
+        private sealed class PreparedQuery
+        {
+            public float[] Floats = Array.Empty<float>();
+            public byte[]? Codes;
+            public Int8VectorParameters Parameters;
+        }
+
+        private PreparedQuery Prepare(float[] query)
+        {
+            var prepared = new PreparedQuery { Floats = PrepareVector(query) };
+            if (_quantized)
+            {
+                prepared.Codes = new byte[_header.VectorDimension];
+                prepared.Parameters = Int8Quantizer.Quantize(prepared.Floats.AsSpan(0, _header.VectorDimension), prepared.Codes);
+            }
+            return prepared;
+        }
+
+        /// <summary>
+        /// The query for a row that is already on disk, used when wiring a new node into the
+        /// graph. In int8 mode the stored codes are read back rather than re-quantised so the
+        /// node is scored exactly as its neighbours will later score it.
+        /// </summary>
+        private unsafe PreparedQuery StoredQuery(int index, float[] preparedFloats)
+        {
+            var prepared = new PreparedQuery { Floats = preparedFloats };
+            if (_quantized)
+            {
+                int dim = _header.VectorDimension;
+                prepared.Codes = new byte[dim];
+                new ReadOnlySpan<byte>(CodesPointer(index), dim).CopyTo(prepared.Codes);
+                prepared.Parameters = ParamsAt(index);
+            }
+            return prepared;
+        }
+
+        private unsafe float CalculateScore(PreparedQuery query, int targetIndex)
+        {
+            int dim = _header.VectorDimension;
+            if (_quantized)
+            {
+                fixed (byte* codes = query.Codes)
+                {
+                    return Int8Quantizer.Similarity(
+                        _header.DistanceFunction, codes, query.Parameters,
+                        CodesPointer(targetIndex), ParamsAt(targetIndex), dim);
+                }
+            }
+
+            return SimilarityUnsafe(query.Floats, VectorPointer(targetIndex), dim);
+        }
+
+        /// <summary>Score between two stored rows, read in place.</summary>
+        private unsafe float StoredSimilarity(int left, int right)
+        {
+            if (_quantized)
+            {
+                return Int8Quantizer.Similarity(
+                    _header.DistanceFunction,
+                    CodesPointer(left), ParamsAt(left),
+                    CodesPointer(right), ParamsAt(right),
+                    _header.VectorDimension);
+            }
+
+            return Similarity(StoredVector(left), StoredVector(right));
+        }
+
+        /// <summary>Address of a row's byte codes in section 8. Only valid when <see cref="_quantized"/>.</summary>
+        private unsafe byte* CodesPointer(int index)
+            => DataBasePointer + (_vectorSectionOffset - HeaderSize) + (long)index * _header.VectorDimension;
+
+        /// <summary>Address of a row's 16-byte parameter block in section 10. Only valid when <see cref="_quantized"/>.</summary>
+        private unsafe byte* ParamsPointer(int index)
+            => DataBasePointer + (_quantParamsSectionOffset - HeaderSize) + (long)index * Int8VectorParameters.Size;
+
+        private unsafe Int8VectorParameters ParamsAt(int index)
+            => Int8VectorParameters.ReadFrom(ParamsPointer(index));
 
         /// <summary>
         /// Address of a stored vector inside the mapped view. Scoring straight against this
@@ -2271,13 +2333,20 @@ namespace Qvec.Core
         private unsafe void ReadVectorInto(int index, float[] destination, int destinationOffset)
         {
             int dim = _header.VectorDimension;
-            long offset = _vectorSectionOffset + (long)index * dim * sizeof(float) - HeaderSize;
-            long bytes = (long)dim * sizeof(float);
 
-            byte* source = DataBasePointer + offset;
+            if (_quantized)
+            {
+                Int8Quantizer.Dequantize(
+                    new ReadOnlySpan<byte>(CodesPointer(index), dim),
+                    ParamsAt(index),
+                    destination.AsSpan(destinationOffset, dim));
+                return;
+            }
+
+            long bytes = (long)dim * sizeof(float);
             fixed (float* destPtr = &destination[destinationOffset])
             {
-                Buffer.MemoryCopy(source, destPtr, bytes, bytes);
+                Buffer.MemoryCopy(VectorPointer(index), destPtr, bytes, bytes);
             }
         }
 
@@ -2542,26 +2611,9 @@ namespace Qvec.Core
             for (int j = 0; j < survivors.Count; j++)
             {
                 int next = survivors[(j + 1) % survivors.Count];
-                float[] vector = GetVector(survivors[j]);
-                try
-                {
-                    // Both directions, since a neighbour list is not symmetric.
-                    AddNeighborConnection(next, level, survivors[j], vector);
-                }
-                finally
-                {
-                    ArrayPool<float>.Shared.Return(vector);
-                }
-
-                float[] nextVector = GetVector(next);
-                try
-                {
-                    AddNeighborConnection(survivors[j], level, next, nextVector);
-                }
-                finally
-                {
-                    ArrayPool<float>.Shared.Return(nextVector);
-                }
+                // Both directions, since a neighbour list is not symmetric.
+                AddNeighborConnection(next, level, survivors[j]);
+                AddNeighborConnection(survivors[j], level, next);
             }
         }
 

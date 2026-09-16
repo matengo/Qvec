@@ -480,6 +480,87 @@ public class V4HeaderTests
     }
 
     [Fact]
+    public void LayoutCalculator_WithInt8Quantization_StoresCodesAndParametersInsteadOfFloats()
+    {
+        var header = QvecFormatLayout.CreateInitial(
+            vectorDimension: 7,
+            maxCount: 11,
+            maxNeighbors: 5,
+            maxLayers: 3,
+            metadataHeapCapacity: 12345,
+            quantization: VectorQuantization.Int8);
+
+        Assert.Equal(2, header.QuantizationMode);
+        Assert.Equal((int)V4SectionIds.QuantizedVectors, header.QuantizationSectionId);
+        Assert.False(header.TryGetSection(V4SectionIds.Vectors, out _));
+
+        var codes = header.GetRequiredSection(V4SectionIds.QuantizedVectors);
+        Assert.Equal(7u, codes.ElementSize);
+        Assert.True(codes.Length >= 11 * 7);
+
+        var parameters = header.GetRequiredSection(V4SectionIds.QuantizationVectorParameters);
+        Assert.Equal(16u, parameters.ElementSize);
+        Assert.True(parameters.Length >= 11 * 16);
+
+        // Same shape rules as the float layout: ordered, 64-byte aligned, non-overlapping.
+        var sections = header.Sections
+            .Where(s => s.SectionId != V4SectionIds.Unused)
+            .OrderBy(s => s.Offset)
+            .ToArray();
+        Assert.Equal(8, sections.Length);
+        long previousEnd = V4Header.HeaderSizeValue;
+        foreach (var section in sections)
+        {
+            Assert.Equal(0, section.Offset % 64);
+            Assert.True(previousEnd <= section.Offset);
+            previousEnd = section.Offset + section.Length;
+        }
+        Assert.Equal(previousEnd, header.FileLength);
+
+        // And it must survive a write/read cycle through the validator.
+        var read = V4Header.Read(Write(header), header.FileLength);
+        Assert.Equal(2, read.QuantizationMode);
+        Assert.True(read.TryGetSection(V4SectionIds.QuantizedVectors, out _));
+    }
+
+    [Fact]
+    public void Read_QuantizedHeader_WithModeZero_IsRejectedBecauseFloatVectorsAreMissing()
+    {
+        var header = QvecFormatLayout.CreateInitial(4, 8, 3, 2, 4096, quantization: VectorQuantization.Int8);
+        header.QuantizationMode = 0;
+        header.QuantizationSectionId = 0;
+
+        // Mode 0 makes section 8 an unknown Required section and section 1 a missing one;
+        // whichever check fires first, the file must not open as a float database.
+        AssertThrows(header, "section id");
+    }
+
+    [Fact]
+    public void Read_QuantizedHeader_WithPerDatasetMode_IsRejectedAsReserved()
+    {
+        var header = QvecFormatLayout.CreateInitial(4, 8, 3, 2, 4096, quantization: VectorQuantization.Int8);
+        header.QuantizationMode = 1;
+
+        AssertThrows(header, "QuantizationMode");
+    }
+
+    [Theory]
+    [InlineData("QuantizedVectors ElementSize", V4SectionIds.QuantizedVectors, 1u, -1L)]
+    [InlineData("QuantizedVectors length", V4SectionIds.QuantizedVectors, 4u, 1L)]
+    [InlineData("QuantizationVectorParameters ElementSize", V4SectionIds.QuantizationVectorParameters, 8u, -1L)]
+    [InlineData("QuantizationVectorParameters length", V4SectionIds.QuantizationVectorParameters, 16u, 1L)]
+    public void Read_QuantizedHeader_WithInvalidSectionShape_ThrowsFormatException(
+        string expectedMessagePart, uint sectionId, uint elementSize, long length)
+    {
+        var header = QvecFormatLayout.CreateInitial(4, 8, 3, 2, 4096, quantization: VectorQuantization.Int8);
+        var entry = header.GetEntry(sectionId);
+        entry.ElementSize = elementSize;
+        if (length >= 0) entry.Length = length;
+
+        AssertThrows(header, expectedMessagePart);
+    }
+
+    [Fact]
     public void DirtyHeader_IsReadableAndReportsWriteInProgress()
     {
         var header = CreateValidHeader();

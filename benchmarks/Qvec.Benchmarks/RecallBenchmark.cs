@@ -92,7 +92,8 @@ public static class RecallBenchmark
             // Pinned so a published number can be re-derived. HNSW layer assignment is random by
             // default, so without this two runs of the identical command produce two different
             // graphs and recall moves by a point or two for no visible reason.
-            indexSeed: options.IndexSeed);
+            indexSeed: options.IndexSeed,
+            quantization: options.Quantization);
 
         var buildTime = BuildIndex(db, dataset, options);
 
@@ -121,6 +122,7 @@ public static class RecallBenchmark
             options.Distance,
             options.MaxNeighbors,
             options.MaxLayers,
+            options.Quantization,
             options.TopK,
             buildTime,
             fileSizeBytes,
@@ -225,6 +227,7 @@ public sealed class BenchmarkOptions
     public DistanceFunction Distance { get; init; } = DistanceFunction.Euclidean;
     public int MaxNeighbors { get; init; } = 32;
     public int MaxLayers { get; init; } = 5;
+    public VectorQuantization Quantization { get; init; } = VectorQuantization.None;
     public int TopK { get; init; } = 10;
     public int QueryCount { get; init; } = int.MaxValue;
     public int WarmupQueries { get; init; } = 100;
@@ -246,6 +249,7 @@ public sealed record BenchmarkReport(
     DistanceFunction Distance,
     int MaxNeighbors,
     int MaxLayers,
+    VectorQuantization Quantization,
     int TopK,
     TimeSpan BuildTime,
     long FileSizeBytes,
@@ -257,7 +261,7 @@ public sealed record BenchmarkReport(
         var writer = new StringWriter();
 
         writer.WriteLine($"Dataset: **{Dataset}** — {BaseCount:N0} base vectors, {Dimension} dimensions, {QueryCount:N0} queries.");
-        writer.WriteLine($"Metric: `{Distance}`. Index: `maxNeighbors = {MaxNeighbors}`, `maxLayers = {MaxLayers}`.");
+        writer.WriteLine($"Metric: `{Distance}`. Index: `maxNeighbors = {MaxNeighbors}`, `maxLayers = {MaxLayers}`, `quantization = {Quantization}`.");
         writer.WriteLine($"Build: {BuildTime.TotalSeconds:F1} s ({BaseCount / Math.Max(BuildTime.TotalSeconds, 0.001):N0} inserts/s). File: {FileSizeBytes / 1024.0 / 1024.0:F1} MiB.");
         writer.WriteLine($"Hardware: {hardware}. Single-threaded queries.");
         writer.WriteLine();

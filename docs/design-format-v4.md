@@ -736,37 +736,36 @@ Viktigt: sparse påverkar fysisk allokering, inte den logiska `FileInfo.Length`.
 
 ## Reserverat utrymme för kvantisering
 
-v4 ska reservera formatkrokar men inte designa algoritmen.
+v4 reserverade formatkrokar utan att designa algoritmen. Mode `2` (`Int8ScalarPerVector`) är
+sedan implementerad utan versionsbump; se [design-quantization-int8.md](design-quantization-int8.md).
 
 Headerfält:
 
 - `QuantizationMode`
   - `0 = None`
-  - `1 = Int8ScalarPerDataset` reserverad
-  - `2 = Int8ScalarPerVector` reserverad
+  - `1 = Int8ScalarPerDataset` reserverad, avvisas
+  - `2 = Int8ScalarPerVector` implementerad
 - `QuantizationSectionId`
   - `0` när `QuantizationMode == None`
-  - annars id för primär kvantiserad vektorsektion
+  - `8` när `QuantizationMode == 2`
 
 Section ids:
 
-- `8 = QuantizedVectors`
-- `9 = QuantizationDatasetParameters`
-- `10 = QuantizationVectorParameters`
+- `8 = QuantizedVectors` — `ElementSize = dim`, en byte per dimension
+- `9 = QuantizationDatasetParameters` — reserverad, används inte
+- `10 = QuantizationVectorParameters` — `ElementSize = 16`, `scale`/`offset`/`sumOfCodes`/`squaredNorm` per rad
 
-Regler i v4:
+Regler:
 
-- `QuantizationMode` måste vara `0`.
-- Om `QuantizationMode != 0` ska v4-reader kasta `QvecFormatException`:
+- Mode `0`: sektion `1` (`Vectors`) är required, `8` och `10` får inte vara required.
+- Mode `2`: sektion `8` och `10` är required, `1` saknas. Sektion `8` ligger i slot 0 och `10` i slot 7, övriga slots är oförändrade så grow-algoritmen behöver inte veta om mode.
+- Mode `1` eller okänt mode ger `QvecFormatException`:
 
 ```text
 '{path}' uses quantization mode {mode}, which this build reserves but does not implement.
 ```
 
-- Section ids `8..10` får finnas som optional utan `Required`, men v4 ska ignorera dem när mode är `0`.
-- Om någon av `8..10` är `Required` ska v4-reader avvisa filen som okänd/unsupported required section om implementationen inte har explicit stöd.
-
-Detta gör att en framtida v5/v4.1 kan lägga till int8-data utan att behöva ändra primary header layout igen.
+- Att öppna en fil med ett annat mode än det som begärs i konstruktorn ger `QvecFormatException` som nämner `quantization`.
 
 ---
 
