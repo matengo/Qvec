@@ -1,400 +1,322 @@
-# Design: Sync Engine — Edge-Cloud Hybrid Synchronization
+# Design: Sync Engine — replikering mellan Qvec-instanser
 
-## Vision
+Status: **design, ej implementerad**. Ersätter ett tidigare förslag (Azure Append Blob + Web PubSub + wrappande `QvecSyncAgent`) som förkastades av skälen i [avsnitt 2](#2-varför-det-tidigare-förslaget-förkastades).
 
-Qvec är och förblir en **inprocess edge-databas**. Sync Engine är ett helt separat, opt-in lager som låter flera lokala Qvec-instanser synkronisera via en central server. En lokal databas fungerar fullt autonomt utan sync — man kopplar på synkronisering när man behöver det.
+## 1. Mål och avgränsning
 
-```
-????????????     ????????????     ????????????
-?  Edge A  ?     ?  Edge B  ?     ?  Edge C  ?
-?  QvecDB  ?     ?  QvecDB  ?     ?  QvecDB  ?
-?          ?     ?          ?     ?          ?
-? SyncAgent?     ? SyncAgent?     ? SyncAgent?
-????????????     ????????????     ????????????
-     ?                ?                ?
-     ???????????????????????????????????
-             ?   Azure Web PubSub /    ?
-             ?   WebSocket / SSE       ?
-             ?                         ?
-     ?????????????????????????????????????
-     ?          Sync Server              ?
-     ?  (Azure Function / Web API)       ?
-     ?                                   ?
-     ?  ???????????????????????????????  ?
-     ?  ?  Azure Append Blob          ?  ?
-     ?  ?  (Central Event Log)        ?  ?
-     ?  ???????????????????????????????  ?
-     ?????????????????????????????????????
-```
+Qvec är och förblir en **inprocess-databas i en enda fil**. Sync är ett opt-in-lager som låter flera instanser konvergera mot samma dokumentmängd utan att någon av dem slutar fungera offline.
 
-## Principer
+Mål:
 
-1. **Opt-in** — Sync läggs till utanpå en befintlig `QvecDatabase`. Ingen ändring krävs i core.
-2. **Offline-first** — Klienten kan läsa, söka och skriva lokalt utan anslutning. Synk sker när anslutningen kommer tillbaka.
-3. **Event-sourcing** — Alla mutationer (Add, Update, Delete) loggas som events i en append-only central log.
-4. **Idempotent apply** — Events identifieras via Guid. Samma event kan appliceras flera gånger utan dubbletter.
-5. **Delta-sync** — Klienter laddar bara ner data som tillkommit sedan senaste synkpunkten (offset-baserat).
+- **Fånga alla skrivningar i kärnan.** `AddEntry`, `AddEntries`, `UpdateVector`, `UpdateMetadata`, `Update`, `Delete` och `Vacuum` ska alla spåras, oavsett vilken väg appen tog. Inget "skriv via agenten annars synkas det inte".
+- **Offline-first.** Skrivningar och sökningar sker alltid lokalt. Sync körs när det finns en peer att nå.
+- **Deterministisk konfliktlösning** som inte beror på nätverkets ankomstordning eller på synkade klockor.
+- **Transport-agnostisk.** Samma kärnmekanism ska fungera mot en mapp/SMB-share, ett objektlager (Azure Blob, S3) och en HTTP-hubb (`Qvec.Api`). Inget molnberoende i `Qvec.Core` eller `Qvec.Sync`.
+- **Bootstrap utan omindexering.** En ny nod ska kunna starta från en kopia av `.qvec`-filen (inkl. HNSW-graf) istället för att spela upp historik och bygga om grafen.
+- **AOT-ren.** Inget reflection-baserat serialiseringsformat på trådens väg.
 
-## Beroenden
+Icke-mål (v1):
 
-- [Guid som dokument-ID](design-guid-id.md) — Krävs för dedup vid synk.
-- [Update & Delete](design-update-delete.md) — Krävs för att kunna applicera remote-events lokalt.
+- Per-fält-merge av metadata. Dokumentet är atomen.
+- Realtid under 100 ms. Pollning på sekundnivå räcker; push är en optimering på transportnivå.
+- Multi-master med kausala garantier. Vi lovar *konvergens* (alla replikor landar i samma tillstånd), inte att alla mellanliggande tillstånd är synliga.
+- Kryptering/signering av loggsegment. Lagrets egen åtkomstkontroll antas räcka i v1.
 
----
+## 2. Varför det tidigare förslaget förkastades
 
-## Arkitektur
+| Brist | Konsekvens |
+|---|---|
+| Sync bara via `QvecSyncAgent.AddEntryAsync` m.fl. | Ett `db.AddEntry` direkt mot databasen synkas tyst inte. Divergens som är svår att upptäcka. |
+| Byte-offset i en global Append Blob som cursor | Kan inte komprimeras, 50 000-blockstak, ny klient måste spela upp *all* historik inkl. raderade dokument (~6,7 GB för 1M × 1536-dim). |
+| Ingen version per dokument | LWW avgörs av serverns ankomstordning. En klient som var offline och uppdaterade doc X lokalt får sin nyare ändring överskriven av en äldre remote-ändring den hämtar senare. |
+| Utgående kö i minnet | Krasch mellan lokal skrivning och sändning tappar ändringen permanent. |
+| Azure Functions + Append Blob + Web PubSub som enda väg | Molnlåsning i ett bibliotek vars poäng är "ingen server". |
+| Ingen snapshot-väg | HNSW byggs om på varje ny nod (170 s @ 1M på referensmaskinen) trots att filen redan är självbärande. |
 
-### Sync Event Format
+Gemensam nämnare: **kärnan saknar replika-identitet, monoton sekvens och version per dokument**. Det är det som måste byggas först, och det är det som gör transporten utbytbar.
 
-Varje mutation serialiseras som ett binärt event som skrivs till Append Blob:
+## 3. Arkitektur i korthet
 
-```
-???????????????????????????????????????????????????
-? EventHeader (fast storlek)                      ?
-? ??????????????????????????????????????????????? ?
-? ? EventType   ? Guid     ? Timestamp? DataLen ? ?
-? ? (1 byte)    ? (16 B)   ? (8 B)   ? (4 B)   ? ?
-? ??????????????????????????????????????????????? ?
-? EventData (variabel)                            ?
-? ??????????????????????????????????????????????? ?
-? ? Vector (dim * 4 bytes) + Metadata (UTF-8)   ? ?
-? ??????????????????????????????????????????????? ?
-???????????????????????????????????????????????????
+```mermaid
+flowchart LR
+    subgraph Core["Qvec.Core (per replika)"]
+        DB["QvecDatabase\n+ EntryVersions\n+ ChangeLog (ring)"]
+    end
+    subgraph Sync["Qvec.Sync"]
+        Agent["SyncAgent\nloop · cursor · backoff"]
+        Peer["ISyncPeer"]
+    end
+    subgraph Transports["Transportpaket"]
+        Dir["DirectorySyncPeer\n(mapp / SMB)"]
+        Blob["Qvec.Sync.AzureBlob\n(Azure Blob / S3-kompatibelt)"]
+        Http["Qvec.Api\n/changes + SSE"]
+    end
+    DB -- "GetChanges / ApplyChanges\nExportSnapshot" --> Agent
+    Agent --> Peer
+    Peer --> Dir & Blob & Http
 ```
 
-```csharp
-public enum SyncEventType : byte
-{
-    Add = 1,
-    UpdateVector = 2,
-    UpdateMetadata = 3,
-    Delete = 4
-}
+Tre lager, tre paket:
 
-[StructLayout(LayoutKind.Sequential, Pack = 1)]
-public struct SyncEventHeader
-{
-    public SyncEventType Type;
-    public Guid DocumentId;
-    public long TimestampTicks;
-    public int DataLength;
-}
-```
+| Lager | Paket | Ansvar |
+|---|---|---|
+| Ändringsspårning | `Qvec.Core` | Version per dokument, ringlogg, `GetChanges`/`ApplyChanges`, snapshot-export. Inga nätverksberoenden. |
+| Synkloop | `Qvec.Sync` | `SyncAgent`, `ISyncPeer`, cursor-fil, wire-format, `DirectorySyncPeer`. Beroende: bara `Qvec.Core`. |
+| Transporter | `Qvec.Sync.AzureBlob`, ev. `Qvec.Api` | Konkreta peers. Isolerade så att `Qvec.Sync` förblir beroendefritt. |
 
-Event-storlek per typ:
+Topologier som faller ut utan extra kod:
 
-| EventType | Header | Data | Total (1536-dim) |
+- **Serverlös buss** — alla replikor pekar på samma mapp/blob-container. Varje replika skriver under eget prefix, läser alla andras.
+- **Hubb** — en `Qvec.Api`-instans är peer för alla; hubben är själv en fullvärdig, sökbar replika.
+- **Ledare + read replicas** — hubb där edge-noderna bara pullar. Bootstrap via snapshot ger edge en färdig HNSW-graf.
+
+## 4. Kärnan: ändringsspårning i filformatet
+
+### 4.1 Nya headerfält (i reserverat område, offset 184–511)
+
+| Fält | Typ | Offset | Beskrivning |
 |---|---|---|---|
-| Add | 29 bytes | 6144 (vektor) + metadata | ~6.7 KB |
-| UpdateVector | 29 bytes | 6144 (vektor) | ~6.2 KB |
-| UpdateMetadata | 29 bytes | metadata | ~0.5 KB |
-| Delete | 29 bytes | 0 | 29 bytes |
+| `ReplicaId` | Guid | 184 | Denna fils identitet. Sätts vid skapande; byts av `AdoptAsReplica`. |
+| `ChangeSeq` | long | 200 | Senast tilldelade lokala sekvensnummer (monotont, aldrig återanvänt). |
+| `ChangeLogHead` | long | 208 | Ringens skrivposition (record-index). |
+| `ChangeLogCount` | long | 216 | Antal giltiga records i ringen (≤ kapacitet). |
+| `LastHlc` | long | 224 | Senast utgivna HLC, för monotonicitet över omstart. |
+| `TrackingEnabledUnixSeconds` | long | 232 | När spårning slogs på (diagnostik). |
 
-### Klient: `QvecSyncAgent`
+Ny flagga: `V4HeaderFlags.HasChangeTracking = 1 << 3`.
 
-`QvecSyncAgent` wrapprar en `QvecDatabase` och hanterar all synk-logik. Det är den enda klassen användaren behöver interagera med.
+**Formatversion.** Filer *utan* spårning skrivs fortfarande som version 5 och förblir läsbara av 2.0.0. Filer *med* spårning skrivs som **version 6**. Skälet är säkerhet, inte nödvändighet: en 2.0.0-läsare skulle öppna en version-5-fil med spårning utan fel, skriva rader utan att uppdatera loggen och tyst korrumpera replikeringen. Version 6 gör att äldre läsare avvisar filen med ett tydligt fel. En 2.1-läsare läser 5 och 6.
+
+### 4.2 Nya sektioner
+
+| Sektion | Id | Elementstorlek | Flaggor | Innehåll |
+|---|---|---|---|---|
+| `EntryVersions` | 11 | 24 B × `MaxCount` | Present, Mutable, MayMoveOnGrow | Per rad: `Hlc` (8) + `Origin` (16). Skrivs tillsammans med raden. |
+| `ChangeLog` | 12 | 64 B × kapacitet | Present, Mutable, MayMoveOnGrow | Ringbuffert av `ChangeRecord`. |
+
+`ChangeRecord` (64 B):
+
+```
+offset  size  fält
+0       8     Seq          lokalt sekvensnummer
+8       8     Hlc          version (se 4.3)
+16      16    DocumentId
+32      16    Origin       ReplicaId som skapade versionen
+48      1     Type         1=Upsert, 2=Delete
+49      15    reserverat (0)
+```
+
+Loggen bär **inte** payload. För `Upsert` hämtas aktuell vektor/metadata från den levande raden vid `GetChanges`. Det gör loggen billig (64 B/ändring, 64 MB för 1M records) och ger automatisk koalescering: tio uppdateringar av samma dokument blir ett `Upsert` med senaste tillståndet. Priset är att mellanliggande versioner inte kan återskapas — vilket är exakt LWW-semantiken vi vill ha.
+
+**Kapacitet** = `MaxCount` records som default (konfigurerbart via `ChangeTrackingOptions.LogCapacity`). Växer med `CreateGrown`. När ringen är full skrivs det äldsta över; en peer vars cursor pekar före `oldestSeq` får `SyncCursorTooOldException` och måste bootstrappa via snapshot. Det är samma avvägning som WAL-retention i Postgres, och den ska stå i README.
+
+**Varför en ring i filen och inte en sidecar-logg?** Sidecar bryter "en fil"-löftet, förlorar atomiciteten med `CommitHeader`, och komplicerar `Vacuum`/`File.Move`. Ringen kostar bara plats.
+
+### 4.3 Version: hybrid logical clock
+
+`Hlc` är 64 bitar: övre 48 = fysisk tid i ms sedan Unix-epok, nedre 16 = logisk räknare.
+
+```
+lokal händelse:      pt = max(nowMs, last.pt); c = (pt == last.pt) ? last.c + 1 : 0
+mottagen version v:  pt = max(nowMs, last.pt, v.pt); c = pt == last.pt && pt == v.pt ? max(last.c, v.c)+1
+                                                       : pt == last.pt ? last.c+1
+                                                       : pt == v.pt    ? v.c+1 : 0
+```
+
+Total ordning: `(Hlc, Origin)` lexikografiskt. Två replikor kan aldrig ge samma `(Hlc, Origin)` eftersom `Origin` skiljer. Klockskev tolereras: en replika med klockan 10 min fram "vinner" konflikter under de tio minuterna, men systemet konvergerar ändå och HLC:n hos mottagarna hoppar fram så att deras nästa skrivning blir nyare. `LastHlc` persisteras i headern så att en omstart aldrig ger ut en äldre version än den senast utgivna.
+
+### 4.4 Tombstoner
+
+Raderade slots återanvänds direkt av `AllocateSlot`, så raden kan inte bära tombstonens version. Istället:
+
+- `Delete` skriver ett `ChangeRecord` av typ `Delete` med ny `Hlc`.
+- Vid `Open` läses ringen och en `Dictionary<Guid, (Hlc, Origin)> _deletedVersions` byggs för alla `Delete`-records vars dokument inte lever.
+- `ApplyChanges` med ett `Upsert` för ett dokument som finns i `_deletedVersions` med nyare version → skippas (raderingen vinner).
+- Tombstone-retention = loggens retention. Ett `Delete`-record som roterat ut ur ringen är glömt; en peer som är så gammal bootstrappar ändå från snapshot.
+
+### 4.5 Lokala mutationer
+
+Alla går redan genom `_lock.EnterWriteLock()` och slutar med `CommitHeader()`. Tillägget per operation:
+
+| Operation | Tillägg |
+|---|---|
+| `AddEntryInternal` | Stampa `EntryVersions[slot] = (NextHlc(), ReplicaId)`; append `Upsert`. |
+| `UpdateVector` / `UpdateMetadata` / `Update` | Ny version på den nya raden; append `Upsert`. |
+| `Delete` | Append `Delete` med ny version; lägg i `_deletedVersions`. |
+| `AddEntries` (parallell) | Versioner och seq tas ut under kort lås före graf-arbetet; loggappend sker i insättningsordning inom batchen. |
+| `Vacuum` | Kopierar `EntryVersions` per levande rad, kopierar ringen och headerfälten orörda till den nya filen. |
+| `CreateGrown` | Lägger ut båda sektionerna med ny kapacitet; kopierar ringen (packad, i seq-ordning). |
+
+Ordning vid skrivning: rad → version → loggrecord → `CommitHeader` (bumpar `ChangeSeq`, `ChangeLogHead`, `ChangeLogCount`, `LastHlc`). Ett record bortom `ChangeLogCount` efter krasch ignoreras, på samma sätt som en rad bortom `CurrentCount`.
+
+### 4.6 Apply av remote-ändringar
 
 ```csharp
-/// <summary>
-/// Kopplar en lokal QvecDatabase till en central synkserver.
-/// Opt-in: skapa databasen som vanligt och lägg till sync när du behöver det.
-/// </summary>
-public class QvecSyncAgent : IAsyncDisposable
+public ApplyResult ApplyChanges(ChangeBatch batch);  // under write lock
+```
+
+Per post i batchen:
+
+1. Slå upp lokal version: levande rad → `EntryVersions`; annars `_deletedVersions`; annars "okänd".
+2. Om `remote.Version <= local.Version` → `Skipped` (idempotent; gäller även våra egna ändringar som kommer tillbaka via en peer).
+3. `Upsert`: om raden lever → `Update`-väg (soft-delete + ny rad); annars `AddEntryInternal` med `externalId`. Versionen som stämplas är **remote-versionen**, inte en ny lokal. Ett `Upsert`-record appendas ändå i *vår* logg (med vår `Seq`, remote `Hlc`/`Origin`) så att våra egna peers ser ändringen.
+4. `Delete`: soft-delete om raden lever; lägg `_deletedVersions[id] = remote.Version`; append `Delete`.
+5. HLC:n "tickas" med remote-versionen (4.3) så att nästa lokala skrivning blir nyare.
+
+`ApplyResult` returnerar `Applied`, `Skipped`, `Rejected` (t.ex. dim-fel) per post plus totalsummor. Fältindex uppdateras om ett `Func<string, IEnumerable<(string, string)>>`-extractor är registrerat (ny `db.FieldIndexExtractor`-egenskap; idag skickas extractorn bara till `RebuildFieldIndex`).
+
+### 4.7 Läsning av ändringar
+
+```csharp
+public ChangeBatch GetChanges(long sinceSeq, int maxItems, Guid? excludeOrigin = null);  // under read lock
+public long OldestChangeSeq { get; }
+public long ChangeSeq { get; }
+```
+
+- Kastar `SyncCursorTooOldException(oldestSeq)` om `sinceSeq < OldestChangeSeq - 1`.
+- Går ringen från `sinceSeq + 1` till `ChangeSeq`, koalescerar per `DocumentId` (behåll senaste), hoppar över records med `Origin == excludeOrigin` (undviker att skicka tillbaka en peers egna ändringar), och bygger payload:
+  - Levande rad → `Upsert` med floats (om filen har floats) eller int8-koder + per-vektor-parametrar (ren int8) + metadata.
+  - Ej levande → `Delete`.
+- `ChangeBatch.ToSeq` är det sista inkluderade `Seq`; klienten sparar det som cursor först *efter* lyckad push/apply.
+
+### 4.8 Snapshot
+
+```csharp
+public SnapshotInfo ExportSnapshot(Stream destination);   // under write lock: Flush, kopiera hela filen
+public static void AdoptAsReplica(string path, Guid newReplicaId, out Guid sourceReplicaId, out long sourceSeq);
+```
+
+`ExportSnapshot` ger en bit-exakt kopia med `ReplicaId = källan`, `ChangeSeq = N`. Mottagaren kör `AdoptAsReplica` som byter `ReplicaId`, behåller alla versioner och ringen, och returnerar `(källa, N)` så att agenten kan sätta cursorn `{källa → N}`. Från den punkten pullas bara deltat. Ingen omindexering.
+
+### 4.9 Aktivering på befintlig fil
+
+`db.EnableChangeTracking(ChangeTrackingOptions)` gör en relayout (samma mekanism som `CreateGrown`), sätter `ReplicaId`, stämplar alla levande rader med `(NextHlc(), ReplicaId)` och skriver ett `Upsert`-record per rad. Filen blir version 6. Detta är avsiktligt "en stor initial ändringsmängd": första peern som pullar får alla dokument. Dokumenteras.
+
+### 4.10 Kompatibilitetsregler för payload
+
+| Källa | Payload | Mottagare `None`/`Int8Rescored` | Mottagare `Int8` |
+|---|---|---|---|
+| `None` / `Int8Rescored` | floats | ✅ | ✅ (kvantiserar lokalt) |
+| `Int8` | koder + parametrar | ❌ `Rejected` per post, tydligt fel | ✅ |
+
+Dimensioner måste matcha; annars avvisas hela batchen. Avståndsfunktion behöver inte matcha (varje replika indexerar med sin egen).
+
+## 5. `Qvec.Sync`
+
+### 5.1 `ISyncPeer`
+
+```csharp
+public interface ISyncPeer : IAsyncDisposable
 {
-    private readonly QvecDatabase _db;
-    private readonly ISyncTransport _transport;
-    private readonly SyncState _state;
-    private CancellationTokenSource _cts;
-
-    public QvecSyncAgent(QvecDatabase db, SyncOptions options)
-    {
-        _db = db;
-        _transport = CreateTransport(options);
-        _state = SyncState.Load(options.StateFilePath);
-    }
-
-    /// <summary>
-    /// Startar bakgrundssynkronisering. Lyssnar på remote events
-    /// och skickar lokala ändringar.
-    /// </summary>
-    public async Task StartAsync(CancellationToken ct = default)
-    {
-        _cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-
-        // 1. Initial catch-up: hämta allt vi missat sedan senaste offset
-        await PullDeltaAsync(_cts.Token);
-
-        // 2. Starta realtidslyssning
-        await _transport.SubscribeAsync(OnRemoteEvent, _cts.Token);
-    }
-
-    /// <summary>
-    /// Lägger till lokalt OCH skickar till servern.
-    /// Returnerar omedelbart efter lokal skrivning (offline-first).
-    /// </summary>
-    public async Task<Guid> AddEntryAsync(float[] vector, string metadata)
-    {
-        Guid id = _db.AddEntry(vector, metadata);
-        await EnqueueOutboundEventAsync(SyncEventType.Add, id, vector, metadata);
-        return id;
-    }
-
-    /// <summary>
-    /// Uppdaterar lokalt OCH skickar till servern.
-    /// </summary>
-    public async Task<bool> UpdateAsync(Guid id, float[] newVector, string newMetadata)
-    {
-        bool ok = _db.Update(id, newVector, newMetadata);
-        if (ok) await EnqueueOutboundEventAsync(SyncEventType.UpdateVector, id, newVector, newMetadata);
-        return ok;
-    }
-
-    /// <summary>
-    /// Tar bort lokalt OCH skickar till servern.
-    /// </summary>
-    public async Task<bool> DeleteAsync(Guid id)
-    {
-        bool ok = _db.Delete(id);
-        if (ok) await EnqueueOutboundEventAsync(SyncEventType.Delete, id, null, null);
-        return ok;
-    }
-
-    public async ValueTask DisposeAsync()
-    {
-        _cts?.Cancel();
-        await _transport.DisposeAsync();
-        _state.Save();
-    }
+    Guid PeerId { get; }
+    Task<ChangeBatch?> PullAsync(SyncCursor cursor, int maxItems, CancellationToken ct);
+    Task PushAsync(ChangeBatch batch, CancellationToken ct);
+    Task<Stream?> OpenSnapshotAsync(CancellationToken ct);              // null = stöds ej
+    IAsyncEnumerable<SyncSignal> WatchAsync(CancellationToken ct);      // default: tom → agenten pollar
 }
 ```
 
-### Användning — opt-in pattern
+`SyncCursor` är en vektorklocka `Dictionary<Guid, long>` (replika → senast sedda `Seq`). För en hubb finns en post; för en buss en per replika.
+
+### 5.2 `SyncAgent`
 
 ```csharp
-// 1. Skapa databasen som vanligt — fungerar fullt autonomt
-using var db = new QvecDatabase("local.qvec", dim: 1536, max: 100_000);
-
-// 2. VALFRITT: Koppla på synk
-await using var sync = new QvecSyncAgent(db, new SyncOptions
+await using var agent = new SyncAgent(db, peer, new SyncOptions
 {
-    ServerUrl = "https://qvec-sync.azurewebsites.net",
-    Transport = SyncTransportType.WebPubSub,
-    ConnectionString = "Endpoint=https://...",
-    StateFilePath = "local.syncstate"
+    StatePath = "local.qvec.sync",          // cursor + egen push-position, atomisk skrivning
+    PollInterval = TimeSpan.FromSeconds(5),
+    BatchSize = 500,
+    BootstrapFromSnapshotIfBehind = true,
+    FieldIndexExtractor = null,
 });
-await sync.StartAsync();
-
-// 3. Alla skrivningar via sync-agenten synkas automatiskt
-Guid id = await sync.AddEntryAsync(embedding, "{\"text\": \"hello\"}");
-
-// 4. Sökningar sker alltid direkt mot lokal databas — ingen nätverkslatens
-var results = db.Search(queryVector, topK: 5);
+await agent.StartAsync();
 ```
 
-### Transport-abstraktion
+Loop per iteration:
 
-Olika realtidskanaler stöds via ett gemensamt interface:
+1. **Push**: `db.GetChanges(state.PushedSeq, BatchSize, excludeOrigin: peer.PeerId)` → `peer.PushAsync` → `state.PushedSeq = batch.ToSeq` → spara state.
+2. **Pull**: `peer.PullAsync(state.Cursor)` → `db.ApplyChanges` → uppdatera cursor → spara state.
+3. Vid `SyncCursorTooOldException` från peer och `BootstrapFromSnapshotIfBehind`: hämta snapshot, `AdoptAsReplica`, öppna om databasen (agenten äger då `QvecDatabase`-livscykeln — se öppen fråga 7.3).
+4. Exponentiell backoff vid nätverksfel (1 s → 60 s), återställs vid lyckad iteration.
+5. `WatchAsync`-signaler kortsluter väntan på nästa iteration.
 
-```csharp
-public interface ISyncTransport : IAsyncDisposable
-{
-    /// <summary>Skickar ett event till servern för central lagring.</summary>
-    Task SendAsync(SyncEvent evt, CancellationToken ct);
+State-filen skrivs med temp + rename. Om den saknas startar agenten med tom cursor och `PushedSeq = 0` (skickar allt, mottagaren skippar idempotent).
 
-    /// <summary>Prenumererar på realtidsnotifieringar om nya events.</summary>
-    Task SubscribeAsync(Func<SyncNotification, Task> onNotification, CancellationToken ct);
+### 5.3 Wire-format `ChangeBatch`
 
-    /// <summary>Hämtar events från en given offset (delta-sync).</summary>
-    Task<SyncDelta> PullDeltaAsync(long fromOffset, CancellationToken ct);
-}
-
-public enum SyncTransportType
-{
-    WebPubSub,   // Azure Web PubSub (WebSocket)
-    Sse,         // Server-Sent Events
-    WebSocket    // Raw WebSocket
-}
-```
-
-### SyncState — lokal offset-tracking
-
-```csharp
-/// <summary>
-/// Sparar klientens synk-position till disk. Överlever omstarter.
-/// </summary>
-public class SyncState
-{
-    public long LastSyncedOffset { get; set; }
-    public DateTime LastSyncedUtc { get; set; }
-    public string StateFilePath { get; init; }
-
-    public static SyncState Load(string path) { /* läs från fil */ }
-    public void Save() { /* skriv till fil */ }
-}
-```
-
----
-
-## Server: Sync Relay
-
-Servern är en tunn relay som inte behöver förstå vektordata — den lagrar och vidarebefordrar binära events.
-
-### Ansvar
-
-1. **Append** — Ta emot events från klienter och skriva till Append Blob i strikt ordning.
-2. **Notify** — Skicka lättviktsnotifiering via Web PubSub: `{"offset": 124500}`.
-3. **Serve Delta** — Hantera `GET /delta?from={offset}` med Range-headers mot Append Blob.
-
-### Endpoints
+Binärt, versionerat, AOT-rent (ingen reflection):
 
 ```
-POST   /events              — Tar emot SyncEvent, skriver till blob, notifierar
-GET    /delta?from={offset}  — Returnerar alla events sedan offset (Range Request)
-GET    /status               — Returnerar blob-storlek och antal anslutna klienter
-WS     /ws                   — WebSocket-anslutning för realtidsprenumeration
+"QVCB" (4) | FormatVersion u16 | Flags u16 (bit0 = Brotli-komprimerad body)
+Dim i32 | PayloadKind u8 (1=Float, 2=Int8) | Count i32 | FromSeq i64 | ToSeq i64 | Origin Guid
+Body: Count × { Type u8 | DocumentId 16 | Hlc i64 | Origin 16 | [vector] | MetadataLen i32 | UTF-8 }
+Crc32 (4) över allt ovan
 ```
 
-### Implementering (Azure Function)
+Body komprimeras med Brotli om `Flags.bit0` — metadata komprimerar bra, vektorer knappt; agenten väljer per batch utifrån metadataandel (tröskel 20 %).
 
-```csharp
-public class SyncFunction
-{
-    private readonly AppendBlobClient _blob;
-    private readonly WebPubSubServiceClient _pubsub;
+### 5.4 `DirectorySyncPeer`
 
-    [Function("AppendEvent")]
-    public async Task<IActionResult> AppendEvent(
-        [HttpTrigger(AuthorizationLevel.Function, "post", Route = "events")] HttpRequest req)
-    {
-        byte[] eventBytes = await req.Body.ReadAsByteArrayAsync();
-
-        // Atomisk append — Append Blob garanterar ordning
-        await _blob.AppendBlockAsync(new BinaryData(eventBytes));
-
-        long newOffset = (await _blob.GetPropertiesAsync()).Value.ContentLength;
-
-        // Push notifiering till alla klienter
-        await _pubsub.SendToAllAsync(
-            BinaryData.FromObjectAsJson(new { type = "NEW_DATA", offset = newOffset }),
-            ContentType.ApplicationJson);
-
-        return new OkObjectResult(new { offset = newOffset });
-    }
-
-    [Function("GetDelta")]
-    public async Task<IActionResult> GetDelta(
-        [HttpTrigger(AuthorizationLevel.Function, "get", Route = "delta")] HttpRequest req)
-    {
-        long from = long.Parse(req.Query["from"]);
-        long blobLength = (await _blob.GetPropertiesAsync()).Value.ContentLength;
-
-        if (from >= blobLength)
-            return new OkObjectResult(Array.Empty<byte>());
-
-        // Range request — bara de nya byten
-        var range = new HttpRange(from, blobLength - from);
-        var download = await _blob.DownloadContentAsync(new BlobDownloadOptions { Range = range });
-
-        return new FileContentResult(download.Value.Content.ToArray(), "application/octet-stream");
-    }
-}
-```
-
----
-
-## Synk-flöde: steg för steg
-
-### Skrivning (klient ? server ? alla)
+Ingår i `Qvec.Sync`. Layout i målmappen:
 
 ```
-Edge A                     Server                    Edge B
-  ?                          ?                          ?
-  ?  1. db.AddEntry(v, m)   ?                          ?
-  ?  (lokal, instant)       ?                          ?
-  ?                          ?                          ?
-  ?  2. POST /events ????????                          ?
-  ?     {Add, guid, v, m}   ?                          ?
-  ?                          ?  3. Append Blob.Append() ?
-  ?                          ?                          ?
-  ?                          ?  4. Web PubSub ???????????
-  ?                          ?  {"offset": 131072}      ?
-  ?                          ?                          ?
-  ?                          ?  5. GET /delta?from=X ????
-  ?                          ?                          ?
-  ?                          ?  6. Event bytes ??????????
-  ?                          ?                          ?
-  ?                          ?     7. db.AddEntry(v, m, ?
-  ?                          ?        externalId: guid) ?
+<root>/
+  replicas/<replicaId>/
+    log/<fromSeq:D20>-<toSeq:D20>.qvcb      immutable segment
+    snapshot/<seq:D20>.qvec                 valfritt, senaste behålls
+  manifest/<replicaId>.json                 { latestSeq, snapshotSeq, updatedUtc }
 ```
 
-### Reconnect / Catch-up
+`PushAsync` skriver segment till `.tmp` och byter namn. `PullAsync` listar `replicas/*` utom egen, läser manifest, hämtar segment med `toSeq > cursor[replica]`. Fungerar identiskt på lokal disk, SMB och — via `Qvec.Sync.AzureBlob` — i en blob-container. Den här peeren är också **testtransporten**: två `QvecDatabase` i samma process, en temp-mapp, ingen nätverkskod.
 
-```
-Edge C (var offline i 2 timmar)
-  ?
-  ?  StartAsync()
-  ?  1. Läs _state.LastSyncedOffset (t.ex. 8192)
-  ?  2. GET /delta?from=8192
-  ?  3. Applicera alla events sekventiellt
-  ?  4. Uppdatera _state.LastSyncedOffset
-  ?  5. Prenumerera på realtid
-```
+### 5.5 `Qvec.Sync.AzureBlob`
 
----
+Samma layout som 5.4 över `BlobContainerClient`. Segment via `UploadAsync(overwrite: false)`; manifest via ETag-villkorad skrivning. Snapshot som block blob. `WatchAsync` = tom i v1 (pollning). Separat NuGet-paket så att `Qvec.Sync` inte drar in `Azure.Storage.Blobs`.
 
-## Konflikthantering
+### 5.6 `Qvec.Api` som hubb (valfritt, senare)
 
-Guid löser ID-konflikter, men vad händer om två klienter uppdaterar samma dokument samtidigt?
+- `GET  /api/changes?since=&max=` → `ChangeBatch` (octet-stream)
+- `POST /api/changes` → `ApplyResult`
+- `GET  /api/snapshot` → filström
+- `GET  /api/changes/stream` → SSE med `{ "seq": N }` vid varje commit
 
-| Strategi | Beskrivning |
-|---|---|
-| **Last-Write-Wins (LWW)** | Servern serialiserar alla events. Den sista UpdateVector som skrivs till Append Blob vinner. Enkelt och deterministiskt. |
-| **Timestamp-baserad** | Varje event har `TimestampTicks`. Vid apply: skippa events äldre än lokalt timestamp. Kräver klocksynk. |
-| **Application-level** | Exponera konflikter uppåt via callback. Låt applikationen bestämma. |
+`HttpSyncPeer` i `Qvec.Sync` (bara `HttpClient`, inget extra beroende). Hubben pullar aldrig — klienterna pushar och pullar.
 
-**Rekommendation:** Börja med **Last-Write-Wins** (LWW) — det är det enklaste och passar bra för vektordata där "senaste embedningen" normalt är den korrekta.
+## 6. Implementationsplan
 
----
+Principer från tidigare faser gäller: **tester först**, noll varningar, snabb CI + `Slow`-svit gröna, en PR per rad nedan, squash-merge, dokumentation i samma PR. Alla PR:ar utom nr 6 är testbara utan nätverk.
 
-## Projektstruktur
+| # | Branch | Innehåll | Tester (skrivs först) | Klart när |
+|---|---|---|---|---|
+| **1** | `sync-versions` | Headerfält 4.1, flagga, formatversion 6 villkorad på spårning, `EntryVersions`-sektion, HLC-klass, `ReplicaId`. Stämpling i alla lokala mutationer. `Vacuum`/`CreateGrown` bevarar. `EnableChangeTracking` på tom och på befintlig fil. | `Format/ChangeTrackingHeaderTests`: fälten round-trippar, CRC, v5-fil utan spårning öppnas av 2.0.0-läsare (simulerat via versionskontroll), v6 avvisas av "gammal" läsare. `HlcTests`: monotonicitet, tick-regler, `LastHlc` över omstart. `EntryVersionTests`: version följer GUID genom `UpdateVector`, överlever `Vacuum` och grow. | Alla befintliga tester gröna; nya filer utan spårning är byte-identiska med 2.0.0. |
+| **2** | `sync-changelog` | `ChangeLog`-ring, `ChangeRecord`, `Delete`-tombstoner, `_deletedVersions`, `GetChanges` med koalescering och `excludeOrigin`, `ApplyChanges` med LWW, `OldestChangeSeq`, `SyncCursorTooOldException`. Fältindex-extractor som egenskap. Ta bort `SyncFrom` (ersätts; markera `[Obsolete]` i 2.1, ta bort i 3.0). | `ChangeLogTests`: append, rotation, krasch-simulering (record bortom count ignoreras), packning vid grow. `GetChangesTests`: koalescering, delete efter upsert, cursor för gammal. `ApplyChangesTests`: idempotens, LWW båda riktningar, delete vinner över äldre upsert, upsert vinner över äldre delete, egen ändring tillbaka = skipped, dim-fel = rejected, int8→float = rejected, float→int8 = applied. **Konvergenstest**: två databaser, slumpade interleavade mutationer offline, byt batchar i båda riktningar tills tomt → identisk `(Guid, Version, Metadata)`-mängd. | Konvergenstestet grönt 1 000 iterationer med seed-loggning. |
+| **3** | `sync-snapshot` | `ExportSnapshot`, `AdoptAsReplica`. | Snapshot-fil öppnas, är hälsosam, har källans `ReplicaId`/`ChangeSeq`; efter `Adopt` nytt id, versioner intakta; delta från `sourceSeq` ger konvergens utan dubbletter. | Bootstrap 1M-fil = filkopiering, ingen omindexering (Slow-test mäter). |
+| **4** | `sync-agent` | Nytt projekt `Qvec.Sync`: `ISyncPeer`, `SyncCursor`, `ChangeBatch`-wire (5.3) med Brotli, `SyncAgent` (5.2) med state-fil och backoff, `DirectorySyncPeer` (5.4). NuGet-metadata, AOT-kompilering i CI (som `Qvec.Core`). | `ChangeBatchWireTests`: round-trip, CRC-fel, versionsfel, komprimerad/okomprimerad. `DirectorySyncPeerTests`: segmentnamn, tmp+rename, manifest, ignorerar egen prefix. `SyncAgentTests` (in-process, temp-mapp): två agenter konvergerar; tre agenter i stjärna; agent startad utan state skickar allt och mottagaren skippar; agent bakom ringen bootstrappar från snapshot; state-fil korrupt → tydligt fel; avbryt mitt i → återupptar. | Exempel i `samples/` som kör två processer mot samma mapp. |
+| **5** | `sync-docs` | README: nytt avsnitt "Sync" med ärlig text om LWW, ringretention, klockskev och payload-kompatibilitet. `docs/design-format-v4.md`: sektion 11/12, headerfält, version 6. `benchmarks/README.md`: kostnad för spårning (skrivgenomströmning med/utan). Roadmap uppdaterad. | Benchmark: `AddEntries` 1M med och utan spårning; `GetChanges` 100k; `ApplyChanges` 100k. | Ingen påstådd siffra utan mätning på referensmaskinen. |
+| **6** | `sync-azure-blob` | Nytt paket `Qvec.Sync.AzureBlob` med `BlobSyncPeer` (5.5). | Integrationstester mot Azurite i CI (`Slow`), samma testsvit som `DirectorySyncPeer` via delad abstrakt testklass. | Publiceras som eget NuGet-paket. |
+| **7** | `sync-api-hub` | `Qvec.Api` endpoints (5.6) + `HttpSyncPeer`. | `Qvec.Api.Tests` med `WebApplicationFactory`: push/pull/snapshot/SSE; auth via befintlig API-nyckel. | Valfritt; kan skjutas till efter release. |
 
-Sync Engine implementeras som ett separat projekt för att behålla Qvec.Core utan beroenden:
+**Release-plan.** PR 1–5 ⇒ **2.1.0** (`Qvec.Core` + nytt `Qvec.Sync`). PR 6 ⇒ `Qvec.Sync.AzureBlob` 2.1.0. PR 7 ⇒ 2.2.0. `SyncFrom` tas bort i 3.0.
 
-```
-Qvec.sln
-??? Qvec.Core/                  # Ingen ändring — ren embedded DB
-??? Qvec.Core.Client/           # Typade klienter
-??? Qvec.Sync/                  # ? NYTT: SyncAgent, transporter, state
-?   ??? QvecSyncAgent.cs
-?   ??? ISyncTransport.cs
-?   ??? Transports/
-?   ?   ??? WebPubSubTransport.cs
-?   ?   ??? SseTransport.cs
-?   ?   ??? WebSocketTransport.cs
-?   ??? SyncEvent.cs
-?   ??? SyncState.cs
-?   ??? SyncOptions.cs
-??? Qvec.Sync.Server/           # ? NYTT: Azure Function relay
-?   ??? SyncFunction.cs
-?   ??? host.json
-??? Qvec.Api/
-??? Qvec.Console.Test/
-```
+**Beroendeordning.** 1 → 2 → 3 → 4 → 5 strikt. 6 och 7 är oberoende av varandra men kräver 4.
 
-## Påverkade befintliga filer
+**Uppskattad omfattning** (i samma enhet som tidigare faser, dvs. PR:ar av den storlek vi kört): 1 och 2 är störst (kärnan, formatet, konvergenstestet); 3 liten; 4 medel; 5 liten men kräver benchmark-körningar; 6 medel (Azurite-uppsättning); 7 medel.
 
-| Fil | Ändring |
-|---|---|
-| `Qvec.sln` | Lägg till `Qvec.Sync` och `Qvec.Sync.Server` |
-| `Qvec.Core\QvecDatabase.cs` | **Ingen** — sync wrappar utifrån |
-| `README.md` | Dokumentation och Quick Start för sync |
+## 7. Öppna frågor
 
-## Prestandabudget
+Beslut föreslås; avvikelse ändrar planen ovan.
 
-| Operation | Latens |
-|---|---|
-| Lokal skrivning + sökning | Oförändrat (µs–ms) |
-| Outbound event ? server | ~50–200 ms (nätverkslatens) |
-| Remote event ? lokal apply | ~100–300 ms (notifiering + delta pull + apply) |
-| Catch-up (10 000 events) | ~2–5 s (beroende på bandbredd) |
-| Idle minnesoverhead | ~1 WebSocket-anslutning + SyncState (bytes) |
+1. **Loggkapacitet.** Förslag: `MaxCount` records (64 B vardera). Alternativ: tidsbaserad retention — svårare att garantera i en ring; avråds.
+2. **Version 6 villkorad på spårning** (4.1) kontra alltid 6 i 2.1. Förslag: villkorad, så att 2.0.0-läsare kan läsa ospårade 2.1-filer.
+3. **Vem äger `QvecDatabase` vid snapshot-bootstrap?** Agenten måste stänga och öppna om filen. Förslag: `SyncAgent` tar en `Func<QvecDatabase>`-fabrik och exponerar `agent.Database`; alternativt kastar agenten `SnapshotRequiredException` och låter appen sköta det. Fabriken är bekvämare; undantaget är explicitare. Förslag: fabrik, med undantaget som fallback när ingen fabrik givits.
+4. **`excludeOrigin` vid buss-topologi.** På en buss pushar varje replika sitt eget segment; ett `Upsert` som replikan tog emot från B ska inte skrivas till A:s segment (B har det redan). Men C som bara ser A:s segment missar då B:s ändring om C inte också läser B:s prefix. Regel: på bussen läser alla alla prefix, och `excludeOrigin` används **inte** vid push (bara mot hubb). Agenten får `SyncTopology { Hub, Bus }`.
+5. **Ren int8 → float-mottagare** avvisas (4.10). Alternativ: tillåt med dekvantiserad vektor och en `Approximate`-flagga i versionen. Förslag: avvisa i v1; det är ärligare.
+6. **`AddEntries` parallell + logg.** Loggappend i insättningsordning kräver att seq tas ut i ordning men graf-arbetet kan ske parallellt. Förslag: ta ut `(slot, seq, hlc)` för hela batchen under låset först, som redan görs för slots.
+7. **Kryptering av segment** i buss-läge. Förslag: utanför v1; dokumentera att lagrets ACL är säkerhetsgränsen.
+
+## 8. Relaterade dokument
+
+- [Filformat v4](design-format-v4.md) — sektionstabell, header, `CreateGrown`.
+- [Guid som dokument-ID](design-guid-id.md) — `externalId`, dedup.
+- [Update & Delete](design-update-delete.md) — soft delete, slot-återanvändning.
+- [Int8-kvantisering](design-quantization-int8.md) och [rescoring](design-quantization-rescoring.md) — payload-kompatibilitet.
