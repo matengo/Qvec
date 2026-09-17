@@ -22,4 +22,8 @@
     <ProjectReference Include="..\..\Qvec.Core\Qvec.Core.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <None Include="Fixtures\**" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
 </Project>

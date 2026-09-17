@@ -1,5 +1,6 @@
 using System;
 using System.Buffers;
+using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.IO.MemoryMappedFiles;
 using System.Numerics;
@@ -7,6 +8,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 using Qvec.Core.Format;
 using Qvec.Core.Quantization;
+using Qvec.Core.Sync;
 
 namespace Qvec.Core
 {
@@ -67,6 +69,12 @@ namespace Qvec.Core
         private long _guidSectionOffset;
         private long _tombstoneSectionOffset;
         private long _freeListSectionOffset;
+        /// <summary>True when the file carries per-row versions (format version 6). The one branch every mutation takes.</summary>
+        private bool _tracking;
+        /// <summary>Offset of section 11 (24 B per row: Hlc + Origin); only meaningful when <see cref="_tracking"/>.</summary>
+        private long _entryVersionsSectionOffset;
+        /// <summary>Offset of section 12 (change-log ring); only meaningful when <see cref="_tracking"/>. Written from PR 2 onward.</summary>
+        private long _changeLogSectionOffset;
         private readonly Dictionary<Guid, int> _guidIndex = new();
         private TombstoneSet _deletedIndices;
         private readonly int[] _cachedEmptyNeighbors;
@@ -92,8 +100,14 @@ namespace Qvec.Core
         /// roughly a quarter at the cost of approximate scores. Recorded in the file header, so
         /// a reopen must pass the same value (or use <see cref="Open(string)"/>).
         /// </param>
-        public QvecDatabase(string path, int dim = 1536, int max = 1000, int maxNeighbors = 32, int maxLayers = 5, DistanceFunction distanceFunction = DistanceFunction.DotProduct, int? indexSeed = null, VectorQuantization quantization = VectorQuantization.None)
-            : this(path, dim, max, maxNeighbors, maxLayers, distanceFunction, honourHeaderSilently: false, indexSeed: indexSeed, quantization: quantization)
+        /// <param name="changeTracking">
+        /// Enables per-document version tracking for replication when creating a new file; see
+        /// <see cref="ChangeTrackingOptions"/>. Off by default and free when off. Reopening a
+        /// tracked file without this argument keeps tracking on; reopening an untracked file
+        /// with it throws -- use <see cref="EnableChangeTracking"/> to convert an existing file.
+        /// </param>
+        public QvecDatabase(string path, int dim = 1536, int max = 1000, int maxNeighbors = 32, int maxLayers = 5, DistanceFunction distanceFunction = DistanceFunction.DotProduct, int? indexSeed = null, VectorQuantization quantization = VectorQuantization.None, ChangeTrackingOptions? changeTracking = null)
+            : this(path, dim, max, maxNeighbors, maxLayers, distanceFunction, honourHeaderSilently: false, indexSeed: indexSeed, quantization: quantization, changeTracking: changeTracking)
         {
         }
 
@@ -115,10 +129,12 @@ namespace Qvec.Core
 
         private QvecDatabase(string path, int dim, int max, int maxNeighbors, int maxLayers,
                              DistanceFunction distanceFunction, bool honourHeaderSilently,
-                             int? indexSeed = null, VectorQuantization quantization = VectorQuantization.None)
+                             int? indexSeed = null, VectorQuantization quantization = VectorQuantization.None,
+                             ChangeTrackingOptions? changeTracking = null)
         {
             _layerRng = indexSeed is int seed ? new Random(seed) : null;
             ArgumentException.ThrowIfNullOrWhiteSpace(path);
+            changeTracking?.Validate();
             _path = Path.GetFullPath(path);
 
             bool exists = File.Exists(path);
@@ -140,7 +156,7 @@ namespace Qvec.Core
 
                 if (!honourHeaderSilently)
                 {
-                    EnsureHeaderMatchesRequest(path, _header, dim, max, maxNeighbors, maxLayers, distanceFunction, quantization);
+                    EnsureHeaderMatchesRequest(path, _header, dim, max, maxNeighbors, maxLayers, distanceFunction, quantization, changeTracking);
                 }
             }
             else
@@ -151,7 +167,14 @@ namespace Qvec.Core
                     dim, max, maxNeighbors, maxLayers,
                     QvecFormatLayout.RecommendMetadataHeapCapacity(max),
                     distanceFunction,
-                    quantization);
+                    quantization,
+                    trackChanges: changeTracking is not null,
+                    changeLogCapacity: changeTracking?.LogCapacity ?? 0);
+
+                if (changeTracking?.ReplicaId is { } replicaId)
+                {
+                    _header.ReplicaId = replicaId;
+                }
             }
 
             // From here on, only header values are used. Never the constructor arguments.
@@ -250,7 +273,7 @@ namespace Qvec.Core
         private static void EnsureHeaderMatchesRequest(
             string path, V4Header header,
             int dim, int max, int maxNeighbors, int maxLayers, DistanceFunction distanceFunction,
-            VectorQuantization quantization)
+            VectorQuantization quantization, ChangeTrackingOptions? changeTracking)
         {
             static string Describe(string name, int stored, int requested)
                 => $"{name}: file has {stored}, caller requested {requested}";
@@ -265,6 +288,24 @@ namespace Qvec.Core
                 mismatches.Add($"distanceFunction: file has {header.DistanceFunction}, caller requested {distanceFunction}");
             if (QvecFormatLayout.EffectiveQuantization(header) != quantization)
                 mismatches.Add($"quantization: file has {QvecFormatLayout.EffectiveQuantization(header)}, caller requested {quantization}");
+
+            // Tracking is a property of the file rather than of the request: a tracked file stays
+            // tracked whether or not the caller mentions it. The reverse is not silently honoured,
+            // because turning tracking on rewrites the file and deserves an explicit call.
+            if (changeTracking is not null)
+            {
+                if (!header.HasChangeTracking)
+                {
+                    throw new QvecFormatException(
+                        $"'{path}' was created without change tracking. Call EnableChangeTracking on the open database to convert it; " +
+                        "the constructor only enables tracking when it creates the file.");
+                }
+
+                if (changeTracking.ReplicaId is { } replicaId && replicaId != header.ReplicaId)
+                    mismatches.Add($"changeTracking.ReplicaId: file has {header.ReplicaId}, caller requested {replicaId}");
+                if (changeTracking.LogCapacity is { } capacity && capacity != header.ChangeLogCapacity)
+                    mismatches.Add($"changeTracking.LogCapacity: file has {header.ChangeLogCapacity}, caller requested {capacity}");
+            }
 
             if (mismatches.Count > 0)
             {
@@ -397,6 +438,113 @@ namespace Qvec.Core
         /// carries the optional float section.
         /// </summary>
         public VectorQuantization Quantization => QvecFormatLayout.EffectiveQuantization(_header);
+
+        // --- CHANGE TRACKING ---
+
+        /// <summary>
+        /// Whether the file records a <see cref="EntryVersion"/> per document, the prerequisite for
+        /// replication. See <see cref="ChangeTrackingOptions"/>.
+        /// </summary>
+        public bool IsChangeTrackingEnabled => _tracking;
+
+        /// <summary>This replica's identity, or <see cref="Guid.Empty"/> when tracking is off.</summary>
+        public Guid ReplicaId => _header.ReplicaId;
+
+        /// <summary>The most recent hybrid logical clock value this replica has issued; 0 when tracking is off.</summary>
+        public long LastHlc => _header.LastHlc;
+
+        /// <summary>Records the change-log ring can hold; 0 when tracking is off.</summary>
+        public long ChangeLogCapacity => _header.ChangeLogCapacity;
+
+        /// <summary>
+        /// The version of a live document. False when tracking is off or the document does not exist
+        /// (or has been deleted -- tombstone versions live in the change log, not on the row).
+        /// </summary>
+        public bool TryGetVersion(Guid id, out EntryVersion version)
+        {
+            _lock.EnterReadLock();
+            try
+            {
+                if (_tracking && _guidIndex.TryGetValue(id, out int index))
+                {
+                    version = ReadVersionFromDisk(index);
+                    return true;
+                }
+
+                version = default;
+                return false;
+            }
+            finally { _lock.ExitReadLock(); }
+        }
+
+        /// <summary>
+        /// Turns on change tracking for an existing database. The file is re-laid out with the two
+        /// tracking sections appended (existing sections do not move), every live row is stamped
+        /// with a fresh version from this replica, and the file becomes format version 6 -- from
+        /// this point on it is no longer readable by Qvec 2.0.0. The first peer to pull from this
+        /// replica will see every document as a change; that is intentional.
+        /// </summary>
+        /// <exception cref="InvalidOperationException">Tracking is already enabled.</exception>
+        public void EnableChangeTracking(ChangeTrackingOptions? options = null)
+        {
+            options ??= new ChangeTrackingOptions();
+            options.Validate();
+
+            _lock.EnterWriteLock();
+            try
+            {
+                if (_tracking)
+                    throw new InvalidOperationException("Change tracking is already enabled on this database.");
+
+                var tracked = QvecFormatLayout.CreateTracked(_header, options.LogCapacity ?? 0);
+                if (options.ReplicaId is { } replicaId) tracked.ReplicaId = replicaId;
+
+                ApplyRelayout(tracked);
+
+                for (int index = 0; index < _header.CurrentCount; index++)
+                {
+                    if (_deletedIndices.Contains(index)) continue;
+                    StampLocalVersion(index);
+                }
+
+                CommitHeader();
+            }
+            finally { _lock.ExitWriteLock(); }
+        }
+
+        /// <summary>Issues the next local HLC value and records it in the header. Callers hold the write lock.</summary>
+        private long TickLocalHlc()
+        {
+            long next = HybridLogicalClock.Next(_header.LastHlc);
+            _header.LastHlc = next;
+            return next;
+        }
+
+        /// <summary>
+        /// Stamps a row with a new local version. Every mutation path calls this after writing the
+        /// row and before <see cref="CommitHeader"/>; the check is the only tracking cost an
+        /// untracked database ever pays.
+        /// </summary>
+        private void StampLocalVersion(int index)
+        {
+            if (!_tracking) return;
+            WriteVersionToDisk(index, TickLocalHlc(), _header.ReplicaId);
+        }
+
+        private unsafe void WriteVersionToDisk(int index, long hlc, Guid origin)
+        {
+            BeginWrite();
+            byte* row = DataBasePointer + (_entryVersionsSectionOffset - HeaderSize) + (long)index * V4Header.EntryVersionSize;
+            BinaryPrimitives.WriteInt64LittleEndian(new Span<byte>(row, sizeof(long)), hlc);
+            origin.TryWriteBytes(new Span<byte>(row + sizeof(long), GuidSize));
+        }
+
+        private unsafe EntryVersion ReadVersionFromDisk(int index)
+        {
+            byte* row = DataBasePointer + (_entryVersionsSectionOffset - HeaderSize) + (long)index * V4Header.EntryVersionSize;
+            long hlc = BinaryPrimitives.ReadInt64LittleEndian(new ReadOnlySpan<byte>(row, sizeof(long)));
+            return new EntryVersion(hlc, new Guid(new ReadOnlySpan<byte>(row + sizeof(long), GuidSize)));
+        }
 
         /// <summary>Maximalt antal poster databasen kan rymma.</summary>
         public int MaxCount => _header.MaxCount;
@@ -646,17 +794,22 @@ namespace Qvec.Core
             _lock.EnterWriteLock();
             try
             {
-                var live = new List<(int OldIndex, Guid Id, float[] Vector, string Metadata)>();
+                var live = new List<(int OldIndex, Guid Id, float[] Vector, string Metadata, EntryVersion Version)>();
                 for (int i = 0; i < _header.CurrentCount; i++)
                 {
                     if (_deletedIndices.Contains(i)) continue;
                     var exact = new float[_header.VectorDimension];
                     ReadVectorInto(i, exact, 0);
-                    live.Add((i, ReadGuidFromDisk(i), exact, GetMetadata(i)));
+                    var version = _tracking ? ReadVersionFromDisk(i) : default;
+                    live.Add((i, ReadGuidFromDisk(i), exact, GetMetadata(i), version));
                 }
 
                 string rebuiltPath = _path + ".vacuum";
                 if (File.Exists(rebuiltPath)) File.Delete(rebuiltPath);
+
+                ChangeTrackingOptions? tracking = _tracking
+                    ? new ChangeTrackingOptions { ReplicaId = _header.ReplicaId, LogCapacity = _header.ChangeLogCapacity }
+                    : null;
 
                 try
                 {
@@ -667,11 +820,24 @@ namespace Qvec.Core
                         _header.MaxNeighbors,
                         _header.MaxLayers,
                         _header.DistanceFunction,
-                        quantization: Quantization))
+                        quantization: Quantization,
+                        changeTracking: tracking))
                     {
                         foreach (var entry in live)
                         {
                             rebuilt.AddEntry(entry.Vector, entry.Metadata, entry.Id);
+                        }
+
+                        if (_tracking)
+                        {
+                            // Rows are assigned sequentially, so live[n] sits at row n. Versions
+                            // must survive a vacuum unchanged or peers would re-pull everything.
+                            for (int n = 0; n < live.Count; n++)
+                                rebuilt.WriteVersionToDisk(n, live[n].Version.Hlc, live[n].Version.Origin);
+
+                            rebuilt._header.LastHlc = Math.Max(rebuilt._header.LastHlc, _header.LastHlc);
+                            rebuilt._header.TrackingEnabledUnixSeconds = _header.TrackingEnabledUnixSeconds;
+                            rebuilt.CommitHeader();
                         }
                     }
 
@@ -745,6 +911,10 @@ namespace Qvec.Core
             _guidSectionOffset = _header.GetRequiredSection(V4SectionIds.Guids).Offset;
             _tombstoneSectionOffset = _header.GetRequiredSection(V4SectionIds.Tombstones).Offset;
             _freeListSectionOffset = _header.GetRequiredSection(V4SectionIds.FreeList).Offset;
+
+            _tracking = _header.HasChangeTracking;
+            _entryVersionsSectionOffset = _tracking ? _header.GetRequiredSection(V4SectionIds.EntryVersions).Offset : 0;
+            _changeLogSectionOffset = _tracking ? _header.GetRequiredSection(V4SectionIds.ChangeLog).Offset : 0;
         }
 
         /// <summary>
@@ -777,14 +947,29 @@ namespace Qvec.Core
             }
 
             var grown = QvecFormatLayout.CreateGrown(_header, newMaxCount, newHeapCapacity);
+            ApplyRelayout(grown);
 
+            // The caller is in the middle of a write, so the header must go straight back to
+            // "write in progress" -- now against the new geometry.
+            BeginWrite();
+        }
+
+        /// <summary>
+        /// Rewrites the file to the geometry described by <paramref name="target"/>, which must
+        /// have been derived from the current header (<see cref="QvecFormatLayout.CreateGrown"/>
+        /// or <see cref="QvecFormatLayout.CreateTracked"/>): every present section is copied to
+        /// its new offset, the mapping is re-established and a clean header committed. Sections new
+        /// in the target land in zero-filled space beyond the old file end. Callers hold the write lock.
+        /// </summary>
+        private void ApplyRelayout(V4Header target)
+        {
             // Publish "a write is in progress" against the OLD geometry before anything moves,
             // so a crash during the move is detectable.
             BeginWrite();
             _dataAccessor.Flush();
             _headerAccessor.Flush();
 
-            var moves = PlanSectionMoves(_header, grown);
+            var moves = PlanSectionMoves(_header, target);
 
             ReleaseMapping();
 
@@ -792,26 +977,22 @@ namespace Qvec.Core
             {
                 using (var stream = new FileStream(_path, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
                 {
-                    stream.SetLength(grown.FileLength);
+                    stream.SetLength(target.FileLength);
                     MoveSections(stream, moves);
                     stream.Flush(flushToDisk: true);
                 }
 
                 _previousMaxCount = _header.MaxCountRaw;
-                _header = grown;
+                _header = target;
                 RemapAfterGrow();
                 InitialiseNewCapacity();
                 CommitHeader();
                 _headerAccessor.Flush();
-
-                // The caller is in the middle of a write, so the header must go straight back to
-                // "write in progress" -- now against the new geometry.
-                BeginWrite();
             }
             catch
             {
                 // The file is now in an unknown state and the mapping is gone. Reopening is the
-                // only safe recovery, and it will fail loudly if the grow corrupted the file.
+                // only safe recovery, and it will fail loudly if the relayout corrupted the file.
                 RemapFromDisk();
                 throw;
             }
@@ -945,6 +1126,7 @@ namespace Qvec.Core
         private void RemapFromDisk()
         {
             _header = ReadAndValidateHeader(_path);
+            CaptureSectionOffsets();
 
             long totalSize = _header.FileLength;
             _mmf = MemoryMappedFile.CreateFromFile(_path, FileMode.Open, null, totalSize);
@@ -997,6 +1179,7 @@ namespace Qvec.Core
                 WriteVectorToDisk(index, vector);
                 WriteMetadataToDisk(index, metadata);
                 WriteGuidToDisk(index, docId);
+                StampLocalVersion(index);
                 InitNeighborsOnDisk(index);
 
                 _guidIndex[docId] = index;
@@ -1097,6 +1280,7 @@ namespace Qvec.Core
                         WriteVectorToDisk(index, vector);
                         WriteMetadataToDisk(index, entry.Metadata);
                         WriteGuidToDisk(index, docId);
+                        StampLocalVersion(index);
                         InitNeighborsOnDisk(index);
                         _guidIndex[docId] = index;
 
@@ -3119,6 +3303,7 @@ namespace Qvec.Core
                     return false;
 
                 WriteMetadataToDisk(index, newMetadata);
+                StampLocalVersion(index);
                 CommitHeader();
                 return true;
             }
@@ -3171,6 +3356,7 @@ namespace Qvec.Core
                 if (newVector == null)
                 {
                     WriteMetadataToDisk(oldIndex, newMetadata!);
+                    StampLocalVersion(oldIndex);
                     CommitHeader();
                     return true;
                 }
@@ -3205,6 +3391,7 @@ namespace Qvec.Core
             WriteVectorToDisk(index, vector);
             WriteMetadataToDisk(index, metadata);
             WriteGuidToDisk(index, docId);
+            StampLocalVersion(index);
             InitNeighborsOnDisk(index);
 
             _guidIndex[docId] = index;

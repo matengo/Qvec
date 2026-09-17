@@ -15,13 +15,16 @@ public static class QvecFormatLayout
         int maxLayers,
         long metadataHeapCapacity,
         DistanceFunction distanceFunction = DistanceFunction.DotProduct,
-        VectorQuantization quantization = VectorQuantization.None)
+        VectorQuantization quantization = VectorQuantization.None,
+        bool trackChanges = false,
+        long changeLogCapacity = 0)
     {
         ValidateCreateArguments(vectorDimension, maxCount, maxNeighbors, maxLayers, metadataHeapCapacity, distanceFunction);
         if (quantization is not VectorQuantization.None and not VectorQuantization.Int8 and not VectorQuantization.Int8Rescored)
         {
             throw new ArgumentOutOfRangeException(nameof(quantization), "Quantization must be None, Int8 or Int8Rescored.");
         }
+        changeLogCapacity = ResolveChangeLogCapacity(trackChanges, changeLogCapacity, maxCount);
 
         // Rescoring is not a header mode of its own: the file is an int8 file that also carries
         // the float section, so QuantizationMode stays 2 and older readers open it as plain int8.
@@ -52,8 +55,10 @@ public static class QvecFormatLayout
             UpdatedUnixTimeSeconds = now,
         };
 
+        if (trackChanges) MarkTracked(header, now);
+
         var offset = (long)V4Header.HeaderSizeValue;
-        LayOutSections(header, maxCount, vectorDimension, maxNeighbors, maxLayers, metadataHeapCapacity, storeFloats, ref offset);
+        LayOutSections(header, maxCount, vectorDimension, maxNeighbors, maxLayers, metadataHeapCapacity, storeFloats, changeLogCapacity, ref offset);
 
         header.NextSectionDataOffset = offset;
         header.FileLength = offset;
@@ -96,10 +101,51 @@ public static class QvecFormatLayout
             current.VectorDimension, newMaxCount, current.MaxNeighbors, current.MaxLayers,
             newMetadataHeapCapacity, current.DistanceFunction);
 
+        // The log grows in step with the rows so a batch that fills the file never rotates its
+        // own records out. A caller-chosen capacity keeps its ratio to MaxCount.
+        long newLogCapacity = 0;
+        if (current.HasChangeTracking)
+        {
+            long oldCapacity = current.ChangeLogCapacity;
+            newLogCapacity = current.MaxCountRaw == 0
+                ? Math.Max(oldCapacity, newMaxCount)
+                : Math.Max(oldCapacity, checked(oldCapacity * newMaxCount / current.MaxCountRaw));
+        }
+
+        return Relayout(current, newMaxCount, newMetadataHeapCapacity, newLogCapacity);
+    }
+
+    /// <summary>
+    /// The header an untracked database gets when change tracking is enabled on it: identical
+    /// geometry, plus the <see cref="V4SectionIds.EntryVersions"/> and
+    /// <see cref="V4SectionIds.ChangeLog"/> sections appended after the existing ones, the
+    /// <see cref="V4HeaderFlags.HasChangeTracking"/> flag, a fresh <c>ReplicaId</c> and format
+    /// version 6. Existing sections keep their offsets, so no data has to move.
+    /// </summary>
+    /// <param name="changeLogCapacity">Records in the ring; 0 means "as many as MaxCount".</param>
+    /// <exception cref="InvalidOperationException">The header already has change tracking.</exception>
+    public static V4Header CreateTracked(V4Header current, long changeLogCapacity = 0)
+    {
+        ArgumentNullException.ThrowIfNull(current);
+        if (current.HasChangeTracking)
+        {
+            throw new InvalidOperationException("The database already has change tracking enabled.");
+        }
+
+        changeLogCapacity = ResolveChangeLogCapacity(trackChanges: true, changeLogCapacity, current.MaxCountRaw);
+
+        var tracked = Relayout(current, current.MaxCountRaw, current.MetadataHeapCapacity, changeLogCapacity, markTracked: true);
+        return tracked;
+    }
+
+    private static V4Header Relayout(
+        V4Header current, long newMaxCount, long newMetadataHeapCapacity, long changeLogCapacity, bool markTracked = false)
+    {
         var grown = current.CloneState();
         grown.MaxCountRaw = newMaxCount;
         grown.MetadataHeapCapacity = newMetadataHeapCapacity;
         grown.UpdatedUnixTimeSeconds = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        if (markTracked) MarkTracked(grown, grown.UpdatedUnixTimeSeconds);
 
         // CloneState copies the scalar state, not the section table, so whether the file carries
         // the optional float section has to be read off the current table.
@@ -108,12 +154,40 @@ public static class QvecFormatLayout
         var offset = (long)V4Header.HeaderSizeValue;
         LayOutSections(
             grown, newMaxCount, current.VectorDimension, current.MaxNeighbors, current.MaxLayers,
-            newMetadataHeapCapacity, storeFloats, ref offset);
+            newMetadataHeapCapacity, storeFloats, changeLogCapacity, ref offset);
 
         grown.NextSectionDataOffset = offset;
         grown.FileLength = offset;
 
         return grown;
+    }
+
+    private static void MarkTracked(V4Header header, long nowUnixSeconds)
+    {
+        header.Version = V4Header.ChangeTrackingFormatVersion;
+        header.HeaderFlags |= V4HeaderFlags.HasChangeTracking;
+        header.ReplicaId = Guid.NewGuid();
+        header.TrackingEnabledUnixSeconds = nowUnixSeconds;
+    }
+
+    private static long ResolveChangeLogCapacity(bool trackChanges, long changeLogCapacity, long maxCount)
+    {
+        if (!trackChanges)
+        {
+            if (changeLogCapacity != 0)
+            {
+                throw new ArgumentException("A change-log capacity is only meaningful with change tracking.", nameof(changeLogCapacity));
+            }
+            return 0;
+        }
+
+        if (changeLogCapacity < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(changeLogCapacity), "Change-log capacity must be non-negative.");
+        }
+
+        // Every file needs at least one record slot, or the ring's head index has nowhere valid to point.
+        return changeLogCapacity == 0 ? Math.Max(1, maxCount) : changeLogCapacity;
     }
 
     /// <summary>
@@ -175,6 +249,8 @@ public static class QvecFormatLayout
     /// quantization mode calls for; slots 1–6 are identical in both modes so code that walks the
     /// graph and metadata never has to care. Int8 files add the parameter section in slot 7, and
     /// rescored int8 files add the float vectors as an optional (non-Required) section in slot 8.
+    /// Tracked files add per-row versions in slot 9 and the change-log ring in slot 10; they come
+    /// last so enabling tracking on an existing file appends rather than moves.
     /// </summary>
     private static void LayOutSections(
         V4Header header,
@@ -184,6 +260,7 @@ public static class QvecFormatLayout
         int maxLayers,
         long metadataHeapCapacity,
         bool storeFloats,
+        long changeLogCapacity,
         ref long offset)
     {
         bool quantized = header.QuantizationMode != 0;
@@ -215,6 +292,11 @@ public static class QvecFormatLayout
                 throw new ArgumentException("Float vectors are already the primary storage of an unquantized file.", nameof(storeFloats));
             }
             AddSection(header.Sections[8], V4SectionIds.Vectors, ref offset, maxCount, floatElementSize, required: false);
+        }
+        if (header.HasChangeTracking)
+        {
+            AddSection(header.Sections[9], V4SectionIds.EntryVersions, ref offset, maxCount, V4Header.EntryVersionSize);
+            AddSection(header.Sections[10], V4SectionIds.ChangeLog, ref offset, changeLogCapacity, V4Header.ChangeRecordSize);
         }
     }
 

@@ -136,7 +136,18 @@ Primary header är 512 bytes. Fälten nedan är absoluta offsetar från filens b
 | 160 | 8 | `Int64` | `NextSectionDataOffset` | första fria byte efter alla kända sektioner |
 | 168 | 8 | `Int64` | `CreatedUnixTimeSeconds` | `DateTimeOffset.UtcNow.ToUnixTimeSeconds()` vid create |
 | 176 | 8 | `Int64` | `UpdatedUnixTimeSeconds` | uppdateras vid header-commit |
-| 184 | 328 | bytes | `Reserved` | måste vara `0` i v4 |
+| 184 | 16 | `Guid` | `ReplicaId` | replikans identitet; `Guid.Empty` utan change tracking |
+| 200 | 8 | `Int64` | `ChangeSeq` | löpnummer för senaste change-log-post; `0` utan tracking |
+| 208 | 8 | `Int64` | `ChangeLogHead` | nästa lediga slot i change-log-ringen; `0` utan tracking |
+| 216 | 8 | `Int64` | `ChangeLogCount` | antal giltiga poster i ringen; `0` utan tracking |
+| 224 | 8 | `Int64` | `LastHlc` | senast utgivna HLC-värdet (48 bitar ms + 16 bitar räknare); `0` utan tracking |
+| 232 | 8 | `Int64` | `TrackingEnabledUnixSeconds` | när tracking slogs på; `0` utan tracking |
+| 240 | 272 | bytes | `Reserved` | måste vara `0` |
+
+Fälten 184..239 är bara meningsfulla när `HasChangeTracking` är satt (version 6). I en
+version 5-fil ligger de i det som tidigare var `Reserved` och måste vara `0`, så en
+version 5-fil skriven av Qvec 2.0.0 är byte-identisk med en fil skriven av en senare
+version utan tracking. Se `design-sync-engine.md` för semantiken.
 
 ### `HeaderFlags`
 
@@ -145,7 +156,8 @@ Primary header är 512 bytes. Fälten nedan är absoluta offsetar från filens b
 | 0 | `SparseRequested` | Skaparen försökte markera filen sparse |
 | 1 | `SparseConfirmed` | Sparse-markering lyckades eller plattformen har naturlig sparse-semantik |
 | 2 | `HasOptionalSections` | Minst en okänd/optional section slot är present |
-| 3..31 | reserverade | måste skrivas `0`; ignoreras av v4-reader |
+| 3 | `HasChangeTracking` | Filen bär `EntryVersions` och `ChangeLog`; kräver `FormatVersion = 6` |
+| 4..31 | reserverade | måste skrivas `0`; ignoreras av v4-reader |
 
 ### `FormatOptions`
 
@@ -220,10 +232,15 @@ Regler:
 | 8 | `QuantizedVectors` | nej | reserverad | framtida int8-vektorer |
 | 9 | `QuantizationDatasetParameters` | nej | reserverad | framtida dataset-scale/offset |
 | 10 | `QuantizationVectorParameters` | nej | reserverad | framtida per-vektor-scale/offset |
-| 11..1023 | reserverade | nej | varierar | Qvec framtida format |
+| 11 | `EntryVersions` | ja om `HasChangeTracking` | `24` | `Int64 hlc` + `Guid origin` per rad; version 6 |
+| 12 | `ChangeLog` | ja om `HasChangeTracking` | `64` | ring av change-poster; version 6, se `design-sync-engine.md` |
+| 13..1023 | reserverade | nej | varierar | Qvec framtida format |
 | 1024.. | third-party/experiment | nej | varierar | får aldrig markeras `Required` av Qvec v4 |
 
 V4-reader måste förstå ids `1..7`. Om någon saknas eller inte är `Required`, är filen korrupt.
+Ids `11` och `12` får bara förekomma när `HasChangeTracking` är satt och måste då båda vara
+`Required` och present; de läggs sist i layouten så att `EnableChangeTracking` kan lägga till
+dem utan att flytta befintliga sektioner.
 
 ---
 
@@ -438,11 +455,17 @@ oförändrat. En v4-fil skulle redan ha avvisats av `ValidateSections`, eftersom
 `ElementSize` valideras mot formeln, men två olika layouter får inte kalla sig samma
 version.
 
+Version 6 (`ChangeTrackingFormatVersion`) är version 5 plus change tracking: flaggan
+`HasChangeTracking`, headerfälten 184..239 och sektionerna `EntryVersions` (11) och
+`ChangeLog` (12). Version väljs per fil: en databas utan tracking skrivs fortfarande som
+version 5 och är läsbar av Qvec 2.0.0; `EnableChangeTracking` (eller `ChangeTrackingOptions`
+vid create) bumpar filen till 6. Flagga och version måste alltid följas åt.
+
 Exakt kompatibilitetsregel:
 
-- En implementation får bara öppna filer med `MagicNumber == 0x5A564543` och `Version == CurrentFormatVersion`.
+- En implementation får bara öppna filer med `MagicNumber == 0x5A564543` och `Version` lika med `5` eller `6`.
 - Version 1 till 4 migreras inte.
-- Versioner större än `CurrentFormatVersion` avvisas.
+- Versioner större än `6` avvisas.
 - `QvecDatabase.Open(path)` och den publika konstruktorn ska följa samma regel för befintliga filer.
 - Konstruktorargument (`dim`, `max`, `maxNeighbors`, `maxLayers`, `distanceFunction`) får inte användas för att tolka en befintlig fil. Om argumenten skiljer sig från headern ska konstruktorn kasta argument/header-mismatch på samma sätt som dagens säkra beteende, men offsets ska alltid komma från section table.
 

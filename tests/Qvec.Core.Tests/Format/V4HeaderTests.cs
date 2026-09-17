@@ -97,7 +97,14 @@ public class V4HeaderTests
         Assert.Equal(160, V4Header.NextSectionDataOffsetOffset);
         Assert.Equal(168, V4Header.CreatedUnixTimeSecondsOffset);
         Assert.Equal(176, V4Header.UpdatedUnixTimeSecondsOffset);
-        Assert.Equal(184, V4Header.ReservedOffset);
+        Assert.Equal(184, V4Header.ReplicaIdOffset);
+        Assert.Equal(200, V4Header.ChangeSeqOffset);
+        Assert.Equal(208, V4Header.ChangeLogHeadOffset);
+        Assert.Equal(216, V4Header.ChangeLogCountOffset);
+        Assert.Equal(224, V4Header.LastHlcOffset);
+        Assert.Equal(232, V4Header.TrackingEnabledUnixSecondsOffset);
+        Assert.Equal(240, V4Header.ReservedOffset);
+        Assert.Equal(512, V4Header.ReservedOffset + V4Header.ReservedLength);
     }
 
     [Fact]

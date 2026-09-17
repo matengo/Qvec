@@ -26,6 +26,10 @@ public static class V4SectionIds
     public const uint QuantizedVectors = 8;
     public const uint QuantizationDatasetParameters = 9;
     public const uint QuantizationVectorParameters = 10;
+    /// <summary>Per-row (Hlc, Origin) version, 24 bytes each. Present only when the header has <see cref="V4HeaderFlags.HasChangeTracking"/>.</summary>
+    public const uint EntryVersions = 11;
+    /// <summary>Ring buffer of 64-byte change records. Present only when the header has <see cref="V4HeaderFlags.HasChangeTracking"/>.</summary>
+    public const uint ChangeLog = 12;
 }
 
 public sealed class SectionTableEntry
