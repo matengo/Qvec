@@ -1,4 +1,5 @@
 using Qvec.Core;
+using Qvec.Core.Sync;
 
 namespace Qvec.Core.Tests;
 
@@ -29,8 +30,9 @@ public sealed class TempDb : IDisposable
         int maxLayers = 5,
         DistanceFunction distance = DistanceFunction.DotProduct,
         int? indexSeed = null,
-        VectorQuantization quantization = VectorQuantization.None)
-        => new(Path, dim, max, maxNeighbors, maxLayers, distance, indexSeed, quantization);
+        VectorQuantization quantization = VectorQuantization.None,
+        ChangeTrackingOptions? changeTracking = null)
+        => new(Path, dim, max, maxNeighbors, maxLayers, distance, indexSeed, quantization, changeTracking);
 
     public void Dispose()
     {

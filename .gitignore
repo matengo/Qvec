@@ -365,3 +365,6 @@ FodyWeavers.xsd
 *.qvec
 *.qvec.*
 
+
+# Committed test fixture (reference file written by the 2.0.0 format code path)
+!tests/Qvec.Core.Tests/Fixtures/*.qvec

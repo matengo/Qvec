@@ -11,6 +11,11 @@ public enum V4HeaderFlags : uint
     SparseRequested = 1 << 0,
     SparseConfirmed = 1 << 1,
     HasOptionalSections = 1 << 2,
+    /// <summary>
+    /// The file carries per-row versions and a change log (sections 11 and 12) and is written as
+    /// format version 6. Set by change tracking; never present in a version-5 file.
+    /// </summary>
+    HasChangeTracking = 1 << 3,
 }
 
 [Flags]
@@ -27,7 +32,26 @@ public enum V4FormatOptions : uint
 public sealed class V4Header
 {
     public const int MagicNumberValue = 0x5A564543;
+
+    /// <summary>
+    /// Format version of a file without change tracking. Unchanged since 2.0.0 so that files
+    /// written by this build stay readable by that release.
+    /// </summary>
     public const int CurrentFormatVersion = 5;
+
+    /// <summary>
+    /// Format version of a file with change tracking. Deliberately distinct from
+    /// <see cref="CurrentFormatVersion"/>: a 2.0.0 reader would otherwise open a tracked file,
+    /// write rows without versions and silently corrupt replication. Version 6 makes it refuse.
+    /// </summary>
+    public const int ChangeTrackingFormatVersion = 6;
+
+    /// <summary>Bytes per row in the <see cref="V4SectionIds.EntryVersions"/> section: Hlc (8) + Origin (16).</summary>
+    public const uint EntryVersionSize = 24;
+
+    /// <summary>Bytes per record in the <see cref="V4SectionIds.ChangeLog"/> section.</summary>
+    public const uint ChangeRecordSize = 64;
+
     public const int HeaderSizeValue = 4096;
     public const int PrimaryHeaderSizeValue = 512;
     public const int SectionTableOffsetValue = 512;
@@ -67,8 +91,14 @@ public sealed class V4Header
     public const int NextSectionDataOffsetOffset = 160;
     public const int CreatedUnixTimeSecondsOffset = 168;
     public const int UpdatedUnixTimeSecondsOffset = 176;
-    public const int ReservedOffset = 184;
-    public const int ReservedLength = 328;
+    public const int ReplicaIdOffset = 184;
+    public const int ChangeSeqOffset = 200;
+    public const int ChangeLogHeadOffset = 208;
+    public const int ChangeLogCountOffset = 216;
+    public const int LastHlcOffset = 224;
+    public const int TrackingEnabledUnixSecondsOffset = 232;
+    public const int ReservedOffset = 240;
+    public const int ReservedLength = 272;
 
     private const SectionFlags KnownSectionFlags =
         SectionFlags.Present |
@@ -196,6 +226,28 @@ public sealed class V4Header
     public long CreatedUnixTimeSeconds { get; set; }
     public long UpdatedUnixTimeSeconds { get; set; }
 
+    // Change-tracking state (offsets 184..239). All zero, and required to be zero, in a
+    // version-5 file; see HasChangeTracking.
+
+    /// <summary>Identity of this replica; stamped as the origin of every local write.</summary>
+    public Guid ReplicaId { get; set; }
+    /// <summary>Last locally assigned change-log sequence number. Monotone, never reused.</summary>
+    public long ChangeSeq { get; set; }
+    /// <summary>Write position (record index) in the change-log ring.</summary>
+    public long ChangeLogHead { get; set; }
+    /// <summary>Number of valid records in the change-log ring.</summary>
+    public long ChangeLogCount { get; set; }
+    /// <summary>Last hybrid logical clock value issued, so a restart never issues an older one.</summary>
+    public long LastHlc { get; set; }
+    /// <summary>When change tracking was enabled on this file, for diagnostics.</summary>
+    public long TrackingEnabledUnixSeconds { get; set; }
+
+    public bool HasChangeTracking => (HeaderFlags & V4HeaderFlags.HasChangeTracking) != 0;
+
+    /// <summary>Number of records the change-log ring can hold; zero when the file is untracked.</summary>
+    public long ChangeLogCapacity
+        => TryGetSection(V4SectionIds.ChangeLog, out var log) ? log.Length / ChangeRecordSize : 0;
+
     public SectionTableEntry[] Sections { get; } =
         InitializeSectionTable();
 
@@ -239,6 +291,12 @@ public sealed class V4Header
         NextSectionDataOffset = NextSectionDataOffset,
         CreatedUnixTimeSeconds = CreatedUnixTimeSeconds,
         UpdatedUnixTimeSeconds = UpdatedUnixTimeSeconds,
+        ReplicaId = ReplicaId,
+        ChangeSeq = ChangeSeq,
+        ChangeLogHead = ChangeLogHead,
+        ChangeLogCount = ChangeLogCount,
+        LastHlc = LastHlc,
+        TrackingEnabledUnixSeconds = TrackingEnabledUnixSeconds,
     };
 
     public void WriteTo(Span<byte> destination)
@@ -365,6 +423,12 @@ public sealed class V4Header
         BinaryPrimitives.WriteInt64LittleEndian(destination.Slice(NextSectionDataOffsetOffset, sizeof(long)), NextSectionDataOffset);
         BinaryPrimitives.WriteInt64LittleEndian(destination.Slice(CreatedUnixTimeSecondsOffset, sizeof(long)), CreatedUnixTimeSeconds);
         BinaryPrimitives.WriteInt64LittleEndian(destination.Slice(UpdatedUnixTimeSecondsOffset, sizeof(long)), UpdatedUnixTimeSeconds);
+        ReplicaId.TryWriteBytes(destination.Slice(ReplicaIdOffset, 16));
+        BinaryPrimitives.WriteInt64LittleEndian(destination.Slice(ChangeSeqOffset, sizeof(long)), ChangeSeq);
+        BinaryPrimitives.WriteInt64LittleEndian(destination.Slice(ChangeLogHeadOffset, sizeof(long)), ChangeLogHead);
+        BinaryPrimitives.WriteInt64LittleEndian(destination.Slice(ChangeLogCountOffset, sizeof(long)), ChangeLogCount);
+        BinaryPrimitives.WriteInt64LittleEndian(destination.Slice(LastHlcOffset, sizeof(long)), LastHlc);
+        BinaryPrimitives.WriteInt64LittleEndian(destination.Slice(TrackingEnabledUnixSecondsOffset, sizeof(long)), TrackingEnabledUnixSeconds);
     }
 
     private void WriteSectionTable(Span<byte> destination)
@@ -418,6 +482,12 @@ public sealed class V4Header
             NextSectionDataOffset = BinaryPrimitives.ReadInt64LittleEndian(source.Slice(NextSectionDataOffsetOffset, sizeof(long))),
             CreatedUnixTimeSeconds = BinaryPrimitives.ReadInt64LittleEndian(source.Slice(CreatedUnixTimeSecondsOffset, sizeof(long))),
             UpdatedUnixTimeSeconds = BinaryPrimitives.ReadInt64LittleEndian(source.Slice(UpdatedUnixTimeSecondsOffset, sizeof(long))),
+            ReplicaId = new Guid(source.Slice(ReplicaIdOffset, 16)),
+            ChangeSeq = BinaryPrimitives.ReadInt64LittleEndian(source.Slice(ChangeSeqOffset, sizeof(long))),
+            ChangeLogHead = BinaryPrimitives.ReadInt64LittleEndian(source.Slice(ChangeLogHeadOffset, sizeof(long))),
+            ChangeLogCount = BinaryPrimitives.ReadInt64LittleEndian(source.Slice(ChangeLogCountOffset, sizeof(long))),
+            LastHlc = BinaryPrimitives.ReadInt64LittleEndian(source.Slice(LastHlcOffset, sizeof(long))),
+            TrackingEnabledUnixSeconds = BinaryPrimitives.ReadInt64LittleEndian(source.Slice(TrackingEnabledUnixSecondsOffset, sizeof(long))),
         };
     }
 
@@ -443,10 +513,10 @@ public sealed class V4Header
                 $"The file is not a Qvec database: expected magic number 0x{MagicNumberValue:X8} but found 0x{header.MagicNumber:X8}.");
         }
 
-        if (header.Version != CurrentFormatVersion)
+        if (header.Version is not (CurrentFormatVersion or ChangeTrackingFormatVersion))
         {
             throw new QvecFormatException(
-                $"The file has Qvec format version {header.Version}. This build only supports format version {CurrentFormatVersion}.");
+                $"The file has Qvec format version {header.Version}. This build supports format versions {CurrentFormatVersion} and {ChangeTrackingFormatVersion}.");
         }
 
         Require(header.HeaderSize == HeaderSizeValue, $"HeaderSize must be {HeaderSizeValue} bytes but was {header.HeaderSize}.");
@@ -520,6 +590,37 @@ public sealed class V4Header
             Require(header.QuantizationSectionId == V4SectionIds.QuantizedVectors,
                 $"QuantizationSectionId must be {V4SectionIds.QuantizedVectors} for int8 quantization but was {header.QuantizationSectionId}.");
         }
+
+        ValidateChangeTrackingFields(header);
+    }
+
+    /// <summary>
+    /// Version and flag must agree: version 6 is exactly "has change tracking", so a 2.0.0 reader
+    /// rejects every tracked file and this build never misreads an untracked one. In an untracked
+    /// file the tracking fields are still reserved and must be zero, exactly as before.
+    /// </summary>
+    private static void ValidateChangeTrackingFields(V4Header header)
+    {
+        if (header.HasChangeTracking)
+        {
+            Require(header.Version == ChangeTrackingFormatVersion,
+                $"HasChangeTracking requires format version 6 but the file declares version {header.Version}.");
+            Require(header.ReplicaId != Guid.Empty, "ReplicaId must be set when HasChangeTracking is set.");
+            Require(header.ChangeSeq >= 0, $"ChangeSeq must be non-negative but was {header.ChangeSeq}.");
+            Require(header.ChangeLogHead >= 0, $"ChangeLogHead must be non-negative but was {header.ChangeLogHead}.");
+            Require(header.ChangeLogCount >= 0, $"ChangeLogCount must be non-negative but was {header.ChangeLogCount}.");
+            Require(header.LastHlc >= 0, $"LastHlc must be non-negative but was {header.LastHlc}.");
+            return;
+        }
+
+        Require(header.Version == CurrentFormatVersion,
+            $"Format version {header.Version} requires the HasChangeTracking flag, which is not set.");
+        Require(header.ReplicaId == Guid.Empty, "ReplicaId must be zero when HasChangeTracking is not set.");
+        Require(header.ChangeSeq == 0, "ChangeSeq must be zero when HasChangeTracking is not set.");
+        Require(header.ChangeLogHead == 0, "ChangeLogHead must be zero when HasChangeTracking is not set.");
+        Require(header.ChangeLogCount == 0, "ChangeLogCount must be zero when HasChangeTracking is not set.");
+        Require(header.LastHlc == 0, "LastHlc must be zero when HasChangeTracking is not set.");
+        Require(header.TrackingEnabledUnixSeconds == 0, "TrackingEnabledUnixSeconds must be zero when HasChangeTracking is not set.");
     }
 
     private static void ValidateSections(V4Header header, long actualFileLength)
@@ -609,6 +710,12 @@ public sealed class V4Header
         {
             yield return sectionId;
         }
+
+        if (header.HasChangeTracking)
+        {
+            yield return V4SectionIds.EntryVersions;
+            yield return V4SectionIds.ChangeLog;
+        }
     }
 
     private static void ValidateKnownSectionShapes(V4Header header)
@@ -684,6 +791,34 @@ public sealed class V4Header
         Require(freeList.ElementSize == 8, $"FreeList ElementSize must be 8 but was {freeList.ElementSize}.");
         Require(freeList.Length >= CheckedLength(header.MaxCountRaw, 8, V4SectionIds.FreeList),
             "FreeList length is too small for MaxCount.");
+
+        if (header.HasChangeTracking)
+        {
+            var versions = header.GetRequiredSection(V4SectionIds.EntryVersions);
+            Require(versions.ElementSize == EntryVersionSize,
+                $"EntryVersions ElementSize must be {EntryVersionSize} but was {versions.ElementSize}.");
+            Require(versions.Length >= CheckedLength(header.MaxCountRaw, EntryVersionSize, V4SectionIds.EntryVersions),
+                "EntryVersions length is too small for MaxCount.");
+
+            var log = header.GetRequiredSection(V4SectionIds.ChangeLog);
+            Require(log.ElementSize == ChangeRecordSize,
+                $"ChangeLog ElementSize must be {ChangeRecordSize} but was {log.ElementSize}.");
+            Require(log.Length >= ChangeRecordSize && log.Length % ChangeRecordSize == 0,
+                $"ChangeLog length must be a positive multiple of {ChangeRecordSize} but was {log.Length}.");
+
+            long capacity = log.Length / ChangeRecordSize;
+            Require(header.ChangeLogCount <= capacity,
+                $"ChangeLogCount ({header.ChangeLogCount}) cannot exceed the change-log capacity ({capacity}).");
+            Require(header.ChangeLogHead < capacity,
+                $"ChangeLogHead ({header.ChangeLogHead}) must be below the change-log capacity ({capacity}).");
+        }
+        else
+        {
+            Require(!header.TryGetSection(V4SectionIds.EntryVersions, out _),
+                $"Section id {V4SectionIds.EntryVersions} (EntryVersions) requires the HasChangeTracking flag.");
+            Require(!header.TryGetSection(V4SectionIds.ChangeLog, out _),
+                $"Section id {V4SectionIds.ChangeLog} (ChangeLog) requires the HasChangeTracking flag.");
+        }
     }
 
     private static void ValidateNoOverlaps(List<SectionExtent> extents)
@@ -730,6 +865,7 @@ public sealed class V4Header
     private static bool IsKnownRequiredSection(V4Header header, uint sectionId)
     {
         if (sectionId is >= V4SectionIds.Graph and <= V4SectionIds.FreeList) return true;
+        if (header.HasChangeTracking && sectionId is V4SectionIds.EntryVersions or V4SectionIds.ChangeLog) return true;
         return header.QuantizationMode == 0
             ? sectionId == V4SectionIds.Vectors
             : sectionId is V4SectionIds.QuantizedVectors or V4SectionIds.QuantizationVectorParameters;
