@@ -1,4 +1,11 @@
-# Design: Filformat v4
+# Design: Filformat (aktuell version 5)
+
+> **Om namngivningen.** Layouten i det här dokumentet infördes som formatversion 4 och kallas
+> därför "v4" i löptexten nedan. Headerfältet `Version` är idag **5** (`CurrentFormatVersion`):
+> version 5 bumpades när baslagret fick dubbel fan-out (`M0 = 2 * MaxNeighbors`) och
+> ändrade `Graph.ElementSize`, se [Version och kompatibilitet](#version-och-kompatibilitet).
+> Allt som sägs om "v4-reader", "v4-fil" osv. gäller alltså även version 5, om inte annat
+> anges. Nästa planerade bump är version 6 för [sync-spårning](design-sync-engine.md).
 
 ## Bakgrund
 
@@ -888,9 +895,9 @@ Det här bryter för användare:
 
 README måste säga:
 
-- Qvec v4 använder ett nytt on-disk format.
+- Qvec 2.x använder ett nytt on-disk format (version 5).
 - v2/v3-filer migreras inte automatiskt.
-- För att uppgradera: exportera vektorer + metadata + Guid med äldre Qvec-version och importera i en ny v4-fil.
+- För att uppgradera: exportera vektorer + metadata + Guid med äldre Qvec-version och importera i en ny fil.
 - Ta backup före uppgradering.
 - Metadata är variabel längd och lagras i append-only heap; kör `Vacuum()` för att reclaim:a metadata-garbage efter många updates.
 - Sparse files används opportunistiskt; rapporterad filstorlek är logisk storlek och kan vara större än fysisk diskförbrukning.
@@ -898,7 +905,7 @@ README måste säga:
 CHANGELOG måste ha en breaking-change-post:
 
 ```text
-BREAKING: Qvec on-disk format is now version 4. Qvec v4 does not open or migrate v2/v3 `.zvec` files. Export with an older Qvec version and re-import into a new v4 database.
+BREAKING: Qvec on-disk format is now version 5. Qvec 2.x does not open or migrate v2/v3 `.zvec` files. Export with an older Qvec version and re-import into a new database.
 ```
 
 Felmeddelanden ska peka användaren mot export/import, inte mot att ändra konstruktorargument.
