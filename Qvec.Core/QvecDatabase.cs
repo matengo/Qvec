@@ -676,6 +676,84 @@ namespace Qvec.Core
             finally { _lock.ExitWriteLock(); }
         }
 
+        /// <summary>
+        /// Writes a bit-exact, committed copy of this database to <paramref name="destination"/>.
+        /// The copy keeps this replica's <see cref="ReplicaId"/> and its whole change log, so a new
+        /// peer can bootstrap by opening it after <see cref="AdoptAsReplica"/> and then pull only the
+        /// delta after <see cref="SnapshotInfo.ChangeSeq"/>. Writers are blocked for the duration of
+        /// the copy; readers are not. Nothing is re-indexed.
+        /// </summary>
+        /// <exception cref="InvalidOperationException">Change tracking is not enabled.</exception>
+        public unsafe SnapshotInfo ExportSnapshot(Stream destination)
+        {
+            ArgumentNullException.ThrowIfNull(destination);
+
+            _lock.EnterWriteLock();
+            try
+            {
+                if (!_tracking)
+                    throw new InvalidOperationException("Change tracking is not enabled on this database; a snapshot without versions cannot be synchronised.");
+
+                // Publish a clean header first so the copy is openable, then copy straight from the
+                // mapping: the file itself is held with FileShare.None while open.
+                CommitHeader();
+
+                destination.Write(HeaderSpan);
+                long remaining = _header.FileLength - HeaderSize;
+                byte* cursor = DataBasePointer;
+                while (remaining > 0)
+                {
+                    int chunk = (int)Math.Min(remaining, 1 << 20);
+                    destination.Write(new ReadOnlySpan<byte>(cursor, chunk));
+                    cursor += chunk;
+                    remaining -= chunk;
+                }
+                destination.Flush();
+
+                return new SnapshotInfo(_header.ReplicaId, _header.ChangeSeq, _header.FileLength);
+            }
+            finally { _lock.ExitWriteLock(); }
+        }
+
+        /// <summary>
+        /// Turns a snapshot file (see <see cref="ExportSnapshot"/>) into an independent replica by
+        /// giving it a new <see cref="ReplicaId"/>. Versions, the change log and every row are
+        /// untouched, so the file stays byte-compatible with what its peers already know about it.
+        /// The identity it had is returned along with the newest sequence it contains; a sync agent
+        /// records that pair as its cursor for the source peer. The file must not be open.
+        /// </summary>
+        /// <exception cref="ArgumentException"><paramref name="newReplicaId"/> is empty or equals the file's current identity.</exception>
+        /// <exception cref="QvecFormatException">The file is not a tracked Qvec database or was not closed cleanly.</exception>
+        public static void AdoptAsReplica(string path, Guid newReplicaId, out Guid sourceReplicaId, out long sourceSeq)
+        {
+            ArgumentException.ThrowIfNullOrEmpty(path);
+            if (newReplicaId == Guid.Empty)
+                throw new ArgumentException("A replica id must not be empty.", nameof(newReplicaId));
+
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+            var image = new byte[HeaderSize];
+            fs.ReadExactly(image);
+
+            V4Header header = V4Header.Read(image, fs.Length);
+            header.EnsureCleanOpen(path);
+            if (!header.HasChangeTracking)
+                throw new QvecFormatException($"'{path}' was created without change tracking and cannot be adopted as a replica.");
+            if (header.ReplicaId == newReplicaId)
+                throw new ArgumentException("The file already has this replica id; two replicas sharing an identity would treat each other's writes as their own.", nameof(newReplicaId));
+
+            sourceReplicaId = header.ReplicaId;
+            sourceSeq = header.ChangeSeq;
+
+            header.ReplicaId = newReplicaId;
+            header.Generation++;
+            header.UpdatedUnixTimeSeconds = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            header.WriteTo(image);
+
+            fs.Position = 0;
+            fs.Write(image);
+            fs.Flush(flushToDisk: true);
+        }
+
         private ApplyOutcome ApplyOne(ChangeItem item, ChangePayloadKind payload, bool localInt8, out string? reason)
         {
             reason = null;
