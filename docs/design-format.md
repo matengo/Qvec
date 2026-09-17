@@ -443,6 +443,52 @@ Behåll både tombstone-scan och persistent free list, men ändra deras roller:
 
 Motivering: `AllocateSlot` blir O(1) efter restart, men startup hittar korrupta eller ofullständiga free-list-skrivningar deterministiskt. Eftersom v4 har `WriteInProgress` ska en crash mitt i delete normalt avvisas redan innan free-list-valideringen.
 
+### `EntryVersions` section (version 6)
+
+Finns bara när `HasChangeTracking` är satt. En rad per slot, 24 bytes:
+
+```
+row i offset = EntryVersions.Offset + i * 24
+  0  8  Int64  Hlc       hybrid logical clock (48 bit väggklocka i ms << 16 | 16 bit räknare)
+  8 16  Guid   Origin    ReplicaId för den replika som skapade versionen
+```
+
+Skrivs efter varje `AddEntry`/`Update`/`UpdateMetadata` och när `ApplyChanges` tar in en
+fjärrversion. Live-radens version är den normativa; en raderad rads version lever bara i
+`ChangeLog`.
+
+### `ChangeLog` section (version 6)
+
+Finns bara när `HasChangeTracking` är satt. En ringbuffert med `ChangeLogCapacity` slots om 64
+bytes; ordningen i ringen är den normativa ändringsordningen och `ChangeSeq` i headern är
+sekvensnumret på den senaste posten.
+
+```
+slot i offset = ChangeLog.Offset + i * 64
+  0  8  Int64  Seq         1-baserat, strikt växande per fil
+  8  8  Int64  Hlc         versionens klocka
+ 16 16  Guid   DocumentId
+ 32 16  Guid   Origin      versionens ursprung
+ 48  1  Byte   Type        1 = Upsert, 2 = Delete
+ 49 15  -      reserverad, nollor
+```
+
+Headerfält:
+
+- `ChangeLogHead`: nästa slot som skrivs.
+- `ChangeLogCount`: antal giltiga poster (`<= ChangeLogCapacity`).
+- posten för `seq` ligger i slot `(ChangeLogHead - 1 - (ChangeSeq - seq)) mod ChangeLogCapacity`.
+
+Append skriver slotten först och committar headern efteråt tillsammans med den mutation som
+orsakade posten. En post som ligger bortom `ChangeLogCount` efter en crash ignoreras därför vid
+`Open`. Vid `Open` spelas ringen upp äldst→nyast för att återskapa versionerna på raderade
+dokument (tombstone-versioner) i minnet; poster för dokument som är live ignoreras.
+
+`Grow` med ändrad `ChangeLogCapacity` och `Vacuum` packar om ringen: alla giltiga poster skrivs
+kontinuerligt från slot 0 med bevarade `Seq`, och `ChangeSeq` behålls så att andra replikers
+cursorer förblir giltiga. Cursorer äldre än `ChangeSeq - ChangeLogCount + 1` avvisas med
+`SyncCursorTooOldException`; se `design-sync-engine.md` §4 för `GetChanges`/`ApplyChanges`.
+
 ---
 
 ## Version och kompatibilitet

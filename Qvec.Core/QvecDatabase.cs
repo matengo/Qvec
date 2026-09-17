@@ -73,8 +73,14 @@ namespace Qvec.Core
         private bool _tracking;
         /// <summary>Offset of section 11 (24 B per row: Hlc + Origin); only meaningful when <see cref="_tracking"/>.</summary>
         private long _entryVersionsSectionOffset;
-        /// <summary>Offset of section 12 (change-log ring); only meaningful when <see cref="_tracking"/>. Written from PR 2 onward.</summary>
+        /// <summary>Offset of section 12 (change-log ring); only meaningful when <see cref="_tracking"/>.</summary>
         private long _changeLogSectionOffset;
+        /// <summary>
+        /// Tombstone versions for documents that are not live, rebuilt from the change-log ring on
+        /// open (deleted rows are recycled, so the version cannot live on the row). A document
+        /// whose tombstone has rotated out of the ring is simply forgotten; see design 4.4.
+        /// </summary>
+        private readonly Dictionary<Guid, EntryVersion> _deletedVersions = new();
         private readonly Dictionary<Guid, int> _guidIndex = new();
         private TombstoneSet _deletedIndices;
         private readonly int[] _cachedEmptyNeighbors;
@@ -222,6 +228,7 @@ namespace Qvec.Core
             {
                 RebuildGuidIndex();
                 LoadTombstones();
+            LoadDeletedVersions();
             }
         }
 
@@ -504,12 +511,270 @@ namespace Qvec.Core
                 for (int index = 0; index < _header.CurrentCount; index++)
                 {
                     if (_deletedIndices.Contains(index)) continue;
-                    StampLocalVersion(index);
+                    RecordLocalUpsert(index, ReadGuidFromDisk(index));
                 }
 
                 CommitHeader();
             }
             finally { _lock.ExitWriteLock(); }
+        }
+
+        /// <summary>Sequence number of the newest change-log record; 0 when tracking is off or nothing has been written.</summary>
+        public long ChangeSeq => _header.ChangeSeq;
+
+        /// <summary>Records currently held in the ring.</summary>
+        public long ChangeLogCount => _header.ChangeLogCount;
+
+        /// <summary>
+        /// Sequence number of the oldest record still in the ring. A cursor older than
+        /// <c>OldestChangeSeq - 1</c> can no longer be served by <see cref="GetChanges"/>.
+        /// </summary>
+        public long OldestChangeSeq => _header.ChangeSeq - _header.ChangeLogCount + 1;
+
+        /// <summary>
+        /// Extracts index terms from metadata. When set, <see cref="ApplyChanges"/> keeps the
+        /// inverted index current for rows it writes; <see cref="RebuildFieldIndex"/> sets it.
+        /// </summary>
+        public Func<string, IEnumerable<(string Field, string Value)>>? FieldIndexExtractor { get; set; }
+
+        /// <summary>
+        /// Reads the change log after <paramref name="sinceSeq"/> and returns each touched
+        /// document once, with its current state: a live row becomes an <see cref="ChangeType.Upsert"/>
+        /// carrying vector and metadata, anything else a <see cref="ChangeType.Delete"/>.
+        /// Intermediate versions are not reconstructed -- that is last-writer-wins by design.
+        /// </summary>
+        /// <param name="sinceSeq">Cursor: the last sequence number the caller has already seen; 0 for everything.</param>
+        /// <param name="maxItems">Upper bound on distinct documents in the batch.</param>
+        /// <param name="excludeOrigin">
+        /// Drop documents whose current version was written by this replica. Use the pulling
+        /// peer's id so it is not sent its own changes back.
+        /// </param>
+        /// <exception cref="SyncCursorTooOldException">The ring has rotated past <paramref name="sinceSeq"/>.</exception>
+        public ChangeBatch GetChanges(long sinceSeq, int maxItems, Guid? excludeOrigin = null)
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(sinceSeq);
+            ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxItems);
+
+            _lock.EnterReadLock();
+            try
+            {
+                if (!_tracking)
+                    throw new InvalidOperationException("Change tracking is not enabled on this database; call EnableChangeTracking first.");
+                if (sinceSeq > _header.ChangeSeq)
+                    throw new ArgumentOutOfRangeException(nameof(sinceSeq), sinceSeq, $"Cursor is ahead of the log head ({_header.ChangeSeq}).");
+
+                long oldest = OldestChangeSeq;
+                if (sinceSeq < oldest - 1)
+                    throw new SyncCursorTooOldException(sinceSeq, oldest);
+
+                var latest = new Dictionary<Guid, ChangeRecord>();
+                var order = new List<Guid>();
+                long toSeq = sinceSeq;
+                for (long seq = sinceSeq + 1; seq <= _header.ChangeSeq; seq++)
+                {
+                    var record = ReadChangeRecord(SlotOfSeq(seq));
+                    if (!latest.ContainsKey(record.DocumentId))
+                    {
+                        if (latest.Count == maxItems) break;
+                        order.Add(record.DocumentId);
+                    }
+                    latest[record.DocumentId] = record;
+                    toSeq = seq;
+                }
+
+                bool int8Payload = _quantized && !_rescore;
+                var items = new List<ChangeItem>(order.Count);
+                foreach (var id in order)
+                {
+                    if (_guidIndex.TryGetValue(id, out int index))
+                    {
+                        var version = ReadVersionFromDisk(index);
+                        if (version.Origin == excludeOrigin) continue;
+                        items.Add(int8Payload ? BuildInt8Upsert(id, index, version) : BuildFloatUpsert(id, index, version));
+                    }
+                    else
+                    {
+                        var record = latest[id];
+                        var version = _deletedVersions.TryGetValue(id, out var tombstone)
+                            ? tombstone
+                            : new EntryVersion(record.Hlc, record.Origin);
+                        if (version.Origin == excludeOrigin) continue;
+                        items.Add(new ChangeItem { Type = ChangeType.Delete, DocumentId = id, Version = version });
+                    }
+                }
+
+                return new ChangeBatch
+                {
+                    SourceReplicaId = _header.ReplicaId,
+                    Dimension = _header.VectorDimension,
+                    DistanceFunction = _header.DistanceFunction,
+                    Payload = int8Payload ? ChangePayloadKind.Int8 : ChangePayloadKind.Float,
+                    FromSeq = sinceSeq + 1,
+                    ToSeq = toSeq,
+                    Items = items,
+                    HasMore = toSeq < _header.ChangeSeq
+                };
+            }
+            finally { _lock.ExitReadLock(); }
+        }
+
+        private ChangeItem BuildFloatUpsert(Guid id, int index, EntryVersion version)
+        {
+            var vector = new float[_header.VectorDimension];
+            ReadVectorInto(index, vector, 0);
+            return new ChangeItem { Type = ChangeType.Upsert, DocumentId = id, Version = version, Vector = vector, Metadata = GetMetadata(index) };
+        }
+
+        private unsafe ChangeItem BuildInt8Upsert(Guid id, int index, EntryVersion version)
+        {
+            var codes = new ReadOnlySpan<byte>(CodesPointer(index), _header.VectorDimension).ToArray();
+            return new ChangeItem
+            {
+                Type = ChangeType.Upsert, DocumentId = id, Version = version,
+                Codes = codes, Parameters = ParamsAt(index), Metadata = GetMetadata(index)
+            };
+        }
+
+        /// <summary>
+        /// Merges a peer's changes with last-writer-wins on <see cref="EntryVersion"/>: an item is
+        /// applied only if its version is newer than what this replica holds for the document
+        /// (live row or tombstone). Applied items keep the remote version and are appended to this
+        /// replica's own log so that its peers see them too. Idempotent.
+        /// </summary>
+        /// <exception cref="ArgumentException">The batch's dimension does not match this database.</exception>
+        public ApplyResult ApplyChanges(ChangeBatch batch)
+        {
+            ArgumentNullException.ThrowIfNull(batch);
+
+            _lock.EnterWriteLock();
+            try
+            {
+                if (!_tracking)
+                    throw new InvalidOperationException("Change tracking is not enabled on this database; call EnableChangeTracking first.");
+                if (batch.Dimension != _header.VectorDimension)
+                    throw new ArgumentException($"Batch dimension {batch.Dimension} does not match the database dimension {_header.VectorDimension}.", nameof(batch));
+
+                bool localInt8 = _quantized && !_rescore;
+                var results = new List<ApplyItemResult>(batch.Items.Count);
+                int applied = 0, skipped = 0, rejected = 0;
+
+                for (int i = 0; i < batch.Items.Count; i++)
+                {
+                    var item = batch.Items[i];
+                    var outcome = ApplyOne(item, batch.Payload, localInt8, out string? reason);
+                    switch (outcome)
+                    {
+                        case ApplyOutcome.Applied: applied++; break;
+                        case ApplyOutcome.Skipped: skipped++; break;
+                        default: rejected++; break;
+                    }
+                    results.Add(new ApplyItemResult(i, item.DocumentId, outcome, reason));
+                }
+
+                return new ApplyResult { Applied = applied, Skipped = skipped, Rejected = rejected, Items = results };
+            }
+            finally { _lock.ExitWriteLock(); }
+        }
+
+        private ApplyOutcome ApplyOne(ChangeItem item, ChangePayloadKind payload, bool localInt8, out string? reason)
+        {
+            reason = null;
+            int dim = _header.VectorDimension;
+
+            bool live = _guidIndex.TryGetValue(item.DocumentId, out int oldIndex);
+            EntryVersion? local = live ? ReadVersionFromDisk(oldIndex)
+                : _deletedVersions.TryGetValue(item.DocumentId, out var tombstone) ? tombstone
+                : null;
+            if (local is { } current && item.Version <= current)
+                return ApplyOutcome.Skipped;
+
+            if (item.Type == ChangeType.Delete)
+            {
+                if (live)
+                {
+                    RemoveLiveRow(item.DocumentId, oldIndex);
+                }
+                RecordRemoteDelete(item.DocumentId, item.Version);
+                CommitHeader();
+                return ApplyOutcome.Applied;
+            }
+
+            if (item.Type != ChangeType.Upsert)
+            {
+                reason = $"Unknown change type {(byte)item.Type}.";
+                return ApplyOutcome.Rejected;
+            }
+            if (item.Metadata is null)
+            {
+                reason = "Upsert without metadata.";
+                return ApplyOutcome.Rejected;
+            }
+
+            float[] floats;
+            if (payload == ChangePayloadKind.Int8)
+            {
+                if (!localInt8)
+                {
+                    reason = "Int8 payload cannot be applied to a database that stores float vectors; the source has no floats to send.";
+                    return ApplyOutcome.Rejected;
+                }
+                if (item.Codes is null || item.Parameters is null)
+                {
+                    reason = "Int8 upsert without codes or parameters.";
+                    return ApplyOutcome.Rejected;
+                }
+                if (item.Codes.Length != dim)
+                {
+                    reason = $"Vector dimension {item.Codes.Length} does not match the database dimension {dim}.";
+                    return ApplyOutcome.Rejected;
+                }
+                floats = new float[dim];
+                Int8Quantizer.Dequantize(item.Codes, item.Parameters.Value, floats);
+            }
+            else
+            {
+                if (item.Vector is null)
+                {
+                    reason = "Upsert without vector.";
+                    return ApplyOutcome.Rejected;
+                }
+                if (item.Vector.Length != dim)
+                {
+                    reason = $"Vector dimension {item.Vector.Length} does not match the database dimension {dim}.";
+                    return ApplyOutcome.Rejected;
+                }
+                floats = item.Vector;
+            }
+
+            List<(string Field, string Value)>? inheritedTerms = null;
+            if (live)
+            {
+                if (FieldIndexExtractor is null) inheritedTerms = GetFieldTerms(oldIndex);
+                RemoveLiveRow(item.DocumentId, oldIndex);
+            }
+
+            AddEntryInternal(floats, item.Metadata, item.DocumentId, item.Version);
+            int newIndex = _guidIndex[item.DocumentId];
+
+            if (payload == ChangePayloadKind.Int8)
+            {
+                // Store the peer's exact codes so replicas stay bit-identical instead of
+                // re-quantising a dequantised approximation.
+                WriteCodesToDisk(newIndex, item.Codes!, item.Parameters!.Value);
+            }
+
+            if (FieldIndexExtractor is { } extractor) AddFieldIndex(newIndex, extractor(item.Metadata));
+            else if (inheritedTerms is { Count: > 0 }) AddFieldIndex(newIndex, inheritedTerms);
+
+            return ApplyOutcome.Applied;
+        }
+
+        /// <summary>Soft-deletes a live row and forgets its GUID. Callers append the log record and commit.</summary>
+        private void RemoveLiveRow(Guid id, int index)
+        {
+            _guidIndex.Remove(id);
+            SoftDelete(index);
+            _header.DeletedCount++;
         }
 
         /// <summary>Issues the next local HLC value and records it in the header. Callers hold the write lock.</summary>
@@ -521,14 +786,41 @@ namespace Qvec.Core
         }
 
         /// <summary>
-        /// Stamps a row with a new local version. Every mutation path calls this after writing the
-        /// row and before <see cref="CommitHeader"/>; the check is the only tracking cost an
-        /// untracked database ever pays.
+        /// Stamps a row with a new local version and logs the upsert. Every local mutation path
+        /// calls this after writing the row and before <see cref="CommitHeader"/>; the check is
+        /// the only tracking cost an untracked database ever pays.
         /// </summary>
-        private void StampLocalVersion(int index)
+        private void RecordLocalUpsert(int index, Guid docId)
         {
             if (!_tracking) return;
-            WriteVersionToDisk(index, TickLocalHlc(), _header.ReplicaId);
+            var version = new EntryVersion(TickLocalHlc(), _header.ReplicaId);
+            WriteVersionToDisk(index, version.Hlc, version.Origin);
+            AppendChangeRecord(ChangeType.Upsert, docId, version);
+            _deletedVersions.Remove(docId);
+        }
+
+        private void RecordLocalDelete(Guid docId)
+        {
+            if (!_tracking) return;
+            var version = new EntryVersion(TickLocalHlc(), _header.ReplicaId);
+            AppendChangeRecord(ChangeType.Delete, docId, version);
+            _deletedVersions[docId] = version;
+        }
+
+        /// <summary>Stamps a row with a version received from a peer and advances the local clock past it.</summary>
+        private void RecordRemoteUpsert(int index, Guid docId, EntryVersion version)
+        {
+            _header.LastHlc = HybridLogicalClock.Receive(_header.LastHlc, version.Hlc);
+            WriteVersionToDisk(index, version.Hlc, version.Origin);
+            AppendChangeRecord(ChangeType.Upsert, docId, version);
+            _deletedVersions.Remove(docId);
+        }
+
+        private void RecordRemoteDelete(Guid docId, EntryVersion version)
+        {
+            _header.LastHlc = HybridLogicalClock.Receive(_header.LastHlc, version.Hlc);
+            AppendChangeRecord(ChangeType.Delete, docId, version);
+            _deletedVersions[docId] = version;
         }
 
         private unsafe void WriteVersionToDisk(int index, long hlc, Guid origin)
@@ -544,6 +836,104 @@ namespace Qvec.Core
             byte* row = DataBasePointer + (_entryVersionsSectionOffset - HeaderSize) + (long)index * V4Header.EntryVersionSize;
             long hlc = BinaryPrimitives.ReadInt64LittleEndian(new ReadOnlySpan<byte>(row, sizeof(long)));
             return new EntryVersion(hlc, new Guid(new ReadOnlySpan<byte>(row + sizeof(long), GuidSize)));
+        }
+
+        // --- CHANGE LOG RING ---
+
+        /// <summary>One 64-byte slot in section 12. Layout per design 4.2; bytes 49..63 are reserved zero.</summary>
+        private readonly record struct ChangeRecord(long Seq, long Hlc, Guid DocumentId, Guid Origin, ChangeType Type);
+
+        private unsafe byte* ChangeRecordPointer(long slot)
+            => DataBasePointer + (_changeLogSectionOffset - HeaderSize) + slot * V4Header.ChangeRecordSize;
+
+        /// <summary>Ring slot holding sequence number <paramref name="seq"/>; only valid for seq within [OldestChangeSeq, ChangeSeq].</summary>
+        private long SlotOfSeq(long seq)
+        {
+            long capacity = _header.ChangeLogCapacity;
+            long newestSlot = (_header.ChangeLogHead - 1 + capacity) % capacity;
+            return ((newestSlot - (_header.ChangeSeq - seq)) % capacity + capacity) % capacity;
+        }
+
+        /// <summary>
+        /// Writes the record into the next ring slot and advances the header counters. The header
+        /// is not committed here: a record beyond the committed <c>ChangeLogCount</c> after a crash
+        /// is ignored on open, the same way a row beyond <c>CurrentCount</c> is.
+        /// </summary>
+        private void AppendChangeRecord(ChangeType type, Guid docId, EntryVersion version)
+        {
+            BeginWrite();
+            long capacity = _header.ChangeLogCapacity;
+            long seq = _header.ChangeSeq + 1;
+            WriteChangeRecord(_header.ChangeLogHead, new ChangeRecord(seq, version.Hlc, docId, version.Origin, type));
+
+            _header.ChangeSeq = seq;
+            _header.ChangeLogHead = (_header.ChangeLogHead + 1) % capacity;
+            _header.ChangeLogCount = Math.Min(_header.ChangeLogCount + 1, capacity);
+        }
+
+        private unsafe void WriteChangeRecord(long slot, ChangeRecord record)
+        {
+            var span = new Span<byte>(ChangeRecordPointer(slot), (int)V4Header.ChangeRecordSize);
+            span.Clear();
+            BinaryPrimitives.WriteInt64LittleEndian(span, record.Seq);
+            BinaryPrimitives.WriteInt64LittleEndian(span[8..], record.Hlc);
+            record.DocumentId.TryWriteBytes(span[16..32]);
+            record.Origin.TryWriteBytes(span[32..48]);
+            span[48] = (byte)record.Type;
+        }
+
+        private unsafe ChangeRecord ReadChangeRecord(long slot)
+        {
+            var span = new ReadOnlySpan<byte>(ChangeRecordPointer(slot), (int)V4Header.ChangeRecordSize);
+            return new ChangeRecord(
+                BinaryPrimitives.ReadInt64LittleEndian(span),
+                BinaryPrimitives.ReadInt64LittleEndian(span[8..]),
+                new Guid(span[16..32]),
+                new Guid(span[32..48]),
+                (ChangeType)span[48]);
+        }
+
+        /// <summary>All records currently in the ring, oldest first.</summary>
+        private List<ChangeRecord> ReadChangeLog()
+        {
+            var records = new List<ChangeRecord>((int)Math.Min(_header.ChangeLogCount, int.MaxValue));
+            for (long seq = OldestChangeSeq; seq <= _header.ChangeSeq; seq++)
+                records.Add(ReadChangeRecord(SlotOfSeq(seq)));
+            return records;
+        }
+
+        /// <summary>
+        /// Writes <paramref name="records"/> into slots 0..n-1 and points the head after them.
+        /// Used after a relayout changed the ring capacity, which invalidates every slot index.
+        /// </summary>
+        private void WritePackedChangeLog(List<ChangeRecord> records)
+        {
+            long capacity = _header.ChangeLogCapacity;
+            int skip = (int)Math.Max(0, records.Count - capacity);
+            for (int i = skip; i < records.Count; i++)
+                WriteChangeRecord(i - skip, records[i]);
+
+            _header.ChangeLogCount = records.Count - skip;
+            _header.ChangeLogHead = _header.ChangeLogCount % capacity;
+        }
+
+        /// <summary>Rebuilds <see cref="_deletedVersions"/> from the ring. Requires <see cref="_guidIndex"/> and tombstones to be loaded.</summary>
+        private void LoadDeletedVersions()
+        {
+            _deletedVersions.Clear();
+            if (!_tracking) return;
+
+            foreach (var record in ReadChangeLog())
+            {
+                if (record.Type == ChangeType.Delete)
+                    _deletedVersions[record.DocumentId] = new EntryVersion(record.Hlc, record.Origin);
+                else
+                    _deletedVersions.Remove(record.DocumentId);
+            }
+
+            // A document that is live cannot also carry a tombstone; the row's version rules.
+            foreach (var id in _deletedVersions.Keys.Where(_guidIndex.ContainsKey).ToList())
+                _deletedVersions.Remove(id);
         }
 
         /// <summary>Maximalt antal poster databasen kan rymma.</summary>
@@ -835,6 +1225,10 @@ namespace Qvec.Core
                             for (int n = 0; n < live.Count; n++)
                                 rebuilt.WriteVersionToDisk(n, live[n].Version.Hlc, live[n].Version.Origin);
 
+                            // The rebuild's own AddEntry calls logged upserts with fresh versions;
+                            // replace that with the source ring so peers' cursors stay valid.
+                            rebuilt.WritePackedChangeLog(ReadChangeLog());
+                            rebuilt._header.ChangeSeq = _header.ChangeSeq;
                             rebuilt._header.LastHlc = Math.Max(rebuilt._header.LastHlc, _header.LastHlc);
                             rebuilt._header.TrackingEnabledUnixSeconds = _header.TrackingEnabledUnixSeconds;
                             rebuilt.CommitHeader();
@@ -971,6 +1365,12 @@ namespace Qvec.Core
 
             var moves = PlanSectionMoves(_header, target);
 
+            // Ring slots are addressed modulo capacity, so a capacity change invalidates every
+            // slot index. Lift the records out now and re-pack them against the new geometry.
+            List<ChangeRecord>? ring = _tracking && _header.ChangeLogCapacity != target.ChangeLogCapacity
+                ? ReadChangeLog()
+                : null;
+
             ReleaseMapping();
 
             try
@@ -986,6 +1386,7 @@ namespace Qvec.Core
                 _header = target;
                 RemapAfterGrow();
                 InitialiseNewCapacity();
+                if (ring is not null) WritePackedChangeLog(ring);
                 CommitHeader();
                 _headerAccessor.Flush();
             }
@@ -1137,6 +1538,7 @@ namespace Qvec.Core
             _deletedIndices.Clear();
             RebuildGuidIndex();
             LoadTombstones();
+            LoadDeletedVersions();
             _headerDirty = false;
         }
 
@@ -1179,7 +1581,7 @@ namespace Qvec.Core
                 WriteVectorToDisk(index, vector);
                 WriteMetadataToDisk(index, metadata);
                 WriteGuidToDisk(index, docId);
-                StampLocalVersion(index);
+                RecordLocalUpsert(index, docId);
                 InitNeighborsOnDisk(index);
 
                 _guidIndex[docId] = index;
@@ -1280,7 +1682,7 @@ namespace Qvec.Core
                         WriteVectorToDisk(index, vector);
                         WriteMetadataToDisk(index, entry.Metadata);
                         WriteGuidToDisk(index, docId);
-                        StampLocalVersion(index);
+                        RecordLocalUpsert(index, docId);
                         InitNeighborsOnDisk(index);
                         _guidIndex[docId] = index;
 
@@ -1378,6 +1780,14 @@ namespace Qvec.Core
             {
                 Buffer.MemoryCopy(source, VectorPointer(index), bytes, bytes);
             }
+        }
+
+        /// <summary>Overwrites a row's int8 codes and parameters verbatim. Only valid for pure int8 files.</summary>
+        private unsafe void WriteCodesToDisk(int index, byte[] codes, Int8VectorParameters parameters)
+        {
+            BeginWrite();
+            codes.AsSpan(0, _header.VectorDimension).CopyTo(new Span<byte>(CodesPointer(index), _header.VectorDimension));
+            parameters.WriteTo(new Span<byte>(ParamsPointer(index), Int8VectorParameters.Size));
         }
         private void WriteMetadataToDisk(int index, string metadata)
         {
@@ -1588,9 +1998,11 @@ namespace Qvec.Core
         /// </summary>
         public void RebuildFieldIndex(Func<string, IEnumerable<(string Field, string Value)>> extractor)
         {
+            ArgumentNullException.ThrowIfNull(extractor);
             _lock.EnterWriteLock();
             try
             {
+                FieldIndexExtractor = extractor;
                 _fieldIndex.Clear();
                 for (int i = 0; i < _header.CurrentCount; i++)
                 {
@@ -3044,6 +3456,7 @@ namespace Qvec.Core
             finally { _lock.ExitReadLock(); }
         }
 
+        [Obsolete("SyncFrom copies rows without versions and cannot converge. Enable change tracking and use GetChanges/ApplyChanges (or Qvec.Sync). Removed in 3.0.")]
         public int SyncFrom(QvecDatabase source)
         {
             int synced = 0;
@@ -3082,6 +3495,7 @@ namespace Qvec.Core
                 _guidIndex.Remove(id);
 
                 _header.DeletedCount++;
+                RecordLocalDelete(id);
                 CommitHeader();
                 return true;
             }
@@ -3303,7 +3717,7 @@ namespace Qvec.Core
                     return false;
 
                 WriteMetadataToDisk(index, newMetadata);
-                StampLocalVersion(index);
+                RecordLocalUpsert(index, id);
                 CommitHeader();
                 return true;
             }
@@ -3356,7 +3770,7 @@ namespace Qvec.Core
                 if (newVector == null)
                 {
                     WriteMetadataToDisk(oldIndex, newMetadata!);
-                    StampLocalVersion(oldIndex);
+                    RecordLocalUpsert(oldIndex, id);
                     CommitHeader();
                     return true;
                 }
@@ -3378,7 +3792,11 @@ namespace Qvec.Core
             finally { _lock.ExitWriteLock(); }
         }
 
-        private Guid AddEntryInternal(float[] vector, string metadata, Guid docId)
+        /// <param name="remoteVersion">
+        /// When set, the row is stamped with this version (received from a peer) instead of a
+        /// fresh local one.
+        /// </param>
+        private Guid AddEntryInternal(float[] vector, string metadata, Guid docId, EntryVersion? remoteVersion = null)
         {
             if (_guidIndex.ContainsKey(docId))
                 return docId;
@@ -3391,7 +3809,8 @@ namespace Qvec.Core
             WriteVectorToDisk(index, vector);
             WriteMetadataToDisk(index, metadata);
             WriteGuidToDisk(index, docId);
-            StampLocalVersion(index);
+            if (remoteVersion is { } remote) RecordRemoteUpsert(index, docId, remote);
+            else RecordLocalUpsert(index, docId);
             InitNeighborsOnDisk(index);
 
             _guidIndex[docId] = index;
