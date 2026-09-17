@@ -201,6 +201,25 @@ public static void AdoptAsReplica(string path, Guid newReplicaId, out Guid sourc
 
 Dimensioner måste matcha; annars avvisas hela batchen. Avståndsfunktion behöver inte matcha (varje replika indexerar med sin egen).
 
+### 4.11 Prestandapåverkan utan sync
+
+Spårning är **opt-in** — via `ChangeTrackingOptions` i konstruktorn eller `EnableChangeTracking` på en befintlig fil — och aldrig på som default. En databas som bara körs inprocess utan peers hamnar i ett av två lägen:
+
+**Spårning av (default).** Ingen påverkan. Inga nya sektioner, headerfälten är noll, filen förblir version 5. Acceptanskriterium för PR 1: nya filer utan spårning är byte-identiska med 2.0.0. Kodvägen får en enda `if (_tracking)`-gren per mutation; sökvägen rörs inte.
+
+**Spårning på, ingen peer.** Kostnaden är den här — och den ska mätas i `sync-docs`, inte påstås:
+
+| Väg | Påverkan | Kommentar |
+|---|---|---|
+| Sökning | **Ingen.** | Varken `EntryVersions` eller `ChangeLog` läses på frågevägen. Samma regel som håller `MemoryMappedViewAccessor` borta därifrån. |
+| Skrivning | +24 B version + 64 B loggpost + en HLC-tick (`UtcNow` och några heltalsoperationer) per mutation. | Nanosekunder mot en HNSW-insättning på µs–ms. Benchmark `AddEntries` 1M med/utan spårning avgör. |
+| Disk | +88 B per rad (+ ringens kapacitet). | 1536-dim float (6 KB/rad): **1,4 %**. 128-dim ren int8 (~130 B/rad): **~70 %** — ska stå i README. |
+| `Open` | Ringen läses en gång för att bygga `_deletedVersions`. | O(loggkapacitet); ~64 MB @ 1M records, tiotals ms. |
+| Minne | `_deletedVersions` växer med antal raderingar som ligger kvar i ringen. | ~40 B per post. Töms i takt med att `Delete`-records roterar ut. |
+| `Vacuum` / grow | Kopierar två sektioner till. | Sekventiell kopiering; marginellt mot omkvantisering och grafskrivning. |
+
+Regel för implementationen: allt spårningsarbete sker under det skrivlås som redan hålls, efter att raden är skriven och före `CommitHeader`. Inget nytt lås, ingen ny allokering per mutation (loggposten skrivs direkt i mappningen).
+
 ## 5. `Qvec.Sync`
 
 ### 5.1 `ISyncPeer`
@@ -288,7 +307,7 @@ Principer från tidigare faser gäller: **tester först**, noll varningar, snabb
 
 | # | Branch | Innehåll | Tester (skrivs först) | Klart när |
 |---|---|---|---|---|
-| **1** | `sync-versions` | Headerfält 4.1, flagga, formatversion 6 villkorad på spårning, `EntryVersions`-sektion, HLC-klass, `ReplicaId`. Stämpling i alla lokala mutationer. `Vacuum`/`CreateGrown` bevarar. `EnableChangeTracking` på tom och på befintlig fil. | `Format/ChangeTrackingHeaderTests`: fälten round-trippar, CRC, v5-fil utan spårning öppnas av 2.0.0-läsare (simulerat via versionskontroll), v6 avvisas av "gammal" läsare. `HlcTests`: monotonicitet, tick-regler, `LastHlc` över omstart. `EntryVersionTests`: version följer GUID genom `UpdateVector`, överlever `Vacuum` och grow. | Alla befintliga tester gröna; nya filer utan spårning är byte-identiska med 2.0.0. |
+| **1** | `sync-versions` | Headerfält 4.1, flagga, formatversion 6 villkorad på spårning, `EntryVersions`-sektion, HLC-klass, `ReplicaId`. Stämpling i alla lokala mutationer. `Vacuum`/`CreateGrown` bevarar. `EnableChangeTracking` på tom och på befintlig fil. | `Format/ChangeTrackingHeaderTests`: fälten round-trippar, CRC, v5-fil utan spårning öppnas av 2.0.0-läsare (simulerat via versionskontroll), v6 avvisas av "gammal" läsare. `HlcTests`: monotonicitet, tick-regler, `LastHlc` över omstart. `EntryVersionTests`: version följer GUID genom `UpdateVector`, överlever `Vacuum` och grow. | Alla befintliga tester gröna; nya filer utan spårning är byte-identiska med 2.0.0; `AddEntries` 1M utan spårning inom mätbrus mot 2.0.0 på referensmaskinen. |
 | **2** | `sync-changelog` | `ChangeLog`-ring, `ChangeRecord`, `Delete`-tombstoner, `_deletedVersions`, `GetChanges` med koalescering och `excludeOrigin`, `ApplyChanges` med LWW, `OldestChangeSeq`, `SyncCursorTooOldException`. Fältindex-extractor som egenskap. Ta bort `SyncFrom` (ersätts; markera `[Obsolete]` i 2.1, ta bort i 3.0). | `ChangeLogTests`: append, rotation, krasch-simulering (record bortom count ignoreras), packning vid grow. `GetChangesTests`: koalescering, delete efter upsert, cursor för gammal. `ApplyChangesTests`: idempotens, LWW båda riktningar, delete vinner över äldre upsert, upsert vinner över äldre delete, egen ändring tillbaka = skipped, dim-fel = rejected, int8→float = rejected, float→int8 = applied. **Konvergenstest**: två databaser, slumpade interleavade mutationer offline, byt batchar i båda riktningar tills tomt → identisk `(Guid, Version, Metadata)`-mängd. | Konvergenstestet grönt 1 000 iterationer med seed-loggning. |
 | **3** | `sync-snapshot` | `ExportSnapshot`, `AdoptAsReplica`. | Snapshot-fil öppnas, är hälsosam, har källans `ReplicaId`/`ChangeSeq`; efter `Adopt` nytt id, versioner intakta; delta från `sourceSeq` ger konvergens utan dubbletter. | Bootstrap 1M-fil = filkopiering, ingen omindexering (Slow-test mäter). |
 | **4** | `sync-agent` | Nytt projekt `Qvec.Sync`: `ISyncPeer`, `SyncCursor`, `ChangeBatch`-wire (5.3) med Brotli, `SyncAgent` (5.2) med state-fil och backoff, `DirectorySyncPeer` (5.4). NuGet-metadata, AOT-kompilering i CI (som `Qvec.Core`). | `ChangeBatchWireTests`: round-trip, CRC-fel, versionsfel, komprimerad/okomprimerad. `DirectorySyncPeerTests`: segmentnamn, tmp+rename, manifest, ignorerar egen prefix. `SyncAgentTests` (in-process, temp-mapp): två agenter konvergerar; tre agenter i stjärna; agent startad utan state skickar allt och mottagaren skippar; agent bakom ringen bootstrappar från snapshot; state-fil korrupt → tydligt fel; avbryt mitt i → återupptar. | Exempel i `samples/` som kör två processer mot samma mapp. |
