@@ -1,7 +1,7 @@
 # Qvec ⚡ 
 ### The "SQLite of Vector Databases" for .NET 10
 
-> **Status: pre-1.0 / active hardening.** Qvec is usable for experiments and prototypes, but APIs are still changing. Version `0.1.x` should be treated as an early preview. The on-disk format is **v4**, self-describing and checksummed; there is no migration from the pre-0.1 formats.
+> **Status: 2.x / active hardening.** Qvec is usable for experiments and prototypes, but APIs may still change between minor versions. The on-disk format is **version 5**, self-describing and checksummed; there is no migration from the pre-2.0 formats (see [Upgrading from 1.0.x](#installation)).
 
 **Qvec** is an open-source, embedded vector database written entirely in C# for **.NET 10**. It is designed for local AI-driven applications that need in-process vector search with **HNSW** (Hierarchical Navigable Small World) indexing.
 
