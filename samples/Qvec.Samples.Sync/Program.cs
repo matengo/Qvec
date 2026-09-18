@@ -23,7 +23,8 @@ string dbPath = args[0];
 string sharedDir = args[1];
 string command = args[2];
 
-using var db = File.Exists(dbPath)
+// Not `using`: a snapshot bootstrap may replace the instance, so dispose agent.Database at the end instead.
+var db = File.Exists(dbPath)
     ? QvecDatabase.Open(dbPath)
     : new QvecDatabase(dbPath, Dim, max: 10_000, changeTracking: new ChangeTrackingOptions());
 
@@ -44,41 +45,55 @@ agent.IterationFailed += ex => Console.Error.WriteLine($"sync failed: {ex.GetTyp
 
 Console.WriteLine($"replica {db.ReplicaId:D} · {db.LiveCount} docs · log seq {db.ChangeSeq}");
 
-switch (command)
+try
 {
-    case "add":
-        if (args.Length < 4) { Console.Error.WriteLine("add needs a text argument"); return 2; }
-        string text = string.Join(' ', args[3..]);
-        Guid id = agent.Database.AddEntry(ToyEmbedding(text), text);
-        Console.WriteLine($"added {id:D}");
-        Report(await agent.SyncOnceAsync());
-        return 0;
+    return await RunAsync();
+}
+finally
+{
+    // The agent does not own the database; dispose whatever instance is live after a possible bootstrap.
+    await agent.StopAsync();
+    agent.Database.Dispose();
+}
 
-    case "list":
-        Report(await agent.SyncOnceAsync());
-        foreach (var (docId, metadata) in agent.Database.Where(_ => true, maxResults: 1000).OrderBy(r => r.Metadata))
-            Console.WriteLine($"  {docId:D}  {metadata}");
-        return 0;
+async Task<int> RunAsync()
+{
+    switch (command)
+    {
+        case "add":
+            if (args.Length < 4) { Console.Error.WriteLine("add needs a text argument"); return 2; }
+            string text = string.Join(' ', args[3..]);
+            Guid id = agent.Database.AddEntry(ToyEmbedding(text), text);
+            Console.WriteLine($"added {id:D}");
+            Report(await agent.SyncOnceAsync());
+            return 0;
 
-    case "watch":
-        agent.IterationCompleted += r =>
-        {
-            if (r.Applied > 0) Console.WriteLine($"{DateTime.Now:T} received {r.Applied} change(s); now {agent.Database.LiveCount} docs");
-            if (r.Bootstrapped) Console.WriteLine($"{DateTime.Now:T} bootstrapped from a snapshot; replica is now {agent.Database.ReplicaId:D}");
-        };
-        agent.Start();
-        Console.WriteLine("watching; press Ctrl+C to stop");
-        using (var stop = new CancellationTokenSource())
-        {
-            Console.CancelKeyPress += (_, e) => { e.Cancel = true; stop.Cancel(); };
-            try { await Task.Delay(Timeout.Infinite, stop.Token); } catch (OperationCanceledException) { }
-        }
-        await agent.StopAsync();
-        return 0;
+        case "list":
+            Report(await agent.SyncOnceAsync());
+            foreach (var (docId, metadata) in agent.Database.Where(_ => true, maxResults: 1000).OrderBy(r => r.Metadata))
+                Console.WriteLine($"  {docId:D}  {metadata}");
+            return 0;
 
-    default:
-        Console.Error.WriteLine($"unknown command '{command}'");
-        return 2;
+        case "watch":
+            agent.IterationCompleted += r =>
+            {
+                if (r.Applied > 0) Console.WriteLine($"{DateTime.Now:T} received {r.Applied} change(s); now {agent.Database.LiveCount} docs");
+                if (r.Bootstrapped) Console.WriteLine($"{DateTime.Now:T} bootstrapped from a snapshot; replica is now {agent.Database.ReplicaId:D}");
+            };
+            agent.Start();
+            Console.WriteLine("watching; press Ctrl+C to stop");
+            using (var stop = new CancellationTokenSource())
+            {
+                Console.CancelKeyPress += (_, e) => { e.Cancel = true; stop.Cancel(); };
+                try { await Task.Delay(Timeout.Infinite, stop.Token); } catch (OperationCanceledException) { }
+            }
+            await agent.StopAsync();
+            return 0;
+
+        default:
+            Console.Error.WriteLine($"unknown command '{command}'");
+            return 2;
+    }
 }
 
 static void Report(SyncIterationResult r)

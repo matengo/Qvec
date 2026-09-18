@@ -1,91 +1,91 @@
 # Design: int8 scalar quantization
 
-## Vad det är
+## What it is
 
-`quantization: VectorQuantization.Int8` i `QvecDatabase`-konstruktorn lagrar varje vektor som
-`dim` bytes plus 16 bytes parametrar i stället för `dim × 4` bytes float. Sökning, insert och
-grafbygge räknar på bytes; floats finns inte kvar i filen.
+`quantization: VectorQuantization.Int8` in the `QvecDatabase` constructor stores each vector as
+`dim` bytes plus 16 bytes of parameters instead of `dim × 4` bytes of float. Search, insert, and
+graph construction compute on bytes; floats are not kept in the file.
 
-Läget väljs när filen skapas och sparas i headern (`QuantizationMode = 2`). Att öppna filen
-igen med ett annat läge ger `QvecFormatException`.
+The mode is chosen when the file is created and is stored in the header (`QuantizationMode = 2`).
+Opening the file again with another mode gives `QvecFormatException`.
 
-## Kodek
+## Codec
 
-Asymmetrisk per-vektor-skalning till osignerade koder `0..255`:
+Asymmetric per-vector scaling to unsigned codes `0..255`:
 
 ```
-scale  = (max - min) / 255        (0 om vektorn är konstant)
+scale  = (max - min) / 255        (0 if the vector is constant)
 offset = min
 q_i    = round((x_i - offset) / scale)
 ```
 
-Per vektor sparas dessutom `sumOfCodes = Σ q_i` och `squaredNorm = ‖x̂‖²` där `x̂` är den
-*dekvantiserade* vektorn. Att normen räknas på `x̂` och inte `x` gör att en vektors
-Euclidean-avstånd till sig själv blir exakt 0, vilket testerna kräver.
+Per vector, `sumOfCodes = Σ q_i` and `squaredNorm = ‖x̂‖²` are also stored, where `x̂` is the
+*dequantized* vector. Computing the norm on `x̂` and not `x` makes a vector's Euclidean distance
+to itself exactly 0, which the tests require.
 
-Skalärprodukten expanderas så att den integer-tunga delen är ren byte×byte:
+The dot product expands so that the integer-heavy part is pure byte×byte:
 
 ```
 a·b ≈ Sa·Sb·Σ(qa·qb) + Sa·Ob·Σqa + Sb·Oa·Σqb + d·Oa·Ob
 ```
 
-`Σ(qa·qb)` räknas med en widening SIMD-kärna (`Vector<byte>` → `ushort` → `uint` → `long`);
-resten är fyra skalära multiplikationer i double. Euclidean blir `-(Na + Nb − 2·a·b)`, Cosine
-normaliserar före kvantisering precis som i float-läget.
+`Σ(qa·qb)` is computed with a widening SIMD kernel (`Vector<byte>` → `ushort` → `uint` → `long`);
+the rest is four scalar multiplications in double. Euclidean becomes `-(Na + Nb − 2·a·b)`, Cosine
+normalizes before quantization exactly as in float mode.
 
-Frågan kvantiseras också. Det ger en enda kärna (byte×byte) för alla vägar och gör att
-insert-grafen och sökningen ser exakt samma avstånd.
+The query is also quantized. That gives a single kernel (byte×byte) for all paths and makes the
+insert graph and the search see exactly the same distances.
 
-## Vad som *inte* gjordes
+## What was *not* done
 
-- **Ingen rescoring i detta läge.** Floats sparas inte, så top-k kan inte omrankas exakt.
-  Det är det som lämnar recall-gapet nedan. Det är löst i det separata läget
-  `Int8Rescored`, se [design-quantization-rescoring.md](design-quantization-rescoring.md).
-- **Ingen per-dataset-skalning** (`QuantizationMode = 1`). Reserverad, avvisas.
-- **Ingen migrering** float → int8 i samma fil. Skapa en ny databas och läs in.
-- `GetByGuid`/`GetVector` returnerar den dekvantiserade approximationen, inte originalet.
+- **No rescoring in this mode.** Floats are not stored, so top-k cannot be reranked exactly.
+  That is what leaves the recall gap below. It is solved in the separate mode
+  `Int8Rescored`; see [design-quantization-rescoring.md](design-quantization-rescoring.md).
+- **No per-dataset scaling** (`QuantizationMode = 1`). Reserved, rejected.
+- **No migration** float → int8 in the same file. Create a new database and load it.
+- `GetByGuid`/`GetVector` returns the dequantized approximation, not the original.
 
 ## Format
 
-Inget versionsbump. Header: `QuantizationMode = 2`, `QuantizationSectionId = 8`.
-Sektion 8 (`QuantizedVectors`, `ElementSize = dim`) tar slot 0 i stället för sektion 1;
-sektion 10 (`QuantizationVectorParameters`, `ElementSize = 16`) tar slot 7. Slots 1–6 är
-oförändrade, så `Grow`/`PlanSectionMoves` behöver inte känna till läget.
+No version bump. Header: `QuantizationMode = 2`, `QuantizationSectionId = 8`.
+Section 8 (`QuantizedVectors`, `ElementSize = dim`) takes slot 0 instead of section 1;
+section 10 (`QuantizationVectorParameters`, `ElementSize = 16`) takes slot 7. Slots 1–6 are
+unchanged, so `Grow`/`PlanSectionMoves` do not need to know the mode.
 
-Float-läget är oförändrat: siftsmall-index byggt från `master` respektive denna branch är
-byteidentiska i alla sju sektioner (endast header-CRC/tidsstämplar skiljer).
+Float mode is unchanged: siftsmall indices built from `master` and this branch, respectively, are
+byte-identical in all seven sections (only header CRC/timestamps differ).
 
-## Mätningar
+## Measurements
 
-siftsmall (10 000 × 128, Euclidean, `indexSeed` pinnat), samma maskin, samma körning:
+siftsmall (10,000 × 128, Euclidean, `indexSeed` pinned), same machine, same run:
 
-| | ef 10 | ef 40 | ef 160 | fil |
+| | ef 10 | ef 40 | ef 160 | file |
 | --- | --- | --- | --- | --- |
-| float recall@10 / QPS | 98.6 % / 14 161 | 100 % / 9 335 | 100 % / 3 689 | 13.8 MiB |
-| int8 recall@10 / QPS | 97.9 % / 32 686 | 99.3 % / 11 579 | 99.3 % / 4 453 | 10.3 MiB |
+| float recall@10 / QPS | 98.6% / 14,161 | 100% / 9,335 | 100% / 3,689 | 13.8 MiB |
+| int8 recall@10 / QPS | 97.9% / 32,686 | 99.3% / 11,579 | 99.3% / 4,453 | 10.3 MiB |
 
-Vektorsektionen: 5.12 → 1.28 MiB. Grafen (7.7 MiB) påverkas inte, därför krymper filen mindre
-än 4×.
+Vector section: 5.12 → 1.28 MiB. The graph (7.7 MiB) is not affected, so the file shrinks less
+than 4×.
 
-Syntetiska täta kluster (spridning 0.08, n = 2000, ef = 200) mot exakt float-brute-force,
+Synthetic dense clusters (spread 0.08, n = 2000, ef = 200) against exact float-brute-force,
 recall@10:
 
 | dim | DotProduct | Euclidean | Cosine |
 | ---: | ---: | ---: | ---: |
-| 64 | 98.5 % | 98.1 % | 89.8 % |
-| 384 | 98.2 % | 96.9 % | 89.1 % |
+| 64 | 98.5% | 98.1% | 89.8% |
+| 384 | 98.2% | 96.9% | 89.1% |
 
-int8-HNSW ger samma resultat som int8-brute-force, så hela förlusten är kvantiseringsbrus,
-inte grafen. Cosine tappar mest eftersom rankningen är ren vinkel med små gap på enhetssfären;
-`Int8` är därför ett medvetet val för `Cosine` på mycket täta data. Testet i
-`QuantizedDatabaseTests` kräver ≥ 85 % just av det skälet.
+int8-HNSW gives the same result as int8-brute-force, so the entire loss is quantization noise,
+not the graph. Cosine loses the most because the ranking is pure angle with small gaps on the unit
+sphere; `Int8` is therefore a deliberate choice for `Cosine` on very dense data. The test in
+`QuantizedDatabaseTests` requires ≥ 85% for exactly that reason.
 
-## Test
+## Tests
 
-- `Int8QuantizerTests`: round-trip ≤ halva steget, integer-dot mot skalär referens för alla
-  SIMD-svansar (1, 15, 16, 17, 63, 64, 65, 1536) med maximala koder, similarity mot float
-  < 1 % relativt fel, parametrar round-trip.
-- `QuantizedDatabaseTests`: layout, 4× storlek, Open bevarar läge, mismatch kastar,
-  recall-golv, score-närhet, Update/Delete/Vacuum, Grow, filtrerad sökning.
-- `V4HeaderTests`: kvantiserad layout, felaktig mode/section-kombination, mode 1 reserverad,
-  ogiltiga sektionsformer.
+- `Int8QuantizerTests`: round-trip ≤ half the step, integer dot against scalar reference for all
+  SIMD tails (1, 15, 16, 17, 63, 64, 65, 1536) with maximum codes, similarity against float
+  < 1% relative error, parameters round-trip.
+- `QuantizedDatabaseTests`: layout, 4× size, Open preserves mode, mismatch throws,
+  recall floor, score closeness, Update/Delete/Vacuum, Grow, filtered search.
+- `V4HeaderTests`: quantized layout, invalid mode/section combination, mode 1 reserved,
+  invalid section shapes.

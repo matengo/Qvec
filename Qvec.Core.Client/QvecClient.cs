@@ -1,4 +1,4 @@
-using System.Diagnostics.CodeAnalysis;
+﻿using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.Linq.Expressions;
 using System.Text.Json;
@@ -120,7 +120,7 @@ namespace Qvec.Core.Client
         [RequiresDynamicCode(ExpressionDynamicCodeMessage)]
         public List<TypedSearchResult<T>> Search(float[] query, Expression<Func<T, bool>> filter, int topK = 5)
         {
-            // Försök använda inverterat index för pre-filtrering
+            // Try to use the inverted index for pre-filtering
             if (_extractor != null && TryExtractLookups(filter.Body, filter.Parameters[0], out var lookups))
             {
                 var candidates = _db.GetIndexedCandidates(lookups);
@@ -262,7 +262,7 @@ namespace Qvec.Core.Client
                     return false;
                 }
 
-                // p.Category == "x" eller "x" == p.Category
+                // p.Category == "x" or "x" == p.Category
                 if (binary.NodeType == ExpressionType.Equal)
                 {
                     if (TryExtractFieldValue(binary.Left, binary.Right, parameter, out var field, out var value)

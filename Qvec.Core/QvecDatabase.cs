@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Buffers;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
@@ -433,7 +433,7 @@ namespace Qvec.Core
             }
         }
 
-        /// <summary>Vektordimensionen databasen skapades med.</summary>
+        /// <summary>The vector dimension this database was created with.</summary>
         /// <summary>Absolute path of the database file.</summary>
         public string FilePath => _path;
 
@@ -1017,13 +1017,13 @@ namespace Qvec.Core
                 _deletedVersions.Remove(id);
         }
 
-        /// <summary>Maximalt antal poster databasen kan rymma.</summary>
+        /// <summary>Maximum number of entries the database can hold.</summary>
         public int MaxCount => _header.MaxCount;
 
-        /// <summary>Antal soft-deletade poster.</summary>
+        /// <summary>Number of soft-deleted entries.</summary>
         public int DeletedCount => _header.DeletedCount;
 
-        /// <summary>Antal levande (icke-raderade) poster.</summary>
+        /// <summary>Number of live (non-deleted) entries.</summary>
         public int LiveCount => _header.CurrentCount - _header.DeletedCount;
 
         private void ValidateVector(float[] vector, string paramName)
@@ -1046,14 +1046,14 @@ namespace Qvec.Core
         }
 
         /// <summary>
-        /// True när det inte finns någon levande post att söka bland. Används för att
-        /// undvika att HNSW-navigeringen seedar resultatet med en obefintlig nod 0.
+        /// True when there is no live entry to search among. Used to
+        /// avoid seeding the HNSW navigation result with a nonexistent node 0.
         /// </summary>
         private bool IsEffectivelyEmpty => _header.CurrentCount == 0 || LiveCount <= 0;
 
         /// <summary>
-        /// Returnerar en giltig startnod för HNSW-navigering, eller -1 om ingen finns.
-        /// Skyddar mot att EntryPoint pekar på en raderad nod.
+        /// Returns a valid start node for HNSW navigation, or -1 if none exists.
+        /// Protects against EntryPoint pointing to a deleted node.
         /// </summary>
         private int ResolveEntryPoint()
         {
@@ -1068,7 +1068,7 @@ namespace Qvec.Core
             return -1;
         }
 
-        // --- KÄRNA: SIMD MATEMATIK ---
+        // --- CORE: SIMD MATH ---
         public static float DotProduct(float[] left, float[] right)
         {
             return DotProduct(left, right, left.Length);
@@ -1193,8 +1193,8 @@ namespace Qvec.Core
         }
 
         /// <summary>
-        /// Normaliserar en vektor till enhetslängd (L2-norm = 1).
-        /// När vektorer är normaliserade blir dot product == cosine similarity.
+        /// Normalizes a vector to unit length (L2 norm = 1).
+        /// When vectors are normalized, dot product == cosine similarity.
         /// </summary>
         public static void NormalizeVector(float[] vector)
         {
@@ -1920,10 +1920,10 @@ namespace Qvec.Core
                 Buffer.MemoryCopy(source, DataBasePointer + (offset - HeaderSize), bytes, bytes);
             }
         }
-        // --- INVERTERAT INDEX ---
+        // --- INVERTED INDEX ---
 
         /// <summary>
-        /// Lägger till en post i det inverterade indexet för ett specifikt fält och värde.
+        /// Adds an entry to the inverted index for a specific field and value.
         /// </summary>
         public void AddFieldIndex(int entryIndex, IEnumerable<(string Field, string Value)> fields)
         {
@@ -1945,7 +1945,7 @@ namespace Qvec.Core
         }
 
         /// <summary>
-        /// Indexerar en post via dess dokument-Guid. Detta är det säkra alternativet till
+        /// Indexes an entry by its document Guid. This is the safe alternative to
         /// <see cref="AddFieldIndex(int, IEnumerable{ValueTuple{string, string}})"/>: callers
         /// previously had to guess the row number with <c>GetCount() - 1</c>, which pointed at
         /// the wrong row whenever an insert was deduplicated or reused a tombstoned slot.
@@ -2004,7 +2004,7 @@ namespace Qvec.Core
         }
 
         /// <summary>
-        /// Tar bort en post från det inverterade indexet.
+        /// Removes an entry from the inverted index.
         /// </summary>
         internal void RemoveFieldIndex(int entryIndex)
         {
@@ -2018,7 +2018,7 @@ namespace Qvec.Core
         }
 
         /// <summary>
-        /// O(1)-sökning via det inverterade indexet. Kräver att fältet har indexerats vid insert.
+        /// O(1) search via the inverted index. Requires the field to have been indexed at insert.
         /// </summary>
         public List<(Guid Id, string Metadata)> WhereIndexed(string field, string value, int maxResults = 100)
         {
@@ -2039,7 +2039,7 @@ namespace Qvec.Core
         }
 
         /// <summary>
-        /// O(1)-sökning via det inverterade indexet med flera fält (AND / intersection).
+        /// O(1) search via the inverted index with multiple fields (AND / intersection).
         /// </summary>
         public List<(Guid Id, string Metadata)> WhereIndexed(IReadOnlyList<(string Field, string Value)> lookups, int maxResults = 100)
         {
@@ -2075,7 +2075,7 @@ namespace Qvec.Core
         }
 
         /// <summary>
-        /// Bygger om det inverterade indexet från disk. Anropas vid uppstart om extractor finns.
+        /// Rebuilds the inverted index from disk. Called at startup if an extractor exists.
         /// </summary>
         public void RebuildFieldIndex(Func<string, IEnumerable<(string Field, string Value)>> extractor)
         {
@@ -2097,8 +2097,8 @@ namespace Qvec.Core
         }
 
         /// <summary>
-        /// Returnerar kandidat-index från det inverterade indexet för en eller flera fält (AND).
-        /// Returnerar null om något fält saknar matchning.
+        /// Returns candidate indexes from the inverted index for one or more fields (AND).
+        /// Returns null if any field has no match.
         /// </summary>
         public HashSet<int>? GetIndexedCandidates(IReadOnlyList<(string Field, string Value)> lookups)
         {
@@ -2124,8 +2124,8 @@ namespace Qvec.Core
         }
 
         /// <summary>
-        /// Vektorsökning enbart över förfiltrerade kandidat-index.
-        /// Beräknar similarity enbart för poster i candidates — ingen HNSW, ingen full scan.
+        /// Vector search only over pre-filtered candidate indexes.
+        /// Computes similarity only for entries in candidates — no HNSW, no full scan.
         /// </summary>
         public List<(Guid Id, float Score, string Metadata)> SearchWithCandidates(float[] query, HashSet<int> candidates, int topK)
         {
@@ -2155,8 +2155,8 @@ namespace Qvec.Core
         }
 
         /// <summary>
-        /// Filtrerar poster enbart på metadata utan vektorsökning.
-        /// Använder parallell scan för stora dataset, sekventiell för små.
+        /// Filters entries only on metadata without vector search.
+        /// Uses a parallel scan for large datasets, sequential for small ones.
         /// </summary>
         public List<(Guid Id, string Metadata)> Where(Func<string, bool> filter, int maxResults = 100)
         {
@@ -2217,7 +2217,7 @@ namespace Qvec.Core
         }
 
         /// <summary>
-        /// SimpleSearch är en grundläggande linjär sökning som inte utnyttjar HNSW-graf
+        /// SimpleSearch is a basic linear search that does not use the HNSW graph
         /// </summary>
         /// <param name="query"></param>
         /// <param name="topK"></param>
@@ -2253,7 +2253,7 @@ namespace Qvec.Core
             finally { _lock.ExitReadLock(); }
         }
         /// <summary>
-        /// SearchSimpleParallel är en optimerad version av SearchSimple som utnyttjar alla CPU-kärnor.
+        /// SearchSimpleParallel is an optimized version of SearchSimple that uses all CPU cores.
         /// </summary>
         /// <param name="query"></param>
         /// <param name="topK"></param>
@@ -2314,7 +2314,7 @@ namespace Qvec.Core
                 .ToList();
         }
         /// <summary>
-        /// HybridHNSW är en sökmetod som kombinerar den snabba HNSW-navigeringen med möjligheten att filtrera på metadata under sökprocessen.
+        /// HybridHNSW is a search method that combines fast HNSW navigation with the ability to filter on metadata during the search process.
         /// </summary>
         /// <param name="query"></param>
         /// <param name="filter"></param>
@@ -2412,11 +2412,11 @@ namespace Qvec.Core
         }
 
         /// <summary>
-        /// HNSW search som navigerar genom lagren och returnerar en lista med de bästa matchningarna, inklusive metadata.
+        /// HNSW search that navigates through the layers and returns a list of the best matches, including metadata.
         /// </summary>
         /// <param name="query"></param>
         /// <param name="topK"></param>
-        /// <param name="efSearch">Sökbredd i bottenlagret. Högre = bättre recall men långsammare. Standard: 200.</param>
+        /// <param name="efSearch">Search width in the bottom layer. Higher = better recall but slower. Default: 200.</param>
         /// <returns></returns>
         public List<(Guid Id, float Score, string Metadata)> Search(float[] query, int topK = 5, int efSearch = DefaultEfSearch)
         {
@@ -3363,7 +3363,7 @@ namespace Qvec.Core
             _lock.EnterReadLock();
             try
             {
-                // Vi returnerar indexet för den aktuella startpunkten från headern
+                // Return the index of the current entry point from the header
                 return _header.EntryPoint;
             }
             finally
@@ -3451,7 +3451,7 @@ namespace Qvec.Core
             return -sum;
         }
 
-        // SIMD DotProduct som arbetar direkt mot en rå pekare
+        // SIMD DotProduct that works directly against a raw pointer
         private static unsafe float DotProductUnsafe(float[] left, float* right, int dim)
         {
             int i = 0;
@@ -3462,7 +3462,7 @@ namespace Qvec.Core
             {
                 for (; i <= dim - vectorSize; i += vectorSize)
                 {
-                    // Ladda 8 floats (AVX2) från både array och pekare samtidigt
+                    // Load 8 floats (AVX2) from both the array and pointer at the same time
                     var v1 = *(Vector<float>*)(pLeft + i);
                     var v2 = *(Vector<float>*)(right + i);
                     dot += Vector.Dot(v1, v2);

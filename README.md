@@ -1,7 +1,7 @@
 # Qvec ⚡ 
 ### The "SQLite of Vector Databases" for .NET 10
 
-> **Status: 2.x / active hardening.** Qvec is usable for experiments and prototypes, but APIs may still change between minor versions. The on-disk format is **version 5**, self-describing and checksummed; there is no migration from the pre-2.0 formats (see [Upgrading from 1.0.x](#installation)).
+> **Status: 2.x / active hardening.** Qvec is usable for experiments and prototypes, but APIs may still change between minor versions. The on-disk format is **version 5** (**version 6** when change tracking is on), self-describing and checksummed; there is no migration from the pre-2.0 formats (see [Upgrading from 1.0.x](#installation)).
 
 **Qvec** is an open-source, embedded vector database written entirely in C# for **.NET 10**. It is designed for local AI-driven applications that need in-process vector search with **HNSW** (Hierarchical Navigable Small World) indexing.
 
@@ -112,7 +112,7 @@ dotnet add package Qvec.Sync
 ```csharp
 using Qvec.Core;
 
-// Fixed-capacity database: dim and max are chosen at creation time.
+// dim is fixed for the life of the file; max is the starting capacity (see the capacity note).
 using var db = new QvecDatabase("vectors.qvec", dim: 1536, max: 10_000);
 
 float[] embedding = GetEmbedding("Hello World");
@@ -322,12 +322,14 @@ Three methods expose it: `GetChanges(sinceSeq, maxItems)` returns a `ChangeBatch
 
 ### Running an agent
 
+Every replica runs its own database and its own `SyncAgent`; the agents never talk to each other directly, only through a peer they all share. The shipped peer is a directory:
+
 ```csharp
 using Qvec.Core;
 using Qvec.Core.Sync;
 using Qvec.Sync;
 
-using var db = File.Exists(path)
+var db = File.Exists(path)
     ? QvecDatabase.Open(path)
     : new QvecDatabase(path, dim: 768, max: 100_000, changeTracking: new ChangeTrackingOptions());
 
@@ -337,24 +339,37 @@ await using var agent = new SyncAgent(db, peer, new SyncOptions
 {
     PollInterval = TimeSpan.FromSeconds(5),
     BootstrapFromSnapshotIfBehind = true,   // copy a snapshot instead of failing when too far behind
-    SnapshotInterval = TimeSpan.FromHours(1),
+    SnapshotInterval = TimeSpan.FromHours(1),  // publish a snapshot of this replica for others to bootstrap from
 });
 
 agent.IterationCompleted += r => { if (r.Applied > 0) Console.WriteLine($"applied {r.Applied} remote changes"); };
-agent.DatabaseReplaced += fresh => { /* re-point your references after a snapshot bootstrap */ };
+agent.IterationFailed += ex => Console.Error.WriteLine($"sync failed, will retry: {ex.Message}");
+agent.DatabaseReplaced += fresh => { /* a snapshot bootstrap swapped the file; re-point anything holding the old db */ };
 
-agent.Start();                 // background loop: push own changes, pull everyone else's
-// ... or drive it yourself:
-SyncIterationResult once = await agent.SyncOnceAsync();
+agent.Start();                            // background loop: push own changes, pull everyone else's
+
+agent.Database.AddEntry(vector, metadata); // keep using the database normally through agent.Database
+var hits = agent.Database.Search(query, topK: 10);
+
+await agent.StopAsync();                  // cancels the loop and waits for it to exit
+agent.Database.Dispose();                 // the agent does not own the database; dispose the live instance yourself
 ```
 
-`SyncAgent` pushes its own unsent changes in `ChangeBatch`es, pulls the other replicas' batches and applies them, and persists its cursor (`SyncOptions.StatePath`, default next to the database) so a restart continues where it stopped. Every batch is CRC-checked and, by default (`SyncCompression.Auto`), Brotli-compressed when metadata is a meaningful share of the payload — dense float vectors do not compress, so those go out raw. `Qvec.Sync` has no cloud SDK dependency; `DirectorySyncPeer` is plain `System.IO`. The `ISyncPeer` interface is public, so another transport (object store, HTTP hub) is a class, not a fork. A runnable two-process example lives in [`samples/Qvec.Samples.Sync`](samples/Qvec.Samples.Sync).
+A few things the example glosses over:
+
+- **Use `agent.Database`, not your own reference, once the agent is running.** A snapshot bootstrap disposes the old `QvecDatabase` and opens a new one; `agent.Database` always points at the live instance and `DatabaseReplaced` tells you when it changed. The agent does not otherwise take ownership — you dispose whatever `agent.Database` is when you are done, after stopping the agent.
+- **Alternatively drive it by hand.** `await agent.SyncOnceAsync()` does one push-then-pull round and returns a `SyncIterationResult` (`PushedItems`, `Applied`, `Skipped`, `Rejected`, `Bootstrapped`, `DidWork`). Useful for command-line tools and tests; the sample does exactly this for its `add` and `list` commands.
+- **Adding a node** is creating an empty tracked database and starting an agent against the same directory. If the existing replicas' change logs still hold everything (the ring is sized to `max` by default), it pulls all documents incrementally; if not, `BootstrapFromSnapshotIfBehind` copies the newest published snapshot — so let at least one long-lived replica set `SnapshotInterval`.
+- **State lives next to the database** in `<db>.sync` (override with `SyncOptions.StatePath`): the sequence number pushed so far and a cursor per remote replica. Delete it to re-push from the start of the log; the agent refuses a state file that belongs to another replica or claims more than the log contains.
+- **Failures back off, not crash.** A failed iteration raises `IterationFailed` and the loop retries with exponential backoff (`InitialBackoff` 1 s → `MaxBackoff` 60 s). `SyncOnceAsync` throws instead.
+
+`SyncAgent` pushes its own unsent changes in `ChangeBatch`es, pulls the other replicas' batches and applies them, and persists its cursor after every batch so a restart continues where it stopped. Every batch is CRC-checked and, by default (`SyncCompression.Auto`), Brotli-compressed when metadata is a meaningful share of the payload — dense float vectors do not compress, so those go out raw. `Qvec.Sync` has no cloud SDK dependency; `DirectorySyncPeer` is plain `System.IO` over a layout of `replicas/<id>/log/*.qvcb`, `replicas/<id>/snapshot/*.qvec` and `manifest/<id>.json`. The `ISyncPeer` interface is public, so another transport (object store, HTTP hub) is a class, not a fork. A runnable two-process example lives in [`samples/Qvec.Samples.Sync`](samples/Qvec.Samples.Sync).
 
 ### What you should know before relying on it
 
 - **Conflicts are resolved by last-write-wins, per document.** The document version with the greater HLC wins; ties break on origin replica id. Concurrent edits to the same document on two replicas lose one of them — silently, deterministically, the same way on every replica. A delete is a version like any other, so a later update on another replica resurrects the document. There is no field-level merge.
 - **Clock skew is bounded, not eliminated.** The HLC never goes backwards and advances past anything it receives, so causally later writes always win. Two *independent* writes are ordered by wall clock; a replica whose clock runs ahead wins those races. Keep NTP running.
-- **The change log is a ring.** A replica that has been offline longer than the ring covers cannot catch up incrementally: `GetChanges` throws `SyncCursorTooOldException` on the source side, the agent surfaces it as `SyncLogOverrunException`, or — with `BootstrapFromSnapshotIfBehind` — replaces the local file with the newest published snapshot. The bootstrapped copy gets a **new `ReplicaId`** and any unsent local changes are lost; `DatabaseReplaced` fires so you can re-point references. Size `LogCapacity` for the longest outage you want to survive.
+- **The change log is a ring.** A replica that has been offline longer than the ring covers cannot catch up incrementally: `GetChanges` throws `SyncCursorTooOldException` on the source side, the agent surfaces it as `SyncLogOverrunException`, or — with `BootstrapFromSnapshotIfBehind` — replaces the local file with a published snapshot (the directory peer picks the one with the highest sequence number among the other replicas — a heuristic, since sequence numbers are per replica; whichever snapshot it is, the log replay afterwards brings it current). The bootstrapped copy gets a **new `ReplicaId`** and any unsent local changes are lost; `DatabaseReplaced` fires so you can re-point references. Size `LogCapacity` for the longest outage you want to survive.
 - **Payloads must match.** Replicas must share dimension (checked — `ApplyChanges` throws) and distance function (not checked — your responsibility). Float and `Int8Rescored` replicas send floats, which any replica can apply (int8 replicas quantize on the way in). A plain `Int8` replica only has codes to send, and those are **rejected** by float and `Int8Rescored` replicas; `ApplyResult.Items` carries the reason and `SyncIterationResult.Rejected` counts them.
 - **The directory transport echoes.** Every replica publishes its applied changes under its own prefix, so a change fans out through the folder and other replicas skip what they already have. Cheap and dependency-free, but the folder grows with every hop and it takes a couple of quiet polls before an idle fleet reports `DidWork == false`.
 - **Field indexes are rebuilt, not synced.** `ApplyChanges` keeps the typed client's in-memory inverted index current like any other mutation; after a snapshot bootstrap the agent rebuilds it from scratch if `SyncOptions.FieldIndexExtractor` is set.

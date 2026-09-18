@@ -1,118 +1,118 @@
-# Design: int8 med rescoring (`Int8Rescored`)
+# Design: int8 with rescoring (`Int8Rescored`)
 
-Påbyggnad på [design-quantization-int8.md](design-quantization-int8.md). Läs den först.
+Extension of [design-quantization-int8.md](design-quantization-int8.md). Read that first.
 
-## Vad det är
+## What it is
 
-`quantization: VectorQuantization.Int8Rescored` bygger och går grafen på int8-koder exakt
-som `Int8`, men sparar dessutom originalfloats i filen. Efter bottenlagrets sökning omrankas
-alla `efSearch` kandidater mot floats, och det är den ordningen och de poängen som returneras.
+`quantization: VectorQuantization.Int8Rescored` builds and walks the graph on int8 codes exactly
+like `Int8`, but also stores the original floats in the file. After the bottom-layer search, all
+`efSearch` candidates are reranked against floats, and that is the order and the scores returned.
 
-Resultatet är float-recall vid (nära) int8-hastighet. Priset är lagring: float-sektionen plus
-int8-sektionerna, dvs. ~1.25× en ren float-fil.
+The result is float recall at (near) int8 speed. The price is storage: the float section plus
+the int8 sections, i.e. ~1.25× a pure float file.
 
-| Läge | Grafbygge/-vandring | Returnerade poäng | `GetByGuid` | Vektorlagring |
+| Mode | Graph build/walk | Returned scores | `GetByGuid` | Vector storage |
 | --- | --- | --- | --- | --- |
-| `None` | float | exakta | original | `dim × 4` |
-| `Int8` | int8 | approximativa | dekvantiserad | `dim + 16` |
-| `Int8Rescored` | int8 | exakta (float) | original | `dim × 5 + 16` |
+| `None` | float | exact | original | `dim × 4` |
+| `Int8` | int8 | approximate | dequantized | `dim + 16` |
+| `Int8Rescored` | int8 | exact (float) | original | `dim × 5 + 16` |
 
-## Varför inte bara `Int8`?
+## Why not just `Int8`?
 
-Int8-förlusten på Cohere 1M vid ef 180 var 1.6 procentenheter recall@100 (93.2 mot 94.8 %),
-på täta cosine-kluster 10 punkter (89.8 mot ~100 %). Förlusten är kvantiseringsbrus i den
-*slutliga rankningen*, inte i grafen: int8-HNSW och int8-brute-force ger samma mängd. Att
-omranka kandidatmängden mot exakta floats tar bort den delen av bruset helt.
+The int8 loss on Cohere 1M at ef 180 was 1.6 percentage points recall@100 (93.2 vs. 94.8%),
+on dense cosine clusters 10 points (89.8 vs. ~100%). The loss is quantization noise in the
+*final ranking*, not in the graph: int8-HNSW and int8-brute-force produce the same set. Reranking
+the candidate set against exact floats removes that part of the noise completely.
 
-Det är också vad zvec gör med `--is-using-refiner` på 10M-datasetet.
+This is also what zvec does with `--is-using-refiner` on the 10M dataset.
 
-## Vad rescoring *inte* kan göra
+## What rescoring *cannot* do
 
-Omrankning ändrar ordningen inom kandidatmängden men kan inte lägga till kandidater grafen
-missade. Därför:
+Reranking changes the order within the candidate set but cannot add candidates the graph
+missed. Therefore:
 
-- Vid `efSearch == topK` är kandidatmängden exakt `k` poster och recall@k är identisk med
-  int8. Cohere 1M, k = 100, ef 100: int8 89.3 %, rescored 89.2 %, float 90.3 %. Poängen
-  blir dock exakta även då.
-- Recall@k för rescored är begränsad uppåt av "recall@ef för int8-vandringen". Ju större
-  `ef / k`, desto närmare float kommer den.
+- At `efSearch == topK`, the candidate set is exactly `k` entries and recall@k is identical to
+  int8. Cohere 1M, k = 100, ef 100: int8 89.3%, rescored 89.2%, float 90.3%. The scores
+  are exact even then, however.
+- Recall@k for rescored is bounded above by "recall@ef for the int8 walk". The larger
+  `ef / k`, the closer it gets to float.
 
 ## Format
 
-Inget versionsbump och inget nytt `QuantizationMode`. Filen är en int8-fil
-(`QuantizationMode = 2`, `QuantizationSectionId = 8`) som dessutom har sektion 1 (`Vectors`,
-`ElementSize = dim × 4`) i slot 8 med flaggorna `Present | Mutable | MayMoveOnGrow` — **inte**
-`Required` — och `HeaderFlags.HasOptionalSections` satt.
+No version bump and no new `QuantizationMode`. The file is an int8 file
+(`QuantizationMode = 2`, `QuantizationSectionId = 8`) that also has section 1 (`Vectors`,
+`ElementSize = dim × 4`) in slot 8 with the flags `Present | Mutable | MayMoveOnGrow` — **not**
+`Required` — and `HeaderFlags.HasOptionalSections` set.
 
-Konsekvens för äldre läsare (byggen före denna ändring): de ignorerar okända icke-`Required`
-sektioner, öppnar filen som ren int8 och söker på koderna. Det är korrekt men utan
-omrankning. `Grow` i en sådan läsare skulle lägga ut en ny fil utan sektion 1 och därmed
-tappa floats; det accepteras eftersom versionerna aldrig samexisterar i produktion.
+Consequence for older readers (builds before this change): they ignore unknown non-`Required`
+sections, open the file as pure int8, and search on the codes. That is correct but without
+reranking. `Grow` in such a reader would lay out a new file without section 1 and thus lose the
+floats; that is accepted because the versions never coexist in production.
 
-`VectorQuantization.Int8Rescored = 3` finns bara i API:t. `QvecDatabase.Quantization`
-härleder värdet via `QvecFormatLayout.EffectiveQuantization(header)` (mode 2 + sektion 1
-närvarande). Konstruktorn jämför det härledda värdet vid reopen, så `Int8` mot en rescored-fil
-och `Int8Rescored` mot en ren int8-fil kastar båda `QvecFormatException`.
+`VectorQuantization.Int8Rescored = 3` exists only in the API. `QvecDatabase.Quantization`
+derives the value via `QvecFormatLayout.EffectiveQuantization(header)` (mode 2 + section 1
+present). The constructor compares the derived value on reopen, so `Int8` against a rescored file
+and `Int8Rescored` against a pure int8 file both throw `QvecFormatException`.
 
-`V4Header`-validering: när sektion 1 finns i int8-läge måste den ha `ElementSize = dim × 4`
-och `Length ≥ MaxCount × dim × 4`. `RequiredSectionIds` är oförändrad.
+`V4Header` validation: when section 1 exists in int8 mode, it must have `ElementSize = dim × 4`
+and `Length ≥ MaxCount × dim × 4`. `RequiredSectionIds` is unchanged.
 
-`CreateGrown` läser av om sektion 1 finns i den gamla tabellen (`CloneState` kopierar inte
-sektionstabellen) och lägger ut den igen. `PlanSectionMoves` är generisk över närvarande
-sektioner och behövde inte ändras.
+`CreateGrown` reads whether section 1 exists in the old table (`CloneState` does not copy the
+section table) and lays it out again. `PlanSectionMoves` is generic over present sections and did
+not need to change.
 
-## Implementation i `QvecDatabase`
+## Implementation in `QvecDatabase`
 
-`_vectorSectionOffset` delades i `_floatVectorSectionOffset` (float-läge och rescored) och
-`_codesSectionOffset` (int8 och rescored); `_rescore` sätts i `CaptureSectionOffsets`.
+`_vectorSectionOffset` was split into `_floatVectorSectionOffset` (float mode and rescored) and
+`_codesSectionOffset` (int8 and rescored); `_rescore` is set in `CaptureSectionOffsets`.
 
-- `WriteVectorToDisk`: kvantiserar och skriver koder + parametrar; i rescored-läge fortsätter
-  den och skriver floats. Alla vägar (AddEntry, AddEntries, UpdateVector, Vacuum) går genom den.
-- `ReadVectorInto` (används av `GetByGuid`/`GetVector` och Vacuum): läser floats när de finns,
-  dekvantiserar annars. Vacuum i rescored-läge kvantiserar alltså om från original, inte från
-  en tidigare dekvantisering.
-- `FinalScore(query, index)`: exakt float-similarity om `_rescore`, annars `CalculateScore`.
-  Används i alla uttömmande vägar (`SearchSimple`, `SearchSimpleParallel`,
+- `WriteVectorToDisk`: quantizes and writes codes + parameters; in rescored mode it continues
+  and writes floats. All paths (AddEntry, AddEntries, UpdateVector, Vacuum) go through it.
+- `ReadVectorInto` (used by `GetByGuid`/`GetVector` and Vacuum): reads floats when they exist,
+  otherwise dequantizes. Vacuum in rescored mode therefore requantizes from the original, not from
+  a previous dequantization.
+- `FinalScore(query, index)`: exact float similarity if `_rescore`, otherwise `CalculateScore`.
+  Used in all exhaustive paths (`SearchSimple`, `SearchSimpleParallel`,
   `ExhaustiveFilteredSearch`, `Rerank`).
-- `RescoreCandidates`: skriver om `Score` i kandidatarrayen från `SearchLayerNearest` /
-  `SearchLayerFiltered` innan `OrderByDescending().Take(topK)`. No-op om inte `_rescore`, så
-  float- och int8-filer betalar ingenting.
-- Insert-heuristiken (`StoredSimilarity`, `SelectNeighborsHeuristic`) kör kvar på int8, så
-  grafen blir identisk med en ren int8-graf byggd i samma ordning.
+- `RescoreCandidates`: rewrites `Score` in the candidate array from `SearchLayerNearest` /
+  `SearchLayerFiltered` before `OrderByDescending().Take(topK)`. No-op unless `_rescore`, so
+  float and int8 files pay nothing.
+- The insert heuristic (`StoredSimilarity`, `SelectNeighborsHeuristic`) remains on int8, so
+  the graph is identical to a pure int8 graph built in the same order.
 
-## Mätningar
+## Measurements
 
 ### siftsmall
 
-10 000 × 128, Euclidean, 12 trådar, samma körning:
+10,000 × 128, Euclidean, 12 threads, same run:
 
 | | ef 20 | ef 80 |
 | --- | --- | --- |
-| float recall@10 / QPS | 98.6 % / 22 729 | 99.5 % / 8 169 |
-| int8 recall@10 / QPS | 98.3 % / 27 161 | 99.0 % / 8 719 |
-| rescored recall@10 / QPS | **99.1 %** / 18 096 | **99.8 %** / 8 118 |
+| float recall@10 / QPS | 98.6% / 22,729 | 99.5% / 8,169 |
+| int8 recall@10 / QPS | 98.3% / 27,161 | 99.0% / 8,719 |
+| rescored recall@10 / QPS | **99.1%** / 18,096 | **99.8%** / 8,118 |
 
-På ett så litet index är grafvandringen billig och omrankningen av 20 kandidater à 128
-floats syns i QPS vid ef 20. Vid ef 80 är kostnaden borta i bruset.
+On such a small index, graph traversal is cheap and reranking 20 candidates of 128 floats each
+shows up in QPS at ef 20. At ef 80 the cost is lost in the noise.
 
-### Täta kluster (testet)
+### Dense clusters (the test)
 
-Samma data som `QuantizedDatabaseTests` (n = 2000, dim 64, spridning 0.08, ef 200):
-`RescoredQuantizationTests` kräver ≥ 97 % recall@10 mot exakt float-brute-force i alla tre
-metriker, där int8 ensamt låg på 89.8 % för Cosine.
+Same data as `QuantizedDatabaseTests` (n = 2000, dim 64, spread 0.08, ef 200):
+`RescoredQuantizationTests` requires ≥ 97% recall@10 against exact float-brute-force in all three
+metrics, where int8 alone was at 89.8% for Cosine.
 
 ### Cohere 1M
 
-Se [benchmarks/README.md](../benchmarks/README.md#cohere-1m-measured) för tabellen. Kort:
-rescored matchar float på recall@100 vid ef 180 och 320 (94.7/97.4 %) och gör det vid
-int8-QPS (6 778 mot int8 6 841 och float 3 764 vid ef 180, 12 trådar). Bygget tog 170 s mot
-419 s för float. Filen är 4 124 MiB mot 3 376 (float) och 1 194 (int8).
+See [benchmarks/README.md](../benchmarks/README.md#cohere-1m-measured) for the table. In short:
+rescored matches float on recall@100 at ef 180 and 320 (94.7/97.4%) and does so at
+int8 QPS (6,778 vs. int8 6,841 and float 3,764 at ef 180, 12 threads). The build took 170 s vs.
+419 s for float. The file is 4,124 MiB vs. 3,376 (float) and 1,194 (int8).
 
-## Test
+## Tests
 
-`tests/Qvec.Core.Tests/Quantization/RescoredQuantizationTests.cs`: layout (slot 8, ej
-Required, `HasOptionalSections`), `Open` rapporterar `Int8Rescored`, mismatch i båda
-riktningarna kastar, `GetByGuid` returnerar exakt original, poäng lika med float-brute-force
-(1e-4) i alla metriker, recall ≥ 97 % på täta kluster, filtrerad sökning med float-poäng,
-Update/Delete/Vacuum håller båda sektionerna i takt, Grow bevarar floats, parallell
-`AddEntries` skriver floats för alla rader.
+`tests/Qvec.Core.Tests/Quantization/RescoredQuantizationTests.cs`: layout (slot 8, not
+Required, `HasOptionalSections`), `Open` reports `Int8Rescored`, mismatch in both
+directions throws, `GetByGuid` returns the exact original, scores equal float-brute-force
+(1e-4) in all metrics, recall ≥ 97% on dense clusters, filtered search with float scores,
+Update/Delete/Vacuum keeps both sections in sync, Grow preserves floats, parallel
+`AddEntries` writes floats for all rows.

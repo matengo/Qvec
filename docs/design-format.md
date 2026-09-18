@@ -1,59 +1,70 @@
-# Design: Filformat (aktuell version 5, version 6 med change tracking)
+# Design: File format (current version 5, version 6 with change tracking)
 
-> **Om namngivningen.** Layouten i det här dokumentet infördes som formatversion 4 och kallas
-> därför "v4" i löptexten nedan. Headerfältet `Version` är idag **5** (`CurrentFormatVersion`)
-> för filer utan change tracking och **6** (`ChangeTrackingFormatVersion`) för filer med:
-> version 5 bumpades när baslagret fick dubbel fan-out (`M0 = 2 * MaxNeighbors`) och
-> ändrade `Graph.ElementSize`; version 6 lägger till headerfälten 184..239 och sektionerna
-> `EntryVersions`/`ChangeLog` för [sync-spårning](design-sync-engine.md), se
-> [Version och kompatibilitet](#version-och-kompatibilitet).
-> Allt som sägs om "v4-reader", "v4-fil" osv. gäller alltså även version 5 och 6, om inte annat
-> anges.
+> **About the naming.** The layout in this document was introduced as format version 4 and is
+> therefore called "v4" in the running text below. The header field `Version` is currently **5**
+> (`CurrentFormatVersion`) for files without change tracking and **6**
+> (`ChangeTrackingFormatVersion`) for files with it: version 5 was bumped when the base layer got
+> double fan-out (`M0 = 2 * MaxNeighbors`) and changed `Graph.ElementSize`; version 6 adds the
+> header fields 184..239 and the sections `EntryVersions`/`ChangeLog` for
+> [sync tracking](design-sync-engine.md), see [Version and compatibility](#version-and-compatibility).
+> Everything said about "v4-reader", "v4-file", and so on therefore also applies to version 5 and
+> 6, unless otherwise stated.
 
-## Bakgrund
+## Background
 
-Qvec v3 har ett kompakt men hårt kodat filformat:
+Qvec v3 has a compact but hard-coded file format:
 
-- `DbHeader` är 52 bytes med `[StructLayout(LayoutKind.Sequential, Pack = 1)]`.
-- Header-regionen är alltid 1024 bytes.
-- Alla sektioner ligger i fast ordning efter headern.
-- Offset för varje sektion räknas fram med `ComputeLayout(...)` från `VectorDimension`, `MaxCount`, `MaxNeighbors` och `MaxLayers`.
-- Metadata är en fast 512-byte slot per rad.
-- Tombstones är en byte per rad och laddas genom scan vid uppstart.
+- `DbHeader` is 52 bytes with `[StructLayout(LayoutKind.Sequential, Pack = 1)]`.
+- The header region is always 1024 bytes.
+- All sections are in a fixed order after the header.
+- The offset for each section is calculated with `ComputeLayout(...)` from `VectorDimension`,
+  `MaxCount`, `MaxNeighbors`, and `MaxLayers`.
+- Metadata is a fixed 512-byte slot per row.
+- Tombstones are one byte per row and are loaded through a scan at startup.
 
-Det har fungerat för små och fasta databaser, men v3 är inte tillräckligt självbeskrivande för ett AOT-orienterat bibliotek som ska kunna växa, återöppnas säkert och utvecklas med nya sektioner.
+That has worked for small and fixed databases, but v3 is not self-describing enough for an
+AOT-oriented library that must be able to grow, be reopened safely, and evolve with new sections.
 
-v4 ersätter de aritmetiskt härledda offsetarna med en explicit section table, lägger till header-integritet, metadata heap, persistent free list och reserverade formatkrokar för framtida kvantisering.
+v4 replaces the arithmetically derived offsets with an explicit section table, adds header
+integrity, metadata heap, persistent free list, and reserved format hooks for future quantization.
 
-Detta dokument är en implementeringsspecifikation. Det beskriver inte en migration från v2/v3; äldre filer ska avvisas.
-
----
-
-## Mål
-
-- Headern och section table är **enda källan till sanning** för en befintlig fil.
-- Konstruktorargument används bara när en ny fil skapas.
-- Äldre format (`Version` 1, 2, 3) migreras inte automatiskt.
-- En trasig, avbruten eller delvis skriven header ska upptäckas vid `Open(...)` och `IsHealthy()`.
-- Metadata får vara större än 512 bytes och ska inte preallokera 512 MB för 1M rader.
-- Tombstoned slots ska kunna återanvändas efter processrestart utan att `AllocateSlot` behöver scanna hela tombstone-sektionen.
-- Filen ska kunna växa genom remap av memory-mapped file.
-- Skapande ska undvika att fysiskt materialisera hela filen när filsystemet stöder sparse files.
-
-## Icke-mål
-
-- Ingen automatisk v2/v3 -> v4 migration.
-- Ingen design av själva int8-kvantiseringen.
-- Ingen multi-process writer-garanti. v4 kan tillåta flera samtidiga readers som öppnar filen på nytt, men exakt live-coherency mellan processer är inte ett mål i denna iteration.
-- Ingen full datachecksum över vektorer, graf eller metadata heap. Checksumen skyddar header och section table, inte hela databasen.
+This document is an implementation specification. It does not describe a migration from v2/v3;
+older files must be rejected.
 
 ---
 
-## Byteordning och primitiva typer
+## Goals
 
-Alla flervärdesfält lagras little-endian. Det matchar .NET på stödda vanliga plattformar, men implementationen ska läsa/skriva explicit med `BinaryPrimitives` eller validerad `MemoryMarshal`-layout så att offsets inte blir beroende av runtime-padding.
+- The header and section table are the **single source of truth** for an existing file.
+- Constructor arguments are used only when a new file is created.
+- Older formats (`Version` 1, 2, 3) are not migrated automatically.
+- A broken, interrupted, or partially written header must be detected by `Open(...)` and
+  `IsHealthy()`.
+- Metadata may be larger than 512 bytes and must not preallocate 512 MB for 1M rows.
+- Tombstoned slots must be reusable after process restart without `AllocateSlot` having to scan the
+  entire tombstone section.
+- The file must be able to grow through remapping of the memory-mapped file.
+- Creation must avoid physically materializing the whole file when the file system supports sparse
+  files.
 
-| Typ | Storlek | Kommentar |
+## Non-goals
+
+- No automatic v2/v3 -> v4 migration.
+- No design of the int8 quantization itself.
+- No multi-process writer guarantee. v4 may allow several concurrent readers that reopen the file,
+  but exact live coherency between processes is not a goal in this iteration.
+- No full data checksum over vectors, graph, or metadata heap. The checksum protects the header and
+  section table, not the whole database.
+
+---
+
+## Byte order and primitive types
+
+All multi-value fields are stored little-endian. This matches .NET on supported common platforms,
+though the implementation must read/write explicitly with `BinaryPrimitives` or a validated
+`MemoryMarshal` layout so that offsets do not depend on runtime padding.
+
+| Type | Size | Comment |
 |---|---:|---|
 | `UInt16` | 2 | unsigned little-endian |
 | `Int32` | 4 | signed little-endian |
@@ -62,13 +73,14 @@ Alla flervärdesfält lagras little-endian. Det matchar .NET på stödda vanliga
 | `UInt64` | 8 | unsigned little-endian |
 | `Double` | 8 | IEEE 754 little-endian |
 
-Alla reserverade bytes måste skrivas som `0` vid `Create`. Vid `Open` får okända reserverade bytes ignoreras, men checksumen beräknas över dem.
+All reserved bytes must be written as `0` on `Create`. On `Open`, unknown reserved bytes may be
+ignored, but the checksum is computed over them.
 
 ---
 
-## Översiktlig layout
+## Overview layout
 
-v4 använder en större header-region än v3.
+v4 uses a larger header region than v3.
 
 ```
 ????????????????????????????????????????  0
@@ -90,22 +102,24 @@ v4 använder en större header-region än v3.
 ????????????????????????????????????????
 ```
 
-`HeaderSize` för v4 är alltid `4096`.
+`HeaderSize` for v4 is always `4096`.
 
-Implementation får fortfarande använda `DbHeader`, men den ska antingen:
+The implementation may still use `DbHeader`, but it must either:
 
-1. vara en explicit v4-struct med unit tests för varje offset, eller
-2. ersättas med manuell header-serialisering.
+1. be an explicit v4 struct with unit tests for every offset, or
+2. be replaced with manual header serialization.
 
-Rekommendationen är manuell serialisering med namngivna offset-konstanter. Det minskar risken att en framtida field-order ändrar filformatet.
+The recommendation is manual serialization with named offset constants. It reduces the risk that a
+future field order changes the file format.
 
 ---
 
 ## Primary Header
 
-Primary header är 512 bytes. Fälten nedan är absoluta offsetar från filens början.
+The primary header is 512 bytes. The fields below are absolute offsets from the beginning of the
+file.
 
-| Offset | Storlek | Typ | Fältnamn | Värde / betydelse |
+| Offset | Size | Type | Field name | Value / meaning |
 |---:|---:|---|---|---|
 | 0 | 4 | `Int32` | `MagicNumber` | `0x5A564543` (`"ZVEC"`) |
 | 4 | 4 | `Int32` | `Version` | `CurrentFormatVersion` (`5`) |
@@ -114,140 +128,144 @@ Primary header är 512 bytes. Fälten nedan är absoluta offsetar från filens b
 | 16 | 4 | `Int32` | `SectionTableOffset` | `512` |
 | 20 | 4 | `Int32` | `SectionTableEntrySize` | `32` |
 | 24 | 4 | `Int32` | `SectionTableEntryCount` | `64` |
-| 28 | 4 | `UInt32` | `HeaderCrc32` | CRC-32 över header + section table, med detta fält nollat |
-| 32 | 8 | `UInt64` | `Generation` | Monotont ökande commit-generation |
-| 40 | 4 | `UInt32` | `WriteInProgress` | `0` = clean, `1` = writer höll på |
-| 44 | 4 | `UInt32` | `HeaderFlags` | se flaggor nedan |
-| 48 | 4 | `Int32` | `VectorDimension` | antal `float` per vektor, `> 0` |
-| 52 | 8 | `Int64` | `CurrentCount` | högsta allokerade rad + 1 |
-| 60 | 8 | `Int64` | `MaxCount` | aktuell radkapacitet för radsektioner |
+| 28 | 4 | `UInt32` | `HeaderCrc32` | CRC-32 over header + section table, with this field zeroed |
+| 32 | 8 | `UInt64` | `Generation` | Monotonically increasing commit generation |
+| 40 | 4 | `UInt32` | `WriteInProgress` | `0` = clean, `1` = writer was in progress |
+| 44 | 4 | `UInt32` | `HeaderFlags` | see flags below |
+| 48 | 4 | `Int32` | `VectorDimension` | number of `float` values per vector, `> 0` |
+| 52 | 8 | `Int64` | `CurrentCount` | highest allocated row + 1 |
+| 60 | 8 | `Int64` | `MaxCount` | current row capacity for row sections |
 | 68 | 4 | `Int32` | `MaxNeighbors` | HNSW `M`, `>= 2` |
-| 72 | 4 | `Int32` | `MaxLayers` | antal lager, `> 0` |
-| 76 | 8 | `Double` | `LayerProbability` | samma betydelse som v3 |
-| 84 | 8 | `Int64` | `EntryPoint` | radindex eller `-1` |
-| 92 | 4 | `Int32` | `EntryPointLevel` | `0..MaxLayers-1`, eller `0` när tom |
-| 96 | 8 | `Int64` | `DeletedCount` | antal tombstoned rader |
+| 72 | 4 | `Int32` | `MaxLayers` | number of layers, `> 0` |
+| 76 | 8 | `Double` | `LayerProbability` | same meaning as v3 |
+| 84 | 8 | `Int64` | `EntryPoint` | row index or `-1` |
+| 92 | 4 | `Int32` | `EntryPointLevel` | `0..MaxLayers-1`, or `0` when empty |
+| 96 | 8 | `Int64` | `DeletedCount` | number of tombstoned rows |
 | 104 | 4 | `Int32` | `DistanceFunction` | `0 = DotProduct`, `1 = Cosine`, `2 = Euclidean` |
-| 108 | 8 | `Int64` | `MetadataHeapUsed` | antal använda bytes i metadata heap |
-| 116 | 8 | `Int64` | `FreeListHead` | första fria radindex eller `-1` |
-| 124 | 8 | `Int64` | `FreeListCount` | antal noder i free list |
-| 132 | 4 | `UInt32` | `FormatOptions` | se formatflaggor |
-| 136 | 4 | `Int32` | `QuantizationMode` | `0 = None`, övriga reserverade |
-| 140 | 4 | `Int32` | `QuantizationSectionId` | `0` när `None`, annars section id |
-| 144 | 8 | `Int64` | `FileLength` | förväntad logisk fillängd |
-| 152 | 8 | `Int64` | `MetadataHeapCapacity` | samma som metadata heap-sektionens `Length` |
-| 160 | 8 | `Int64` | `NextSectionDataOffset` | första fria byte efter alla kända sektioner |
-| 168 | 8 | `Int64` | `CreatedUnixTimeSeconds` | `DateTimeOffset.UtcNow.ToUnixTimeSeconds()` vid create |
-| 176 | 8 | `Int64` | `UpdatedUnixTimeSeconds` | uppdateras vid header-commit |
-| 184 | 16 | `Guid` | `ReplicaId` | replikans identitet; `Guid.Empty` utan change tracking |
-| 200 | 8 | `Int64` | `ChangeSeq` | löpnummer för senaste change-log-post; `0` utan tracking |
-| 208 | 8 | `Int64` | `ChangeLogHead` | nästa lediga slot i change-log-ringen; `0` utan tracking |
-| 216 | 8 | `Int64` | `ChangeLogCount` | antal giltiga poster i ringen; `0` utan tracking |
-| 224 | 8 | `Int64` | `LastHlc` | senast utgivna HLC-värdet (48 bitar ms + 16 bitar räknare); `0` utan tracking |
-| 232 | 8 | `Int64` | `TrackingEnabledUnixSeconds` | när tracking slogs på; `0` utan tracking |
-| 240 | 272 | bytes | `Reserved` | måste vara `0` |
+| 108 | 8 | `Int64` | `MetadataHeapUsed` | number of used bytes in the metadata heap |
+| 116 | 8 | `Int64` | `FreeListHead` | first free row index or `-1` |
+| 124 | 8 | `Int64` | `FreeListCount` | number of nodes in the free list |
+| 132 | 4 | `UInt32` | `FormatOptions` | see format flags |
+| 136 | 4 | `Int32` | `QuantizationMode` | `0 = None`, others reserved |
+| 140 | 4 | `Int32` | `QuantizationSectionId` | `0` when `None`, otherwise section id |
+| 144 | 8 | `Int64` | `FileLength` | expected logical file length |
+| 152 | 8 | `Int64` | `MetadataHeapCapacity` | same as the metadata heap section's `Length` |
+| 160 | 8 | `Int64` | `NextSectionDataOffset` | first free byte after all known sections |
+| 168 | 8 | `Int64` | `CreatedUnixTimeSeconds` | `DateTimeOffset.UtcNow.ToUnixTimeSeconds()` on create |
+| 176 | 8 | `Int64` | `UpdatedUnixTimeSeconds` | updated on header commit |
+| 184 | 16 | `Guid` | `ReplicaId` | identity of the replica; `Guid.Empty` without change tracking |
+| 200 | 8 | `Int64` | `ChangeSeq` | sequence number for the latest change-log entry; `0` without tracking |
+| 208 | 8 | `Int64` | `ChangeLogHead` | next free slot in the change-log ring; `0` without tracking |
+| 216 | 8 | `Int64` | `ChangeLogCount` | number of valid entries in the ring; `0` without tracking |
+| 224 | 8 | `Int64` | `LastHlc` | latest issued HLC value (48 bits ms + 16 bits counter); `0` without tracking |
+| 232 | 8 | `Int64` | `TrackingEnabledUnixSeconds` | when tracking was enabled; `0` without tracking |
+| 240 | 272 | bytes | `Reserved` | must be `0` |
 
-Fälten 184..239 är bara meningsfulla när `HasChangeTracking` är satt (version 6). I en
-version 5-fil ligger de i det som tidigare var `Reserved` och måste vara `0`, så en
-version 5-fil skriven av Qvec 2.0.0 är byte-identisk med en fil skriven av en senare
-version utan tracking. Se `design-sync-engine.md` för semantiken.
-
+Fields 184..239 are meaningful only when `HasChangeTracking` is set (version 6). In a version 5
+file they are in what was previously `Reserved` and must be `0`, so a version 5 file written by
+Qvec 2.0.0 is byte-identical to a file written by a later version without tracking. See
+`design-sync-engine.md` for the semantics.
 ### `HeaderFlags`
 
-| Bit | Namn | Betydelse |
+| Bit | Name | Meaning |
 |---:|---|---|
-| 0 | `SparseRequested` | Skaparen försökte markera filen sparse |
-| 1 | `SparseConfirmed` | Sparse-markering lyckades eller plattformen har naturlig sparse-semantik |
-| 2 | `HasOptionalSections` | Minst en okänd/optional section slot är present |
-| 3 | `HasChangeTracking` | Filen bär `EntryVersions` och `ChangeLog`; kräver `FormatVersion = 6` |
-| 4..31 | reserverade | måste skrivas `0`; ignoreras av v4-reader |
+| 0 | `SparseRequested` | The creator tried to mark the file sparse |
+| 1 | `SparseConfirmed` | Sparse marking succeeded or the platform has natural sparse semantics |
+| 2 | `HasOptionalSections` | At least one unknown/optional section slot is present |
+| 3 | `HasChangeTracking` | The file carries `EntryVersions` and `ChangeLog`; requires `FormatVersion = 6` |
+| 4..31 | reserved | must be written `0`; ignored by v4-reader |
 
 ### `FormatOptions`
 
-| Bit | Namn | Betydelse |
+| Bit | Name | Meaning |
 |---:|---|---|
-| 0 | `AllowGrow` | filen får växa när radkapacitet eller metadata heap tar slut |
-| 1 | `RequireCleanOpen` | `Open` måste avvisa `WriteInProgress != 0`; ska vara satt i v4 |
-| 2 | `HasMetadataHeap` | ska vara satt i v4 |
-| 3 | `HasPersistentFreeList` | ska vara satt i v4 |
-| 4 | `ReservedQuantizationHooks` | section ids för kvantisering är reserverade |
-| 5..31 | reserverade | måste skrivas `0`; ignoreras av v4-reader |
+| 0 | `AllowGrow` | the file may grow when row capacity or metadata heap runs out |
+| 1 | `RequireCleanOpen` | `Open` must reject `WriteInProgress != 0`; must be set in v4 |
+| 2 | `HasMetadataHeap` | must be set in v4 |
+| 3 | `HasPersistentFreeList` | must be set in v4 |
+| 4 | `ReservedQuantizationHooks` | section ids for quantization are reserved |
+| 5..31 | reserved | must be written `0`; ignored by v4-reader |
 
 ---
 
 ## Section Table
 
-Section table börjar vid `SectionTableOffset` och består av exakt `SectionTableEntryCount` slots. v4 reserverar `64` slots. Varje slot är 32 bytes.
+The section table starts at `SectionTableOffset` and consists of exactly `SectionTableEntryCount`
+slots. v4 reserves `64` slots. Each slot is 32 bytes.
 
-Tom slot:
+Empty slot:
 
 - `SectionId = 0`
-- övriga fält `0`
+- other fields `0`
 
-Entry layout, offset relativt slotens början:
+Entry layout, offset relative to the beginning of the slot:
 
-| Offset | Storlek | Typ | Fältnamn | Betydelse |
+| Offset | Size | Type | Field name | Meaning |
 |---:|---:|---|---|---|
-| 0 | 4 | `UInt32` | `SectionId` | typ av sektion |
-| 4 | 4 | `UInt32` | `SectionFlags` | `Present`, `Required`, osv |
-| 8 | 8 | `Int64` | `Offset` | absolut offset från filens början |
-| 16 | 8 | `Int64` | `Length` | antal bytes reserverade för sektionen |
-| 24 | 4 | `UInt32` | `ElementSize` | logisk elementstorlek, eller `1` för byte heap |
-| 28 | 4 | `UInt32` | `Reserved` | `0` i v4 |
+| 0 | 4 | `UInt32` | `SectionId` | type of section |
+| 4 | 4 | `UInt32` | `SectionFlags` | `Present`, `Required`, etc. |
+| 8 | 8 | `Int64` | `Offset` | absolute offset from the beginning of the file |
+| 16 | 8 | `Int64` | `Length` | number of bytes reserved for the section |
+| 24 | 4 | `UInt32` | `ElementSize` | logical element size, or `1` for byte heap |
+| 28 | 4 | `UInt32` | `Reserved` | `0` in v4 |
 
 ### `SectionFlags`
 
-| Bit | Namn | Betydelse |
+| Bit | Name | Meaning |
 |---:|---|---|
-| 0 | `Present` | sloten beskriver en sektion |
-| 1 | `Required` | reader måste förstå `SectionId` |
-| 2 | `Mutable` | sektionen skrivs efter create |
-| 3 | `AppendOnly` | sektionen växer append-only inom sitt `Length` |
-| 4 | `MayMoveOnGrow` | sektionen kan flyttas när filen växer |
-| 5..31 | reserverade | måste skrivas `0` i v4 |
+| 0 | `Present` | the slot describes a section |
+| 1 | `Required` | reader must understand `SectionId` |
+| 2 | `Mutable` | the section is written after create |
+| 3 | `AppendOnly` | the section grows append-only within its `Length` |
+| 4 | `MayMoveOnGrow` | the section may be moved when the file grows |
+| 5..31 | reserved | must be written `0` in v4 |
 
-Regler:
+Rules:
 
-- Om `SectionId == 0` måste `SectionFlags`, `Offset`, `Length`, `ElementSize` och `Reserved` vara `0`.
-- Om `SectionId != 0` måste `Present` vara satt.
-- `Required` betyder att en v4-reader som inte känner igen `SectionId` ska avvisa filen.
-- Okända sektioner utan `Required` ska ignoreras semantiskt men ändå valideras strukturellt.
-- `Reserved` måste vara `0`; annars är headern korrupt.
-- `Offset` måste vara `>= HeaderSize`.
-- `Length` måste vara `>= 0`.
-- `ElementSize` måste vara `> 0` för present sections.
-- `Offset + Length` måste vara `<= FileLength` och `<= actual file length` vid `Open`.
-- Present sections får inte överlappa varandra. Sortera intervallen efter `Offset` och kontrollera att föregående `End <= nästa Offset`.
-- Dubbletter av samma kända `SectionId` är korrupt format, förutom framtida optional ids där readern inte tolkar innehållet. För v4 ska även okända ids vara unika för enkel diagnostik.
+- If `SectionId == 0`, `SectionFlags`, `Offset`, `Length`, `ElementSize`, and `Reserved` must be
+  `0`.
+- If `SectionId != 0`, `Present` must be set.
+- `Required` means that a v4-reader that does not recognize `SectionId` must reject the file.
+- Unknown sections without `Required` must be ignored semantically but still validated structurally.
+- `Reserved` must be `0`; otherwise the header is corrupt.
+- `Offset` must be `>= HeaderSize`.
+- `Length` must be `>= 0`.
+- `ElementSize` must be `> 0` for present sections.
+- `Offset + Length` must be `<= FileLength` and `<= actual file length` on `Open`.
+- Present sections must not overlap each other. Sort the intervals by `Offset` and check that the
+  previous `End <= next Offset`.
+- Duplicates of the same known `SectionId` are corrupt format, except for future optional ids where
+  the reader does not interpret the content. For v4, unknown ids should also be unique for simple
+  diagnostics.
 
-### Reserverade section ids
+### Reserved section ids
 
-| Id | Namn | Required | ElementSize | Kommentar |
+| Id | Name | Required | ElementSize | Comment |
 |---:|---|---|---:|---|
-| 0 | `Unused` | nej | 0 | tom slot |
-| 1 | `Vectors` | ja | `VectorDimension * 4` | `float32[VectorDimension]` per rad |
-| 2 | `Graph` | ja | `(MaxLayers + 1) * MaxNeighbors * 4` | `Int32` grannar per rad och lager; level 0 har `2 * MaxNeighbors` platser |
-| 3 | `MetadataDescriptors` | ja | `16` | en descriptor per rad |
-| 4 | `MetadataHeap` | ja | `1` | UTF-8 metadata bytes, append-only |
-| 5 | `Guids` | ja | `16` | `Guid.ToByteArray()`-kompatibla bytes per rad |
-| 6 | `Tombstones` | ja | `1` | `0 = live/never used`, `1 = deleted` |
-| 7 | `FreeList` | ja | `8` | `Int64 nextIndex` per rad |
-| 8 | `QuantizedVectors` | nej | reserverad | framtida int8-vektorer |
-| 9 | `QuantizationDatasetParameters` | nej | reserverad | framtida dataset-scale/offset |
-| 10 | `QuantizationVectorParameters` | nej | reserverad | framtida per-vektor-scale/offset |
-| 11 | `EntryVersions` | ja om `HasChangeTracking` | `24` | `Int64 hlc` + `Guid origin` per rad; version 6 |
-| 12 | `ChangeLog` | ja om `HasChangeTracking` | `64` | ring av change-poster; version 6, se `design-sync-engine.md` |
-| 13..1023 | reserverade | nej | varierar | Qvec framtida format |
-| 1024.. | third-party/experiment | nej | varierar | får aldrig markeras `Required` av Qvec v4 |
+| 0 | `Unused` | no | 0 | empty slot |
+| 1 | `Vectors` | yes | `VectorDimension * 4` | `float32[VectorDimension]` per row |
+| 2 | `Graph` | yes | `(MaxLayers + 1) * MaxNeighbors * 4` | `Int32` neighbors per row and layer; level 0 has `2 * MaxNeighbors` places |
+| 3 | `MetadataDescriptors` | yes | `16` | one descriptor per row |
+| 4 | `MetadataHeap` | yes | `1` | UTF-8 metadata bytes, append-only |
+| 5 | `Guids` | yes | `16` | `Guid.ToByteArray()`-compatible bytes per row |
+| 6 | `Tombstones` | yes | `1` | `0 = live/never used`, `1 = deleted` |
+| 7 | `FreeList` | yes | `8` | `Int64 nextIndex` per row |
+| 8 | `QuantizedVectors` | no | reserved | future int8 vectors |
+| 9 | `QuantizationDatasetParameters` | no | reserved | future dataset-scale/offset |
+| 10 | `QuantizationVectorParameters` | no | reserved | future per-vector scale/offset |
+| 11 | `EntryVersions` | yes if `HasChangeTracking` | `24` | `Int64 hlc` + `Guid origin` per row; version 6 |
+| 12 | `ChangeLog` | yes if `HasChangeTracking` | `64` | ring of change entries; version 6, see `design-sync-engine.md` |
+| 13..1023 | reserved | no | varies | Qvec future formats |
+| 1024.. | third-party/experiment | no | varies | must never be marked `Required` by Qvec v4 |
 
-V4-reader måste förstå ids `1..7`. Om någon saknas eller inte är `Required`, är filen korrupt.
-Ids `11` och `12` får bara förekomma när `HasChangeTracking` är satt och måste då båda vara
-`Required` och present; de läggs sist i layouten så att `EnableChangeTracking` kan lägga till
-dem utan att flytta befintliga sektioner.
+A v4-reader must understand ids `1..7`. If any is missing or is not `Required`, the file is corrupt.
+Ids `11` and `12` may only occur when `HasChangeTracking` is set and must then both be `Required`
+and present; they are placed last in the layout so that `EnableChangeTracking` can add them without
+moving existing sections.
 
 ---
 
-## Kända sektioner i detalj
+## Known sections in detail
 
 ### `Vectors` section
 
@@ -258,9 +276,12 @@ row i offset = Vectors.Offset + i * Vectors.ElementSize
 Vectors.ElementSize = VectorDimension * sizeof(float)
 ```
 
-Varje rad är `float32[VectorDimension]`. Semantiken för cosine är oförändrad: inlagrade vektorer är normaliserade kopior, caller-arrayer muteras inte. För `DotProduct` och `Euclidean` lagras vektorn som den kom in — att normalisera under euklidisk metrik vore direkt fel, eftersom skalning ändrar avståndet till allt annat.
+Each row is `float32[VectorDimension]`. The semantics for cosine are unchanged: stored vectors are
+normalized copies, and caller arrays are not mutated. For `DotProduct` and `Euclidean`, the vector is
+stored as it arrived — normalizing under Euclidean metric would be directly wrong, because scaling
+changes the distance to everything else.
 
-Validering:
+Validation:
 
 - `Vectors.Length >= MaxCount * VectorDimension * 4`
 - `Vectors.ElementSize == VectorDimension * 4`
@@ -269,10 +290,10 @@ Validering:
 
 Layout:
 
-Baslagret (level 0) har dubbel fan-out: `M0 = 2 * MaxNeighbors` platser, medan varje
-lager ovanför har `MaxNeighbors` platser. Det följer originalpubliceringen av HNSW och
-är det som gör baslagret navigerbart. Level 0 ligger först i raden, vilket betyder att
-varje level `l > 0` börjar på `(l + 1) * MaxNeighbors` — inte `l * MaxNeighbors`.
+The base layer (level 0) has double fan-out: `M0 = 2 * MaxNeighbors` places, while each layer above
+has `MaxNeighbors` places. This follows the original HNSW publication and is what makes the base
+layer navigable. Level 0 comes first in the row, which means each level `l > 0` starts at
+`(l + 1) * MaxNeighbors` — not `l * MaxNeighbors`.
 
 ```
 row i offset      = Graph.Offset + i * Graph.ElementSize
@@ -281,73 +302,80 @@ level l offset    = row i offset + (l + 1) * MaxNeighbors * sizeof(Int32)   // l
 neighbor j offset = level l offset + j * sizeof(Int32)
 ```
 
-Varje neighbor är `Int32` row index eller `-1` för tom plats.
+Each neighbor is an `Int32` row index or `-1` for an empty place.
 
-Validering:
+Validation:
 
 - `Graph.Length >= MaxCount * (MaxLayers + 1) * MaxNeighbors * 4`
 - `Graph.ElementSize == (MaxLayers + 1) * MaxNeighbors * 4`
-- `EntryPoint == -1` eller `0 <= EntryPoint < CurrentCount`
-- `EntryPointLevel` inom `0..MaxLayers-1`
+- `EntryPoint == -1` or `0 <= EntryPoint < CurrentCount`
+- `EntryPointLevel` within `0..MaxLayers-1`
 
 ### `MetadataDescriptors` section
 
-V4 ersätter den fasta 512-byte metadata-sloten med en descriptor per rad.
+V4 replaces the fixed 512-byte metadata slot with one descriptor per row.
 
-Descriptor layout, 16 bytes per rad:
+Descriptor layout, 16 bytes per row:
 
-| Offset | Storlek | Typ | Fältnamn | Betydelse |
+| Offset | Size | Type | Field name | Meaning |
 |---:|---:|---|---|---|
-| 0 | 8 | `Int64` | `HeapOffset` | offset relativt `MetadataHeap.Offset` |
-| 8 | 4 | `Int32` | `Length` | antal UTF-8 bytes |
-| 12 | 4 | `UInt32` | `Flags` | `0` i v4 |
+| 0 | 8 | `Int64` | `HeapOffset` | offset relative to `MetadataHeap.Offset` |
+| 8 | 4 | `Int32` | `Length` | number of UTF-8 bytes |
+| 12 | 4 | `UInt32` | `Flags` | `0` in v4 |
 
-`Length == 0` betyder tom metadata-sträng. Då ska `HeapOffset` ignoreras och normalt skrivas `0`.
+`Length == 0` means an empty metadata string. Then `HeapOffset` should be ignored and normally
+written `0`.
 
-Validering:
+Validation:
 
 - `MetadataDescriptors.Length >= MaxCount * 16`
 - `MetadataDescriptors.ElementSize == 16`
-- För varje live rad `i < CurrentCount`:
+- For each live row `i < CurrentCount`:
   - `Length >= 0`
   - `HeapOffset >= 0`
   - `HeapOffset + Length <= MetadataHeapUsed`
   - `MetadataHeapUsed <= MetadataHeap.Length`
 
-`GetMetadata(index)` läser descriptor, hyr byte-buffer eller använder stackalloc för små payloads, läser exakt `Length` bytes från heapen och avkodar UTF-8. Ogiltig UTF-8 ska ge `QvecFormatException` vid read/open-validering om man väljer eager validering; lazy read får kasta `DecoderFallbackException` inlindad i `QvecFormatException`.
-
+`GetMetadata(index)` reads the descriptor, rents a byte buffer or uses stackalloc for small payloads,
+reads exactly `Length` bytes from the heap, and decodes UTF-8. Invalid UTF-8 should produce
+`QvecFormatException` during read/open validation if eager validation is chosen; lazy read may throw
+`DecoderFallbackException` wrapped in `QvecFormatException`.
 ### `MetadataHeap` section
 
-Metadata heap är append-only inom sektionens `Length`.
+The metadata heap is append-only within the section's `Length`.
 
 Write:
 
-1. UTF-8-koda metadata.
-2. Om `MetadataHeapUsed + byteCount > MetadataHeap.Length`, försök växa filen om `AllowGrow` är satt.
-3. Skriv bytes på `MetadataHeap.Offset + MetadataHeapUsed`.
-4. Skriv descriptorn för raden med `HeapOffset = old MetadataHeapUsed`, `Length = byteCount`.
-5. Öka `MetadataHeapUsed` i commit-headern.
+1. UTF-8-encode metadata.
+2. If `MetadataHeapUsed + byteCount > MetadataHeap.Length`, try to grow the file if `AllowGrow` is
+   set.
+3. Write bytes at `MetadataHeap.Offset + MetadataHeapUsed`.
+4. Write the descriptor for the row with `HeapOffset = old MetadataHeapUsed`, `Length = byteCount`.
+5. Increase `MetadataHeapUsed` in the commit header.
 
-När metadata uppdateras skrivs nya bytes längst bak i heapen och descriptorn pekas om. Gamla bytes blir garbage. De återanvänds inte inline.
+When metadata is updated, new bytes are written at the back of the heap and the descriptor is
+repointed. Old bytes become garbage. They are not reused inline.
 
-`Vacuum()` ska vara mekanismen som reclaimar heap-garbage:
+`Vacuum()` must be the mechanism that reclaims heap garbage:
 
-- Skapa en ny v4-fil.
-- Iterera live rader.
-- Skriv vector, Guid och aktuell metadata via normal `AddEntry(..., externalId: guid)`.
-- Bygg om HNSW-grafen genom normal insert eller dedikerad rebuild.
-- Byt fil atomiskt när plattformen tillåter.
+- Create a new v4 file.
+- Iterate live rows.
+- Write vector, Guid, and current metadata through normal `AddEntry(..., externalId: guid)`.
+- Rebuild the HNSW graph through normal insert or a dedicated rebuild.
+- Swap file atomically when the platform allows it.
 
 Heap exhaustion:
 
-- Om `AllowGrow` är satt och remap/grow lyckas: operationen fortsätter.
-- Om grow är avstängt eller misslyckas: kasta `QvecException` med meddelandet:
+- If `AllowGrow` is set and remap/grow succeeds: the operation continues.
+- If grow is disabled or fails: throw `QvecException` with the message:
 
 ```text
 Metadata heap is full: {requiredBytes} bytes required but only {availableBytes} bytes remain. Enable growth or run Vacuum().
 ```
 
-`MaxMetadataBytes` bör ändras från `512` till ett dokumenterat praktiskt maxvärde, till exempel `int.MaxValue`, men implementationen ska också skydda mot `Length > int.MaxValue` eftersom publika API:t tar `string` och .NET-arrayer inte kan hyras obegränsat.
+`MaxMetadataBytes` should be changed from `512` to a documented practical max value, for example
+`int.MaxValue`, but the implementation must also protect against `Length > int.MaxValue` because the
+public API takes `string` and .NET arrays cannot be rented without limit.
 
 ### `Guids` section
 
@@ -357,14 +385,15 @@ Layout:
 row i offset = Guids.Offset + i * 16
 ```
 
-Bytes ska vara kompatibla med nuvarande `Guid.ToByteArray()` / `new Guid(byte[])` så befintlig round-trip-semantik bevaras inom v4.
+Bytes must be compatible with the current `Guid.ToByteArray()` / `new Guid(byte[])` so existing
+round-trip semantics are preserved within v4.
 
-Validering:
+Validation:
 
 - `Guids.Length >= MaxCount * 16`
 - `Guids.ElementSize == 16`
 
-`RebuildGuidIndex()` ska fortfarande byggas vid `Open`, men den ska hoppa tombstoned rader.
+`RebuildGuidIndex()` should still be built on `Open`, but it must skip tombstoned rows.
 
 ### `Tombstones` section
 
@@ -374,22 +403,22 @@ Layout:
 row i offset = Tombstones.Offset + i
 ```
 
-Värden:
+Values:
 
-- `0`: raden är inte tombstoned.
-- `1`: raden är tombstoned och får återanvändas via free list.
+- `0`: the row is not tombstoned.
+- `1`: the row is tombstoned and may be reused through the free list.
 
-Alla andra värden är korrupt format.
+All other values are corrupt format.
 
-Validering:
+Validation:
 
 - `Tombstones.Length >= MaxCount`
 - `Tombstones.ElementSize == 1`
-- Antal `1` för `i < CurrentCount` ska vara `DeletedCount`.
+- Number of `1` values for `i < CurrentCount` must be `DeletedCount`.
 
 ### `FreeList` section
 
-Free list är en persistent stack över tombstoned slots.
+The free list is a persistent stack over tombstoned slots.
 
 Layout:
 
@@ -397,277 +426,300 @@ Layout:
 row i offset = FreeList.Offset + i * 8
 ```
 
-Varje element är `Int64 nextIndex`.
+Each element is `Int64 nextIndex`.
 
-Värden:
+Values:
 
-- För tombstoned rader som ingår i stacken: nästa tombstoned radindex eller `-1`.
-- För live/never-used rader: ska skrivas `-1`.
+- For tombstoned rows that are part of the stack: next tombstoned row index or `-1`.
+- For live/never-used rows: should be written `-1`.
 
-Headerfält:
+Header fields:
 
-- `FreeListHead`: första tombstoned slot eller `-1`.
-- `FreeListCount`: antal slots i listan.
+- `FreeListHead`: first tombstoned slot or `-1`.
+- `FreeListCount`: number of slots in the list.
 
 Delete:
 
-1. Sätt tombstone byte till `1`.
-2. Skriv `FreeList[index] = FreeListHead`.
-3. Sätt `FreeListHead = index`.
-4. Öka `FreeListCount` och `DeletedCount`.
-5. Commit-header.
+1. Set tombstone byte to `1`.
+2. Write `FreeList[index] = FreeListHead`.
+3. Set `FreeListHead = index`.
+4. Increase `FreeListCount` and `DeletedCount`.
+5. Commit header.
 
 Allocate:
 
-1. Om `FreeListHead != -1`:
+1. If `FreeListHead != -1`:
    - `slot = FreeListHead`
    - `next = FreeList[slot]`
-   - validera `0 <= slot < CurrentCount`, tombstone är `1`
-   - sätt `FreeListHead = next`
-   - sätt `FreeList[slot] = -1`
-   - sätt tombstone byte till `0`
-   - minska `FreeListCount` och `DeletedCount`
-   - returnera `slot`
-2. Annars, om `CurrentCount < MaxCount`: returnera `CurrentCount++`.
-3. Annars: väx filen om `AllowGrow`, annars kasta `QvecFullException`.
+   - validate `0 <= slot < CurrentCount`, tombstone is `1`
+   - set `FreeListHead = next`
+   - set `FreeList[slot] = -1`
+   - set tombstone byte to `0`
+   - decrease `FreeListCount` and `DeletedCount`
+   - return `slot`
+2. Otherwise, if `CurrentCount < MaxCount`: return `CurrentCount++`.
+3. Otherwise: grow the file if `AllowGrow`, otherwise throw `QvecFullException`.
 
-### Scan eller free list?
+### Scan or free list?
 
-Behåll både tombstone-scan och persistent free list, men ändra deras roller:
+Keep both tombstone scan and persistent free list, but change their roles:
 
-- Tombstone-sektionen är den normativa sanningen för om en rad är live.
-- Free list är den normativa allokeringsordningen för återanvändning.
-- Vid `Open` ska implementationen scanna tombstones för att bygga `TombstoneSet` i minnet och samtidigt validera free list:
-  - inga cykler,
-  - alla free-list-index är `< CurrentCount`,
-  - varje free-list-index har tombstone `1`,
-  - varje tombstoned rad förekommer exakt en gång i free list,
-  - antal noder är `FreeListCount` och matchar `DeletedCount`.
+- The tombstone section is the normative truth for whether a row is live.
+- The free list is the normative allocation order for reuse.
+- On `Open`, the implementation must scan tombstones to build `TombstoneSet` in memory and validate
+  the free list at the same time:
+  - no cycles,
+  - all free-list indices are `< CurrentCount`,
+  - every free-list index has tombstone `1`,
+  - every tombstoned row occurs exactly once in the free list,
+  - the number of nodes is `FreeListCount` and matches `DeletedCount`.
 
-Motivering: `AllocateSlot` blir O(1) efter restart, men startup hittar korrupta eller ofullständiga free-list-skrivningar deterministiskt. Eftersom v4 har `WriteInProgress` ska en crash mitt i delete normalt avvisas redan innan free-list-valideringen.
+Rationale: `AllocateSlot` becomes O(1) after restart, but startup deterministically finds corrupt or
+incomplete free-list writes. Because v4 has `WriteInProgress`, a crash in the middle of delete should
+normally be rejected even before free-list validation.
 
 ### `EntryVersions` section (version 6)
 
-Finns bara när `HasChangeTracking` är satt. En rad per slot, 24 bytes:
+Exists only when `HasChangeTracking` is set. One row per slot, 24 bytes:
 
 ```
 row i offset = EntryVersions.Offset + i * 24
-  0  8  Int64  Hlc       hybrid logical clock (48 bit väggklocka i ms << 16 | 16 bit räknare)
-  8 16  Guid   Origin    ReplicaId för den replika som skapade versionen
+  0  8  Int64  Hlc       hybrid logical clock (48 bit wall clock in ms << 16 | 16 bit counter)
+  8 16  Guid   Origin    ReplicaId for the replica that created the version
 ```
 
-Skrivs efter varje `AddEntry`/`Update`/`UpdateMetadata` och när `ApplyChanges` tar in en
-fjärrversion. Live-radens version är den normativa; en raderad rads version lever bara i
-`ChangeLog`.
+Written after every `AddEntry`/`Update`/`UpdateMetadata` and when `ApplyChanges` accepts a remote
+version. The live row's version is normative; a deleted row's version lives only in `ChangeLog`.
 
 ### `ChangeLog` section (version 6)
 
-Finns bara när `HasChangeTracking` är satt. En ringbuffert med `ChangeLogCapacity` slots om 64
-bytes; ordningen i ringen är den normativa ändringsordningen och `ChangeSeq` i headern är
-sekvensnumret på den senaste posten.
+Exists only when `HasChangeTracking` is set. A ring buffer with `ChangeLogCapacity` slots of 64
+bytes; the order in the ring is the normative change order and `ChangeSeq` in the header is the
+sequence number of the latest entry.
 
 ```
 slot i offset = ChangeLog.Offset + i * 64
-  0  8  Int64  Seq         1-baserat, strikt växande per fil
-  8  8  Int64  Hlc         versionens klocka
+  0  8  Int64  Seq         1-based, strictly increasing per file
+  8  8  Int64  Hlc         version clock
  16 16  Guid   DocumentId
- 32 16  Guid   Origin      versionens ursprung
+ 32 16  Guid   Origin      version origin
  48  1  Byte   Type        1 = Upsert, 2 = Delete
- 49 15  -      reserverad, nollor
+ 49 15  -      reserved, zeros
 ```
 
-Headerfält:
+Header fields:
 
-- `ChangeLogHead`: nästa slot som skrivs.
-- `ChangeLogCount`: antal giltiga poster (`<= ChangeLogCapacity`).
-- posten för `seq` ligger i slot `(ChangeLogHead - 1 - (ChangeSeq - seq)) mod ChangeLogCapacity`.
+- `ChangeLogHead`: next slot to be written.
+- `ChangeLogCount`: number of valid entries (`<= ChangeLogCapacity`).
+- the entry for `seq` is in slot `(ChangeLogHead - 1 - (ChangeSeq - seq)) mod ChangeLogCapacity`.
 
-Append skriver slotten först och committar headern efteråt tillsammans med den mutation som
-orsakade posten. En post som ligger bortom `ChangeLogCount` efter en crash ignoreras därför vid
-`Open`. Vid `Open` spelas ringen upp äldst→nyast för att återskapa versionerna på raderade
-dokument (tombstone-versioner) i minnet; poster för dokument som är live ignoreras.
+Append writes the slot first and commits the header afterwards together with the mutation that caused
+the entry. An entry that lies beyond `ChangeLogCount` after a crash is therefore ignored on `Open`.
+On `Open`, the ring is replayed oldest→newest to recreate the versions of deleted documents
+(tombstone versions) in memory; entries for documents that are live are ignored.
 
-`Grow` med ändrad `ChangeLogCapacity` och `Vacuum` packar om ringen: alla giltiga poster skrivs
-kontinuerligt från slot 0 med bevarade `Seq`, och `ChangeSeq` behålls så att andra replikers
-cursorer förblir giltiga. Cursorer äldre än `ChangeSeq - ChangeLogCount + 1` avvisas med
-`SyncCursorTooOldException`; se `design-sync-engine.md` §4 för `GetChanges`/`ApplyChanges`.
+`Grow` with changed `ChangeLogCapacity` and `Vacuum` repack the ring: all valid entries are written
+contiguously from slot 0 with preserved `Seq`, and `ChangeSeq` is kept so that other replicas'
+cursors remain valid. Cursors older than `ChangeSeq - ChangeLogCount + 1` are rejected with
+`SyncCursorTooOldException`; see `design-sync-engine.md` §4 for `GetChanges`/`ApplyChanges`.
 
 ---
 
-## Version och kompatibilitet
+## Version and compatibility
 
 `CurrentFormatVersion = 5`.
 
-Version 5 skiljer sig från version 4 endast i `Graph.ElementSize`: baslagret fick dubbel
-fan-out (`M0 = 2 * MaxNeighbors`), vilket ändrade radlängden. Allt annat i headern är
-oförändrat. En v4-fil skulle redan ha avvisats av `ValidateSections`, eftersom
-`ElementSize` valideras mot formeln, men två olika layouter får inte kalla sig samma
-version.
+Version 5 differs from version 4 only in `Graph.ElementSize`: the base layer got double fan-out
+(`M0 = 2 * MaxNeighbors`), which changed the row length. Everything else in the header is unchanged.
+A v4 file would already have been rejected by `ValidateSections`, because `ElementSize` is validated
+against the formula, but two different layouts must not call themselves the same version.
 
-Version 6 (`ChangeTrackingFormatVersion`) är version 5 plus change tracking: flaggan
-`HasChangeTracking`, headerfälten 184..239 och sektionerna `EntryVersions` (11) och
-`ChangeLog` (12). Version väljs per fil: en databas utan tracking skrivs fortfarande som
-version 5 och är läsbar av Qvec 2.0.0; `EnableChangeTracking` (eller `ChangeTrackingOptions`
-vid create) bumpar filen till 6. Flagga och version måste alltid följas åt.
+Version 6 (`ChangeTrackingFormatVersion`) is version 5 plus change tracking: the
+`HasChangeTracking` flag, the header fields 184..239, and the sections `EntryVersions` (11) and
+`ChangeLog` (12). Version is chosen per file: a database without tracking is still written as
+version 5 and is readable by Qvec 2.0.0; `EnableChangeTracking` (or `ChangeTrackingOptions` on
+create) bumps the file to 6. Flag and version must always accompany each other.
 
-Exakt kompatibilitetsregel:
+Exact compatibility rule:
 
-- En implementation får bara öppna filer med `MagicNumber == 0x5A564543` och `Version` lika med `5` eller `6`.
-- Version 1 till 4 migreras inte.
-- Versioner större än `6` avvisas.
-- `QvecDatabase.Open(path)` och den publika konstruktorn ska följa samma regel för befintliga filer.
-- Konstruktorargument (`dim`, `max`, `maxNeighbors`, `maxLayers`, `distanceFunction`) får inte användas för att tolka en befintlig fil. Om argumenten skiljer sig från headern ska konstruktorn kasta argument/header-mismatch på samma sätt som dagens säkra beteende, men offsets ska alltid komma från section table.
+- An implementation may only open files with `MagicNumber == 0x5A564543` and `Version` equal to `5`
+  or `6`.
+- Versions 1 through 4 are not migrated.
+- Versions greater than `6` are rejected.
+- `QvecDatabase.Open(path)` and the public constructor must follow the same rule for existing files.
+- Constructor arguments (`dim`, `max`, `maxNeighbors`, `maxLayers`, `distanceFunction`) must not be
+  used to interpret an existing file. If the arguments differ from the header, the constructor must
+  throw an argument/header mismatch in the same way as today's safe behavior, but offsets must always
+  come from the section table.
 
-För en äldre Qvec-fil ska `Open` kasta `QvecFormatException` med meddelande som innehåller följande ordalydelse:
+For an older Qvec file, `Open` must throw `QvecFormatException` with a message containing the
+following wording:
 
 ```text
 '{path}' has Qvec format version {version}. This build only supports format version {CurrentFormatVersion}. Qvec does not migrate older files automatically; export with the matching Qvec version and re-import.
 ```
 
-För framtida version:
+For a future version:
 
 ```text
 '{path}' has Qvec format version {version}. This build only supports format version {CurrentFormatVersion}.
 ```
 
-För fel magic number:
+For an incorrect magic number:
 
 ```text
 '{path}' is not a Qvec database: expected magic number 0x5A564543 but found 0x{actual:X8}.
 ```
 
-För clean-check:
+For a clean-check:
 
 ```text
 '{path}' was not closed cleanly: WriteInProgress is set for generation {generation}. The file may contain a torn write.
 ```
 
-För checksum:
+For checksum:
 
 ```text
 '{path}' has a corrupt Qvec header: CRC-32 mismatch (stored 0x{stored:X8}, computed 0x{computed:X8}).
 ```
 
-Tester ska inte kräva exakt hela strängen, men ska kräva dessa viktiga fraser så att användaren får en tydlig remediation.
+Tests must not require the exact whole string, but must require these important phrases so that the
+user gets clear remediation.
 
 ---
 
-## Integritet
+## Integrity
+### Checksum algorithm
 
-### Checksum-algoritm
+Use `System.IO.Hashing.Crc32`.
 
-Använd `System.IO.Hashing.Crc32`.
+Microsoft Learn describes `Crc32` in namespace `System.IO.Hashing`, assembly
+`System.IO.Hashing.dll`, and as an implementation of CRC-32 according to ITU-T V.42 / IEEE 802.3. If
+`Qvec.Core` does not already get the assembly transitively from `net10.0`, the implementation must
+add a Microsoft `PackageReference` to `System.IO.Hashing` with a version that matches the SDK. This
+is not a third-party dependency.
 
-Microsoft Learn beskriver `Crc32` i namespace `System.IO.Hashing`, assembly `System.IO.Hashing.dll`, och som en implementation av CRC-32 enligt ITU-T V.42 / IEEE 802.3. Om `Qvec.Core` inte redan får assemblyn transitivt från `net10.0` ska implementationen lägga till ett Microsoft `PackageReference` till `System.IO.Hashing` med version som matchar SDK:n. Detta är inte en tredjepartsdependency.
+CRC-32 is not cryptographic. It is sufficient here because the goal is torn/corrupt header
+detection, not attacker protection.
 
-CRC-32 är inte kryptografiskt. Det räcker här eftersom målet är torn/corrupt header-detektion, inte angriparskydd.
+### Exact bytes that are checksummed
 
-### Exakta bytes som checksumas
-
-Checksumen beräknas över `HeaderSize` bytes, alltså:
+The checksum is computed over `HeaderSize` bytes, that is:
 
 - Primary header 0..511
 - Section table 512..2559
 - Reserved header area 2560..4095
 
-Fältet `HeaderCrc32` på offset `28..31` behandlas som fyra nollbytes under beräkningen.
+The field `HeaderCrc32` at offset `28..31` is treated as four zero bytes during the calculation.
 
-Alla andra headerfält, inklusive `WriteInProgress`, `Generation`, `FileLength`, `MetadataHeapUsed` och hela section table, ingår.
+All other header fields, including `WriteInProgress`, `Generation`, `FileLength`,
+`MetadataHeapUsed`, and the whole section table, are included.
 
-Pseudokod:
+Pseudocode:
 
 ```csharp
-Span<byte> header = stackalloc byte[HeaderSize]; // eller ArrayPool för implementation
+Span<byte> header = stackalloc byte[HeaderSize]; // or ArrayPool for implementation
 ReadHeaderBytes(header);
 BinaryPrimitives.WriteUInt32LittleEndian(header.Slice(28, 4), 0);
 uint crc = Crc32.HashToUInt32(header);
 ```
 
-Vid commit:
+On commit:
 
-1. Bygg hela headerbilden i minne med `HeaderCrc32 = 0`.
-2. Beräkna CRC.
-3. Skriv CRC till offset 28 i headerbilden.
-4. Skriv hela `HeaderSize` till filen.
-5. Flush headern.
+1. Build the whole header image in memory with `HeaderCrc32 = 0`.
+2. Compute CRC.
+3. Write CRC to offset 28 in the header image.
+4. Write the whole `HeaderSize` to the file.
+5. Flush the header.
 
-### `WriteInProgress` och `Generation`
+### `WriteInProgress` and `Generation`
 
-Varje muterande operation som kan lämna data och header ur synk ska använda tvåfas-commit:
+Every mutating operation that can leave data and header out of sync must use two-phase commit:
 
-1. Under write lock: skriv en dirty header med:
-   - samma section table som nuvarande committade läge,
+1. Under write lock: write a dirty header with:
+   - the same section table as the current committed state,
    - `WriteInProgress = 1`,
    - `Generation = currentGeneration + 1`,
-   - korrekt CRC för dirty headern.
+   - correct CRC for the dirty header.
 2. Flush dirty header.
-3. Skriv data-sektioner.
-4. Flush berörda accessors/streams.
-5. Skriv clean commit-header:
-   - alla nya räknare, offsets, längder och section table-värden,
+3. Write data sections.
+4. Flush affected accessors/streams.
+5. Write clean commit header:
+   - all new counters, offsets, lengths, and section table values,
    - `WriteInProgress = 0`,
-   - samma `Generation`,
-   - ny CRC.
+   - same `Generation`,
+   - new CRC.
 6. Flush header.
 
-Detta är "data före commit-header". Dirty-headern skrivs före data för att en crash under operationen ska upptäckas.
+This is "data before commit header". The dirty header is written before data so that a crash during
+the operation will be detected.
 
-Operationer som bara skriver data men inte ändrar headern, till exempel en in-place neighbor update, ska ändå sätta `WriteInProgress` om en torn write kan göra grafen inkonsistent. En framtida optimering kan batcha graph updates, men v4 bör börja konservativt.
+Operations that only write data but do not change the header, for example an in-place neighbor
+update, should still set `WriteInProgress` if a torn write can make the graph inconsistent. A future
+optimization can batch graph updates, but v4 should start conservatively.
 
-### `Flush()` och `Dispose()`
+### `Flush()` and `Dispose()`
 
-Ny intern metod:
+New internal method:
 
 ```csharp
 private void FlushAll()
 ```
 
-ska minst:
+must at least:
 
-- anropa `Flush()` på alla aktiva `MemoryMappedViewAccessor` som kan ha ändrats,
-- säkerställa att clean headern skrivits efter datan,
-- om implementationen håller en underliggande `FileStream`, anropa `Flush(flushToDisk: true)` när möjligt.
+- call `Flush()` on all active `MemoryMappedViewAccessor` instances that may have changed,
+- ensure that the clean header has been written after the data,
+- if the implementation holds an underlying `FileStream`, call `Flush(flushToDisk: true)` when
+  possible.
 
-Osäkerhet: `MemoryMappedViewAccessor.Flush()` dokumenterar att viewn flushas till filen, men exakt garanti om fysisk lagring och disk-cache beror på OS och storage. Därför ska `Dispose()` garantera Qvecs logiska ordning och synlighet för omedelbar reopen i samma OS, inte absolut strömavbrottssäkerhet.
+Uncertainty: `MemoryMappedViewAccessor.Flush()` documents that the view is flushed to the file, but
+the exact guarantee about physical storage and disk cache depends on OS and storage. Therefore,
+`Dispose()` must guarantee Qvec's logical order and visibility for immediate reopen in the same OS,
+not absolute power-loss safety.
 
-`Dispose()` måste:
+`Dispose()` must:
 
-1. ta write lock eller stoppa nya operationer,
-2. om en pointer är acquired, släppa den,
-3. flush:a data och clean header,
-4. dispose:a accessors,
-5. dispose:a `MemoryMappedFile`,
-6. dispose:a lock.
+1. take write lock or stop new operations,
+2. if a pointer is acquired, release it,
+3. flush data and clean header,
+4. dispose accessors,
+5. dispose `MemoryMappedFile`,
+6. dispose lock.
 
-Om `Dispose()` anropas när `WriteInProgress` fortfarande är satt på grund av exception, ska implementationen försöka skriva en clean header endast om den vet att datasteget slutfördes. Annars ska dirty läge lämnas kvar så att nästa `Open` avvisar filen.
+If `Dispose()` is called when `WriteInProgress` is still set because of an exception, the
+implementation should try to write a clean header only if it knows the data step completed.
+Otherwise, dirty state must be left in place so that the next `Open` rejects the file.
 
 ### `IsHealthy()`
 
-`IsHealthy()` ska inte längre vara en magic-number-peek.
+`IsHealthy()` must no longer be a magic-number peek.
 
-Den ska:
+It must:
 
-1. läsa `HeaderSize` bytes från filen/accessorn,
-2. validera magic och `Version == CurrentFormatVersion`,
-3. validera CRC,
-4. kräva `WriteInProgress == 0`,
-5. validera section table och kända section-längder,
-6. validera grundläggande räknare:
+1. read `HeaderSize` bytes from the file/accessor,
+2. validate magic and `Version == CurrentFormatVersion`,
+3. validate CRC,
+4. require `WriteInProgress == 0`,
+5. validate section table and known section lengths,
+6. validate basic counters:
    - `0 <= CurrentCount <= MaxCount`
    - `0 <= DeletedCount <= CurrentCount`
    - `0 <= FreeListCount <= DeletedCount`
    - `MetadataHeapUsed <= MetadataHeap.Length`
-7. returnera `false` vid alla exceptions.
+7. return `false` for all exceptions.
 
-Full graph-konsistens behöver inte kontrolleras i `IsHealthy()` eftersom det skulle bli dyrt, men section bounds måste kontrolleras.
+Full graph consistency does not need to be checked in `IsHealthy()` because it would be expensive,
+but section bounds must be checked.
 
 ---
 
-## Create-layout
+## Create layout
 
-Vid `Create` beräknas initiala sektioner från argumenten. Dessa argument används därefter inte för befintlig fil.
+On `Create`, initial sections are computed from the arguments. These arguments are not used
+thereafter for an existing file.
 
-Rekommenderad initial layout:
+Recommended initial layout:
 
 1. `HeaderSize = 4096`
 2. `Vectors`
@@ -678,7 +730,9 @@ Rekommenderad initial layout:
 7. `FreeList`
 8. `MetadataHeap`
 
-`MetadataHeap` sist för att mindre metadata-only growth i vissa fall kan ske utan att andra sektioner behöver flyttas. Radsektionerna ligger före heapen eftersom de har enkel kapacitetsberäkning.
+`MetadataHeap` is last so that smaller metadata-only growth can in some cases happen without needing
+to move other sections. The row sections are before the heap because they have simple capacity
+calculation.
 
 Initial heap capacity:
 
@@ -686,199 +740,220 @@ Initial heap capacity:
 max(64 KiB, min(64 MiB, MaxCount * 128 bytes))
 ```
 
-Detta är bara startkapacitet. Filen får växa.
+This is only starting capacity. The file may grow.
 
-Alla sektioners offset ska alignas till 64 bytes. Det är inte ett korrekthetskrav för memory-mapped file, men det är billigt och hjälper SIMD/cache-linjer. `Length` behöver inte vara alignment-paddad; nästa `Offset` görs aligned.
+All section offsets must be aligned to 64 bytes. It is not a correctness requirement for the
+memory-mapped file, but it is cheap and helps SIMD/cache lines. `Length` does not need to be
+alignment-padded; the next `Offset` is made aligned.
 
-`FileLength` ska vara sista sektionens `Offset + Length`, eventuellt alignad till 4096 bytes för OS page friendliness.
+`FileLength` must be the last section's `Offset + Length`, optionally aligned to 4096 bytes for OS
+page friendliness.
 
 ---
 
 ## Growable file
 
-### När växer filen?
+### When does the file grow?
 
-Filen växer när:
+The file grows when:
 
-- `CurrentCount == MaxCount` och en ny rad behövs,
-- metadata heap saknar plats,
-- framtida optional section behöver mer plats.
+- `CurrentCount == MaxCount` and a new row is needed,
+- metadata heap lacks space,
+- a future optional section needs more space.
 
-För radkapacitet:
+For row capacity:
 
 ```text
 newMaxCount = max(MaxCount + 1, ceil(MaxCount * 1.5))
 ```
 
-För metadata heap:
+For metadata heap:
 
 ```text
 newMetadataHeapCapacity = max(requiredEnd, ceil(oldCapacity * 1.5), oldCapacity + 64 KiB)
 ```
 
-### Flytta sektioner eller reservera slack?
+### Move sections or reserve slack?
 
-v4 ska flytta sektioner vid grow, inte reservera enorma fasta slack-zoner.
+v4 must move sections on grow, not reserve enormous fixed slack zones.
 
-Motivering:
+Rationale:
 
-- Qvec ska vara "SQLite of vector databases"; en liten databas ska förbli liten.
-- Sparse files minskar fysisk allokering men inte alla miljöer stöder sparse lika bra.
-- En stor förreserverad adresslayout gör section table svårare att resonera om och kan ge mycket stor logisk fillängd.
-- Grow är en write-lockad, relativt sällsynt operation. Kostnaden är acceptabel och testbar.
+- Qvec must be the "SQLite of vector databases"; a small database should remain small.
+- Sparse files reduce physical allocation, but not all environments support sparse equally well.
+- A large pre-reserved address layout makes the section table harder to reason about and can produce
+  a very large logical file length.
+- Grow is a write-locked, relatively rare operation. The cost is acceptable and testable.
 
-Sektioner med `MayMoveOnGrow` får nya offsets vid grow. Alla v4-kända data-sektioner ska ha flaggan satt. Reader får aldrig cache:a section offsets utanför objektets nuvarande layout-generation.
+Sections with `MayMoveOnGrow` get new offsets on grow. All v4-known data sections must have the flag
+set. A reader must never cache section offsets outside the object's current layout generation.
 
-### Grow-algoritm
+### Grow algorithm
 
 Under write lock:
 
-1. Skriv dirty header (`WriteInProgress = 1`, `Generation + 1`) och flush.
-2. Släpp `_dataBasePtr` om den är acquired.
-3. Flush och dispose:a alla view accessors.
-4. Dispose:a nuvarande `MemoryMappedFile`.
-5. Öppna filen med `FileStream` för read/write.
-6. Beräkna ny section table.
+1. Write dirty header (`WriteInProgress = 1`, `Generation + 1`) and flush.
+2. Release `_dataBasePtr` if it is acquired.
+3. Flush and dispose all view accessors.
+4. Dispose the current `MemoryMappedFile`.
+5. Open the file with `FileStream` for read/write.
+6. Compute new section table.
 7. `SetLength(newFileLength)`.
-8. Flytta sektioner som fått nytt offset.
-   - Flytta bakifrån och fram när destinationen ligger efter source för att undvika överlappskorruption.
-   - Använd buffert från `ArrayPool<byte>`, till exempel 1-8 MiB.
-   - Metadata heap flyttas som bytes `0..MetadataHeapUsed`, men section `Length` blir ny kapacitet.
-   - Radsektioner kopieras upp till gamla `MaxCount * ElementSize`; ny kapacitetsdel initieras:
-     - graph neighbors till `-1`,
-     - tombstones till `0`,
-     - free-list entries till `-1`,
-     - descriptors till zero,
-     - guids till zero.
+8. Move sections that received a new offset.
+   - Move from back to front when the destination is after the source to avoid overlap corruption.
+   - Use a buffer from `ArrayPool<byte>`, for example 1-8 MiB.
+   - Metadata heap is moved as bytes `0..MetadataHeapUsed`, but section `Length` becomes new
+     capacity.
+   - Row sections are copied up to old `MaxCount * ElementSize`; the new capacity part is
+     initialized:
+     - graph neighbors to `-1`,
+     - tombstones to `0`,
+     - free-list entries to `-1`,
+     - descriptors to zero,
+     - guids to zero.
 9. Flush stream.
-10. Skapa ny `MemoryMappedFile` med ny capacity.
-11. Skapa nya accessors.
-12. Uppdatera in-memory offsets från section table.
-13. Skriv clean header med ny `MaxCount`, section table, `FileLength`, `Generation`, `WriteInProgress = 0`, CRC.
+10. Create a new `MemoryMappedFile` with new capacity.
+11. Create new accessors.
+12. Update in-memory offsets from section table.
+13. Write clean header with new `MaxCount`, section table, `FileLength`, `Generation`,
+    `WriteInProgress = 0`, CRC.
 14. Flush header.
 
-### Pointer-invalidering
+### Pointer invalidation
 
-Nuvarande implementation cache:ar `_dataBasePtr` för objektets livstid. Det är inte säkert i en growable design.
+The current implementation caches `_dataBasePtr` for the object's lifetime. That is not safe in a
+growable design.
 
-Regel:
+Rule:
 
-- `_dataBasePtr` är bara giltig för aktuell mapping-generation.
-- Innan grow/remap måste implementationen:
-  - ta write lock,
-  - säkerställa att inga readers är aktiva,
-  - anropa `ReleasePointer()` om `_dataBasePtr != null`,
-  - sätta `_dataBasePtr = null`,
-  - dispose:a gamla accessors.
-- Efter remap reacquiras pointer lazy nästa gång `DataBasePointer` används.
+- `_dataBasePtr` is only valid for the current mapping generation.
+- Before grow/remap, the implementation must:
+  - take write lock,
+  - ensure that no readers are active,
+  - call `ReleasePointer()` if `_dataBasePtr != null`,
+  - set `_dataBasePtr = null`,
+  - dispose old accessors.
+- After remap, the pointer is reacquired lazily the next time `DataBasePointer` is used.
 
-Lägg till ett internt `int _mappingGeneration` om det hjälper debug asserts, men write lock räcker för korrekthet inom processen.
+Add an internal `int _mappingGeneration` if it helps debug asserts, but write lock is enough for
+correctness within the process.
 
-### Readers mitt under grow
+### Readers in the middle of grow
 
-Samma process:
+Same process:
 
-- `ReaderWriterLockSlim` blockerar nya readers medan grow håller write lock.
-- Aktiva readers slutför innan grow börjar.
-- Därför ser de antingen gamla mappingen eller nya mappingen, aldrig en halv remap.
+- `ReaderWriterLockSlim` blocks new readers while grow holds the write lock.
+- Active readers finish before grow begins.
+- Therefore they see either the old mapping or the new mapping, never a half remap.
 
-Andra processer:
+Other processes:
 
-- v4 ger ingen live-remap-garanti.
-- En reader som redan har mappat filen när en annan process växer den kan fortsätta se sin gamla mapping och gammal header.
-- Rekommenderad regel: multi-process readers ska stänga och öppna om filen om de ser att `Generation` ändrats, och libraryt ska dokumentera att concurrent writer + external reader inte är en stark v4-garanti.
-- En framtida version kan lägga till named mutex/file lock och snapshot readers.
+- v4 gives no live-remap guarantee.
+- A reader that has already mapped the file when another process grows it can continue to see its old
+  mapping and old header.
+- Recommended rule: multi-process readers should close and reopen the file if they see that
+  `Generation` changed, and the library should document that concurrent writer + external reader is
+  not a strong v4 guarantee.
+- A future version can add named mutex/file lock and snapshot readers.
 
 ---
 
 ## Sparse allocation
-
-Vid `Create` ska Qvec undvika att fysiskt skriva nollor över hela `FileLength`.
+On `Create`, Qvec must avoid physically writing zeros over the whole `FileLength`.
 
 Windows:
 
-- Öppna filen.
-- Anropa `DeviceIoControl` med `FSCTL_SET_SPARSE` på filhandtaget innan `SetLength(...)`.
-- Microsofts Win32-dokumentation säger att `FSCTL_SET_SPARSE` markerar filen sparse och att stora nollområden kan sakna fysisk allokering tills nonzero data skrivs.
-- Det finns ingen enkel hög-nivå .NET API i `FileStream` som säkert motsvarar `FSCTL_SET_SPARSE`; använd P/Invoke med `SafeFileHandle`.
-- Om P/Invoke misslyckas ska `Create` fortsätta utan sparse och sätta `SparseRequested = 1`, `SparseConfirmed = 0`.
+- Open the file.
+- Call `DeviceIoControl` with `FSCTL_SET_SPARSE` on the file handle before `SetLength(...)`.
+- Microsoft's Win32 documentation says that `FSCTL_SET_SPARSE` marks the file sparse and that large
+  zero areas can lack physical allocation until nonzero data is written.
+- There is no simple high-level .NET API in `FileStream` that safely corresponds to
+  `FSCTL_SET_SPARSE`; use P/Invoke with `SafeFileHandle`.
+- If P/Invoke fails, `Create` must continue without sparse and set `SparseRequested = 1`,
+  `SparseConfirmed = 0`.
 
 Linux/macOS:
 
-- `FileStream.SetLength(...)` på en ny fil skapar normalt en sparse fil på filsystem som stöder holes, eftersom nollområden inte skrivs fysiskt förrän data skrivs.
-- .NET exponerar inte ett portabelt "make sparse"-anrop.
-- Sätt `SparseConfirmed = 1` endast om implementationen kan verifiera det billigt och portabelt; annars lämna `0` och dokumentera att beteendet är filsystemsberoende.
+- `FileStream.SetLength(...)` on a new file normally creates a sparse file on file systems that
+  support holes, because zero areas are not written physically until data is written.
+- .NET does not expose a portable "make sparse" call.
+- Set `SparseConfirmed = 1` only if the implementation can verify it cheaply and portably;
+  otherwise leave `0` and document that the behavior is file-system-dependent.
 
-Viktigt: sparse påverkar fysisk allokering, inte den logiska `FileInfo.Length`. Tester ska därför kontrollera logisk layout och round-trip, inte kräva ett specifikt antal allokerade diskblock.
+Important: sparse affects physical allocation, not the logical `FileInfo.Length`. Tests should
+therefore check logical layout and round-trip, not require a specific number of allocated disk
+blocks.
 
 ---
 
-## Reserverat utrymme för kvantisering
+## Reserved space for quantization
 
-v4 reserverade formatkrokar utan att designa algoritmen. Mode `2` (`Int8ScalarPerVector`) är
-sedan implementerad utan versionsbump; se [design-quantization-int8.md](design-quantization-int8.md).
-Rescoring (`Int8Rescored` i API:t) är mode `2` plus en optional, icke-`Required` sektion 1
-(`Vectors`) i slot 8 med `HasOptionalSections` satt; se
+v4 reserved format hooks without designing the algorithm. Mode `2` (`Int8ScalarPerVector`) has since
+been implemented without a version bump; see [design-quantization-int8.md](design-quantization-int8.md).
+Rescoring (`Int8Rescored` in the API) is mode `2` plus an optional, non-`Required` section 1
+(`Vectors`) in slot 8 with `HasOptionalSections` set; see
 [design-quantization-rescoring.md](design-quantization-rescoring.md).
 
-Headerfält:
+Header fields:
 
 - `QuantizationMode`
   - `0 = None`
-  - `1 = Int8ScalarPerDataset` reserverad, avvisas
-  - `2 = Int8ScalarPerVector` implementerad
+  - `1 = Int8ScalarPerDataset` reserved, rejected
+  - `2 = Int8ScalarPerVector` implemented
 - `QuantizationSectionId`
-  - `0` när `QuantizationMode == None`
-  - `8` när `QuantizationMode == 2`
+  - `0` when `QuantizationMode == None`
+  - `8` when `QuantizationMode == 2`
 
 Section ids:
 
-- `8 = QuantizedVectors` — `ElementSize = dim`, en byte per dimension
-- `9 = QuantizationDatasetParameters` — reserverad, används inte
-- `10 = QuantizationVectorParameters` — `ElementSize = 16`, `scale`/`offset`/`sumOfCodes`/`squaredNorm` per rad
+- `8 = QuantizedVectors` — `ElementSize = dim`, one byte per dimension
+- `9 = QuantizationDatasetParameters` — reserved, unused
+- `10 = QuantizationVectorParameters` — `ElementSize = 16`, `scale`/`offset`/`sumOfCodes`/`squaredNorm` per row
 
-Regler:
+Rules:
 
-- Mode `0`: sektion `1` (`Vectors`) är required, `8` och `10` får inte vara required.
-- Mode `2`: sektion `8` och `10` är required, `1` saknas. Sektion `8` ligger i slot 0 och `10` i slot 7, övriga slots är oförändrade så grow-algoritmen behöver inte veta om mode.
-- Mode `1` eller okänt mode ger `QvecFormatException`:
+- Mode `0`: section `1` (`Vectors`) is required, `8` and `10` must not be required.
+- Mode `2`: sections `8` and `10` are required, `1` is absent. Section `8` is in slot 0 and `10` in
+  slot 7, the other slots are unchanged so the grow algorithm does not need to know about mode.
+- Mode `1` or unknown mode gives `QvecFormatException`:
 
 ```text
 '{path}' uses quantization mode {mode}, which this build reserves but does not implement.
 ```
 
-- Att öppna en fil med ett annat mode än det som begärs i konstruktorn ger `QvecFormatException` som nämner `quantization`.
+- Opening a file with a different mode than the one requested in the constructor gives
+  `QvecFormatException` that mentions `quantization`.
 
 ---
 
-## Ändrade operationer
+## Changed operations
 
 ### `ReadAndValidateHeader`
 
-Ny ordning:
+New order:
 
-1. Kontrollera att filen inte är tom.
-2. Läs minst 4096 bytes. Om filen är kortare än 4096:
-   - om magic/version kan läsas och version är 1..3, kasta äldre-format-meddelandet,
-   - annars kasta truncation/corrupt header.
-3. Läs `MagicNumber`.
-4. Läs `Version`.
-5. Kräv `Version == CurrentFormatVersion`.
-6. Kräv header-konstanter:
+1. Check that the file is not empty.
+2. Read at least 4096 bytes. If the file is shorter than 4096:
+   - if magic/version can be read and version is 1..3, throw the older-format message,
+   - otherwise throw truncation/corrupt header.
+3. Read `MagicNumber`.
+4. Read `Version`.
+5. Require `Version == CurrentFormatVersion`.
+6. Require header constants:
    - `HeaderSize == 4096`
    - `PrimaryHeaderSize == 512`
    - `SectionTableOffset == 512`
    - `SectionTableEntrySize == 32`
    - `SectionTableEntryCount == 64`
-7. Beräkna och jämför CRC.
-8. Kräv `WriteInProgress == 0`.
-9. Validera section table.
-10. Validera kända sektioner mot headerfält.
-11. Returnera en in-memory layoutmodell.
+7. Compute and compare CRC.
+8. Require `WriteInProgress == 0`.
+9. Validate section table.
+10. Validate known sections against header fields.
+11. Return an in-memory layout model.
 
 ### `ComputeLayout`
 
-`ComputeLayout(...)` ska tas bort för befintliga filer. Ersätt med:
+`ComputeLayout(...)` must be removed for existing files. Replace it with:
 
 ```csharp
 private sealed record QvecLayout(...);
@@ -886,118 +961,134 @@ private static QvecLayout ReadAndValidateLayout(string path);
 private static QvecLayout CreateInitialLayout(CreateOptions options);
 ```
 
-För ny fil kan `CreateInitialLayout` fortfarande räkna fram initiala offsets, men resultatet skrivs till section table och därefter är tabellen sanning.
+For a new file, `CreateInitialLayout` can still calculate initial offsets, but the result is written
+to the section table and the table is truth thereafter.
 
 ### `WriteVectorToDisk`
 
-Använd:
+Use:
 
 ```text
 offset = Vectors.Offset + index * Vectors.ElementSize
 ```
 
-Inte `HeaderSize` plus aritmetiskt framräknade sektioner.
+Not `HeaderSize` plus arithmetically calculated sections.
 
 ### `WriteMetadataToDisk`
 
-Skriv till heap + descriptor enligt ovan. Ta bort 512-byte-padding och truncation-regeln. `MaxMetadataBytes` är inte längre `512`.
+Write to heap + descriptor as above. Remove 512-byte padding and the truncation rule.
+`MaxMetadataBytes` is no longer `512`.
 
 ### `GetMetadata`
 
-Läs descriptor och exakt antal bytes från heap. `TrimEnd('\0')` ska bort; null bytes inuti metadata är vanliga bytes i UTF-8 payloaden och ska inte styra längden.
+Read the descriptor and exact number of bytes from the heap. `TrimEnd('\0')` must be removed; null
+bytes inside metadata are ordinary bytes in the UTF-8 payload and must not control the length.
 
 ### `ReadGuidFromDisk`
 
-Använd `Guids.Offset + index * 16`.
+Use `Guids.Offset + index * 16`.
 
 ### `WriteTombstone` / `ReadTombstone` / `LoadTombstones`
 
-Använd `Tombstones.Offset`.
+Use `Tombstones.Offset`.
 
-`LoadTombstones` ska även bygga `TombstoneSet`, ta bort tombstoned GUIDs från `_guidIndex` och validera free list.
+`LoadTombstones` must also build `TombstoneSet`, remove tombstoned GUIDs from `_guidIndex`, and
+validate the free list.
 
 ### `GetNeighborsAtLevel` / `WriteNeighborsAtLevel` / `InitNeighborsAtLevel`
 
-Använd `Graph.Offset`, `Graph.ElementSize`, `MaxNeighbors` och `MaxLayers`.
+Use `Graph.Offset`, `Graph.ElementSize`, `MaxNeighbors`, and `MaxLayers`.
 
 ### `AllocateSlot`
 
-Använd persistent free list först. Fallback till append. Om append når `MaxCount`, grow innan `QvecFullException` så länge `AllowGrow` är satt.
+Use persistent free list first. Fall back to append. If append reaches `MaxCount`, grow before
+`QvecFullException` as long as `AllowGrow` is set.
 
 ### `Open`
 
-`QvecDatabase.Open(path)` ska vara det rekommenderade sättet att öppna befintlig fil. Det ska aldrig behöva `dim`, `max`, `maxNeighbors` eller `maxLayers`.
+`QvecDatabase.Open(path)` must be the recommended way to open an existing file. It must never need
+`dim`, `max`, `maxNeighbors`, or `maxLayers`.
 
-Den publika konstruktorn kan fortsatt skapa ny fil med parametrar. För befintlig fil ska den läsa headern först och därefter:
+The public constructor can continue to create a new file with parameters. For an existing file, it
+must read the header first and then:
 
-- om parametrarna matchar: öppna,
-- om de inte matchar: kasta `QvecFormatException` med mismatch-meddelande,
-- aldrig räkna offsets från parametrarna.
+- if the parameters match: open,
+- if they do not match: throw `QvecFormatException` with a mismatch message,
+- never calculate offsets from parameters.
 
 ### `PartitionedQvecDatabase`
 
-Partitioner är fortfarande separata `.zvec`-filer.
+Partitions are still separate `.zvec` files.
 
-`PartitionedQvecDatabase.ReadHeader` måste uppdateras så att den inte läser gamla 52-byte `DbHeader`. Den ska antingen:
+`PartitionedQvecDatabase.ReadHeader` must be updated so that it does not read the old 52-byte
+`DbHeader`. It must either:
 
-- använda en intern v4 header reader från `QvecDatabase`, eller
-- öppna partitionen med `QvecDatabase.Open(...)` och läsa publika properties.
+- use an internal v4 header reader from `QvecDatabase`, or
+- open the partition with `QvecDatabase.Open(...)` and read public properties.
 
-Den ska validera:
+It must validate:
 
-- samma `VectorDimension`,
-- samma `DistanceFunction`,
-- gärna samma format version om en publik/internal property exponeras.
+- same `VectorDimension`,
+- same `DistanceFunction`,
+- preferably same format version if a public/internal property is exposed.
 
-Eftersom v4 tillåter grow inom en partition kan `PartitionSize` bli en policy för när partitioned wrapper skapar ny partition, inte en hård filkapacitet. Rekommendation: behåll befintligt rollover-beteende i första implementationen för minsta API-överraskning, men låt en enskild `QvecDatabase` växa när den används direkt.
-
+Because v4 allows grow within a partition, `PartitionSize` can become a policy for when the
+partitioned wrapper creates a new partition, not a hard file capacity. Recommendation: keep existing
+rollover behavior in the first implementation for least API surprise, but allow an individual
+`QvecDatabase` to grow when it is used directly.
 ---
 
-## Migration och rollout
+## Migration and rollout
 
-Det här bryter för användare:
+This breaks for users:
 
-- Befintliga v2/v3 `.zvec`-filer öppnas inte av v4.
-- `MaxMetadataBytes == 512` gäller inte längre.
-- Råverktyg eller tester som antar gamla offsetar (`HeaderSize = 1024`, metadata direkt efter graph, osv.) måste uppdateras.
-- Filstorlek vid create kan ändras kraftigt:
-  - logisk längd kan vara större på grund av grow/slack,
-  - fysisk allokering kan vara mindre med sparse files.
-- `QvecDatabase` är inte längre en strikt fixed-capacity databas när `AllowGrow` är på.
+- Existing v2/v3 `.zvec` files are not opened by v4.
+- `MaxMetadataBytes == 512` no longer applies.
+- Raw tools or tests that assume old offsets (`HeaderSize = 1024`, metadata directly after graph,
+  etc.) must be updated.
+- File size on create can change substantially:
+  - logical length can be larger because of grow/slack,
+  - physical allocation can be smaller with sparse files.
+- `QvecDatabase` is no longer a strictly fixed-capacity database when `AllowGrow` is on.
 
-README måste säga:
+README must say:
 
-- Qvec 2.x använder ett nytt on-disk format (version 5).
-- v2/v3-filer migreras inte automatiskt.
-- För att uppgradera: exportera vektorer + metadata + Guid med äldre Qvec-version och importera i en ny fil.
-- Ta backup före uppgradering.
-- Metadata är variabel längd och lagras i append-only heap; kör `Vacuum()` för att reclaim:a metadata-garbage efter många updates.
-- Sparse files används opportunistiskt; rapporterad filstorlek är logisk storlek och kan vara större än fysisk diskförbrukning.
+- Qvec 2.x uses a new on-disk format (version 5).
+- v2/v3 files are not migrated automatically.
+- To upgrade: export vectors + metadata + Guid with an older Qvec version and import into a new
+  file.
+- Back up before upgrading.
+- Metadata is variable length and stored in an append-only heap; run `Vacuum()` to reclaim metadata
+  garbage after many updates.
+- Sparse files are used opportunistically; reported file size is logical size and can be larger than
+  physical disk consumption.
 
-CHANGELOG måste ha en breaking-change-post:
+CHANGELOG must have a breaking-change entry:
 
 ```text
 BREAKING: Qvec on-disk format is now version 5. Qvec 2.x does not open or migrate v2/v3 `.zvec` files. Export with an older Qvec version and re-import into a new database.
 ```
 
-Felmeddelanden ska peka användaren mot export/import, inte mot att ändra konstruktorargument.
+Error messages must point the user toward export/import, not toward changing constructor arguments.
 
 ---
 
-## Testplan och implementeringsordning
+## Test plan and implementation order
 
-Repo hade 114 gröna tester när remediation-planen godkändes. Hård regel: build ska vara 0 warnings. Implementera i små steg och kör minsta relevanta testfil efter varje steg; kör hela sviten när formatet är färdigt.
+The repo had 114 green tests when the remediation plan was approved. Hard rule: build must have 0
+warnings. Implement in small steps and run the smallest relevant test file after each step; run the
+whole suite when the format is complete.
 
-### Steg 1: Introducera v4 header reader/writer utan att ändra publikt API
+### Step 1: Introduce v4 header reader/writer without changing public API
 
-Kod:
+Code:
 
-- Lägg till offset-konstanter för primary header.
-- Lägg till `SectionEntry`/`QvecLayout`.
-- Lägg till CRC-beräkning.
-- Lägg till create/read round-trip för headerbild i minne.
+- Add offset constants for primary header.
+- Add `SectionEntry`/`QvecLayout`.
+- Add CRC calculation.
+- Add create/read round-trip for header image in memory.
 
-Tester i `tests\Qvec.Core.Tests\PersistenceTests.cs`:
+Tests in `tests\Qvec.Core.Tests\PersistenceTests.cs`:
 
 - `V4HeaderLayoutConstants_DocumentPersistedOffsets`
 - `V4SectionEntryLayoutConstants_DocumentPersistedOffsets`
@@ -1007,83 +1098,85 @@ Tester i `tests\Qvec.Core.Tests\PersistenceTests.cs`:
 - `Open_WithHeaderCrcMismatch_ThrowsFormatException`
 - `IsHealthy_WithCrcMismatch_ReturnsFalse`
 
-### Steg 2: Byt sektionoffsets till section table
+### Step 2: Switch section offsets to section table
 
-Kod:
+Code:
 
-- Ta bort `ComputeLayout` från open-path.
-- Alla läs/skrivmetoder använder `QvecLayout`.
-- Behåll v3-testsemantik på API-nivå, men uppdatera råoffset-tester.
+- Remove `ComputeLayout` from open-path.
+- All read/write methods use `QvecLayout`.
+- Keep v3 test semantics at API level, but update raw-offset tests.
 
-Tester i `PersistenceTests.cs`:
+Tests in `PersistenceTests.cs`:
 
-- `Entries_RoundTripWithIdenticalConstructorArguments` ska fortsätta gälla.
-- `Reopen_WithMismatchedMax_EitherHonorsHeaderOrThrowsFormatException` ska bli strikt: konstruktorn kastar mismatch, `Open` roundtrippar.
+- `Entries_RoundTripWithIdenticalConstructorArguments` must continue to apply.
+- `Reopen_WithMismatchedMax_EitherHonorsHeaderOrThrowsFormatException` must become strict: the
+  constructor throws mismatch, `Open` round-trips.
 - `Open_WithOverlappingSections_ThrowsFormatException`
 - `Open_WithSectionPastEndOfFile_ThrowsFormatException`
 - `Open_WithUnknownOptionalSection_IgnoresButValidatesBounds`
 - `Open_WithUnknownRequiredSection_ThrowsFormatException`
 
-### Steg 3: Implementera dirty/clean header commit
+### Step 3: Implement dirty/clean header commit
 
-Kod:
+Code:
 
-- Alla mutationer går genom commit helper.
-- `Dispose()` flushar data före clean header.
-- `IsHealthy()` kör verklig validering.
+- All mutations go through commit helper.
+- `Dispose()` flushes data before clean header.
+- `IsHealthy()` runs real validation.
 
-Tester i `PersistenceTests.cs`:
+Tests in `PersistenceTests.cs`:
 
 - `Open_WithWriteInProgress_ThrowsFormatException`
 - `IsHealthy_WithWriteInProgress_ReturnsFalse`
-- `Dispose_PersistsDataVisibleToImmediateReopen` ska fortsätta gälla.
-- `AddEntry_WritesDataBeforeCleanHeader` kan testas via en intern/fake stream om möjligt; annars täck med dirty-header patch-test.
+- `Dispose_PersistsDataVisibleToImmediateReopen` must continue to apply.
+- `AddEntry_WritesDataBeforeCleanHeader` can be tested through an internal/fake stream if possible;
+  otherwise cover with dirty-header patch test.
 
-### Steg 4: Metadata heap
+### Step 4: Metadata heap
 
-Kod:
+Code:
 
-- Ersätt `MetadataSize = 512` för lagring med descriptors + heap.
-- Ta bort truncation/padding.
-- Uppdatera `MaxMetadataBytes`.
-- Metadata update append:ar och lämnar garbage.
+- Replace `MetadataSize = 512` for storage with descriptors + heap.
+- Remove truncation/padding.
+- Update `MaxMetadataBytes`.
+- Metadata update appends and leaves garbage.
 
-Tester i `ReproTests.cs` och `PersistenceTests.cs`:
+Tests in `ReproTests.cs` and `PersistenceTests.cs`:
 
-- `Metadata_AboveSlotBoundary_RoundTrips` ska nu kräva round-trip, inte "roundtrip or throws".
+- `Metadata_AboveSlotBoundary_RoundTrips` must now require round-trip, not "roundtrip or throws".
 - `Metadata_TruncatedInsideMultiByteCharacter_RoundTrips`
 - `UpdateMetadata_WithLongerPayload_RoundTripsAfterReopen`
 - `MetadataHeap_DescriptorPointsWithinHeap`
 - `Open_WithMetadataDescriptorPastHeapUsed_ThrowsFormatException`
 - `MetadataHeap_WhenFullAndGrowthDisabled_ThrowsClearQvecException`
 
-### Steg 5: Persistent free list
+### Step 5: Persistent free list
 
-Kod:
+Code:
 
-- Lägg till `FreeList` section.
-- Delete pushar slot.
-- Allocate poppar slot.
-- Startup scannar tombstones och validerar free list.
+- Add `FreeList` section.
+- Delete pushes slot.
+- Allocate pops slot.
+- Startup scans tombstones and validates free list.
 
-Tester i `PersistenceTests.cs`:
+Tests in `PersistenceTests.cs`:
 
-- `DeletedEntries_StayDeletedAfterReopen` ska fortsätta gälla.
+- `DeletedEntries_StayDeletedAfterReopen` must continue to apply.
 - `DeleteThenReopenThenAdd_ReusesFreedSlot`
 - `Open_WithFreeListCycle_ThrowsFormatException`
 - `Open_WithFreeListEntryNotTombstoned_ThrowsFormatException`
 - `Open_WithDeletedCountMismatch_ThrowsFormatException`
 
-### Steg 6: Grow/remap
+### Step 6: Grow/remap
 
-Kod:
+Code:
 
-- Introducera remap helper.
-- Släpp cached pointer före remap.
-- Reacquire lazy efter remap.
-- Flytta sektioner och uppdatera table.
+- Introduce remap helper.
+- Release cached pointer before remap.
+- Reacquire lazily after remap.
+- Move sections and update table.
 
-Tester i `PersistenceTests.cs`:
+Tests in `PersistenceTests.cs`:
 
 - `AddEntry_WhenCurrentCountReachesMax_GrowsAndRoundTrips`
 - `MetadataHeap_WhenFull_GrowsAndRoundTrips`
@@ -1091,83 +1184,86 @@ Tester i `PersistenceTests.cs`:
 - `Grow_PreservesGuidIndexTombstonesAndGraph`
 - `Open_AfterGrow_UsesSectionTableNotConstructorArguments`
 
-### Steg 7: Sparse create
+### Step 7: Sparse create
 
-Kod:
+Code:
 
-- Lägg till plattformsabstraktion för sparse-markering.
-- Windows P/Invoke isoleras bakom liten intern helper.
-- Misslyckande är non-fatal.
+- Add platform abstraction for sparse marking.
+- Windows P/Invoke is isolated behind a small internal helper.
+- Failure is non-fatal.
 
-Tester:
+Tests:
 
-- `Create_DoesNotWriteZeroesAcrossEntireFile` är svår att testa portabelt; undvik att kräva fysisk diskallokering.
-- Lägg istället `Create_WithSparseUnavailable_StillCreatesHealthyDatabase` med injicerad/fake sparse helper om implementationen gör helpern testbar.
+- `Create_DoesNotWriteZeroesAcrossEntireFile` is difficult to test portably; avoid requiring
+  physical disk allocation.
+- Instead add `Create_WithSparseUnavailable_StillCreatesHealthyDatabase` with an injected/fake sparse
+  helper if the implementation makes the helper testable.
 - `Create_HeaderFlagsReflectSparseAttempt`.
 
-### Steg 8: Partitioned wrapper och docs
+### Step 8: Partitioned wrapper and docs
 
-Kod:
+Code:
 
-- Uppdatera `PartitionedQvecDatabase.ReadHeader`.
-- Uppdatera README/CHANGELOG.
+- Update `PartitionedQvecDatabase.ReadHeader`.
+- Update README/CHANGELOG.
 
-Tester:
+Tests:
 
-- `PartitionedDatabase_RollsOverWhenCurrentPartitionIsFull` ska fortsätta gälla.
-- Lägg `PartitionedDatabase_OpenExistingV4Partitions_UsesHeaderValues`.
-- Lägg `PartitionedDatabase_WithOldPartition_ThrowsClearFormatException`.
+- `PartitionedDatabase_RollsOverWhenCurrentPartitionIsFull` must continue to apply.
+- Add `PartitionedDatabase_OpenExistingV4Partitions_UsesHeaderValues`.
+- Add `PartitionedDatabase_WithOldPartition_ThrowsClearFormatException`.
 
-### Steg 9: Full verifiering
+### Step 9: Full verification
 
-Kör:
+Run:
 
 ```powershell
 dotnet test --no-restore
 ```
 
-Om restore krävs:
+If restore is required:
 
 ```powershell
 dotnet test
 ```
 
-Slutmål:
+Final goals:
 
-- alla tester gröna,
+- all tests green,
 - 0 warnings,
-- inga v2/v3 migrationsvägar kvar i v4 open-path,
-- inga råa `HeaderSize = 1024` antaganden i core/tests.
+- no v2/v3 migration paths left in v4 open-path,
+- no raw `HeaderSize = 1024` assumptions in core/tests.
 
 ---
 
-## Korrekthetsgarantier som ska bevaras
+## Correctness guarantees to preserve
 
-Från nuvarande `PersistenceTests.cs` och `ReproTests.cs` ska dessa kontrakt fortsätta gälla på API-nivå:
+From current `PersistenceTests.cs` and `ReproTests.cs`, these contracts must continue to apply at API
+level:
 
-- Entries roundtrippar efter dispose/reopen.
-- `QvecDatabase.Open(path)` adopterar headerns dimension/kapacitet i stället för caller guesses.
-- Den publika konstruktorn får inte öppna med motstridiga argument utan tydligt formatfel.
-- Invalid magic, future version, zero-length file och truncated body avvisas.
-- Empty database kan öppnas och användas efter reopen.
-- Deleted entries förblir deleted efter reopen.
-- Search och SearchSimple returnerar inte tombstoned entries.
-- Cosine normalisering muterar inte caller-arrayer.
-- Metadata över gamla 512-byte-gränsen ska i v4 roundtrippa.
-- Uppdaterad vektor ska bevara Guid och inverted-index membership.
-- Repeated update ska inte exhausta kapacitet när tombstoned slot kan återanvändas.
+- Entries round-trip after dispose/reopen.
+- `QvecDatabase.Open(path)` adopts the header's dimension/capacity instead of caller guesses.
+- The public constructor must not open with contradictory arguments without a clear format error.
+- Invalid magic, future version, zero-length file, and truncated body are rejected.
+- Empty database can be opened and used after reopen.
+- Deleted entries remain deleted after reopen.
+- Search and SearchSimple do not return tombstoned entries.
+- Cosine normalization does not mutate caller arrays.
+- Metadata beyond the old 512-byte boundary must round-trip in v4.
+- Updated vector must preserve Guid and inverted-index membership.
+- Repeated update must not exhaust capacity when a tombstoned slot can be reused.
 
-Råfilstester som förväntar v3-layout måste skrivas om, inte behållas.
+Raw-file tests that expect v3 layout must be rewritten, not kept.
 
 ---
 
-## Öppna frågor / risker
+## Open questions / risks
 
-- **`System.IO.Hashing` i net10.0:** Microsoft Learn visar `System.IO.Hashing.Crc32` i assembly/package `System.IO.Hashing`. Implementeraren måste verifiera om Qvec.Core kan använda den direkt i aktuell SDK eller behöver `PackageReference`.
-- **Flush-garantier:** `MemoryMappedViewAccessor.Flush()` och `FileStream.Flush(true)` ger bästa praktiska .NET/OS-garanti, men absolut power-loss-semantik varierar med OS, disk och cache. Dokumentera detta ärligt.
-- **Sparse-verifiering:** Windows kräver `FSCTL_SET_SPARSE` via `DeviceIoControl`; .NET har ingen enkel portabel sparse API. Linux/macOS sparse-beteende beror på filsystem. Tester ska inte anta fysisk allokering.
-- **Multi-process readers under grow:** Denna design garanterar säkerhet inom en process via write lock. Externa readers behöver reopen/snapshot-policy i framtiden.
-- **Section move-kostnad:** Att flytta stora vector/graph sections vid grow kan bli dyrt. Alternativet enorm slack valdes bort, men implementeraren bör mäta och eventuellt justera growth factor.
-- **Free-list recovery:** Designen avvisar inkonsistent clean free list i stället för att tyst reparera. Det är säkrare, men kan vara striktare än användare förväntar sig.
-- **Vacuum atomics:** Atomiskt filbyte är plattformsberoende, särskilt på Windows om filen är öppen/mappad. `Vacuum()` behöver egen detaljerad implementation/testning.
-- **Guid byteordning:** v4 behåller `Guid.ToByteArray()`-semantik för .NET-kompatibilitet, inte RFC 4122 network byte order. Det bör dokumenteras om formatet ska läsas av andra språk.
+- **`System.IO.Hashing` in net10.0:** Microsoft Learn shows `System.IO.Hashing.Crc32` in assembly/package `System.IO.Hashing`. The implementer must verify whether Qvec.Core can use it directly in the current SDK or needs `PackageReference`.
+- **Flush guarantees:** `MemoryMappedViewAccessor.Flush()` and `FileStream.Flush(true)` give the best practical .NET/OS guarantee, but absolute power-loss semantics vary with OS, disk, and cache. Document this honestly.
+- **Sparse verification:** Windows requires `FSCTL_SET_SPARSE` via `DeviceIoControl`; .NET has no simple portable sparse API. Linux/macOS sparse behavior depends on file system. Tests must not assume physical allocation.
+- **Multi-process readers during grow:** This design guarantees safety within one process through write lock. External readers need reopen/snapshot policy in the future.
+- **Section move cost:** Moving large vector/graph sections on grow can become expensive. The enormous-slack alternative was rejected, but the implementer should measure and possibly adjust growth factor.
+- **Free-list recovery:** The design rejects an inconsistent clean free list instead of silently repairing it. That is safer, but may be stricter than users expect.
+- **Vacuum atomics:** Atomic file replacement is platform-dependent, especially on Windows if the file is open/mapped. `Vacuum()` needs its own detailed implementation/testing.
+- **Guid byte order:** v4 keeps `Guid.ToByteArray()` semantics for .NET compatibility, not RFC 4122 network byte order. This should be documented if the format is to be read by other languages.

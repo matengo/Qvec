@@ -1,8 +1,8 @@
-namespace Qvec.Core
+﻿namespace Qvec.Core
 {
     /// <summary>
-    /// Markerar en property som ska ingå i det inverterade indexet.
-    /// Används av Qvec.SourceGen för att generera en IQvecFieldExtractor.
+    /// Marks a property that should be included in the inverted index.
+    /// Used by Qvec.SourceGen to generate an IQvecFieldExtractor.
     /// </summary>
     /// <remarks>
     /// Parameter is allowed so that the attribute can be placed directly on a positional

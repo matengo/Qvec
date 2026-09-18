@@ -1,26 +1,26 @@
-namespace Qvec.Core
+﻿namespace Qvec.Core
 {
     /// <summary>
-    /// Extraherar indexerade fältvärden från en instans av T.
-    /// Implementeras av source-genererad kod.
+    /// Extracts indexed field values from an instance of T.
+    /// Implemented by source-generated code.
     /// </summary>
     public interface IQvecFieldExtractor<in T>
     {
         /// <summary>
-        /// Returnerar namnen på alla fält som <see cref="ExtractFields(T)"/> kan returnera.
+        /// Returns the names of all fields that <see cref="ExtractFields(T)"/> can return.
         /// </summary>
         /// <remarks>
-        /// QvecClient konsumerar extraktorer via den här instansen, så en static abstract-medlem
-        /// skulle inte gå att anropa utan att även bära den konkreta genererade typen. ReadOnlySpan
-        /// låter genererade extraktorer exponera en statiskt cachelagrad array utan per-anrop-
-        /// allokeringar och utan att reflektera över T, vilket passar Native AOT. Nedärvda
-        /// attribut kopieras inte in i en härledd typs extraktor; använd basextraktorn via
-        /// kontravarians om basfält ska indexeras för härledda instanser.
+        /// QvecClient consumes extractors through this instance, so a static abstract member
+        /// could not be called without also carrying the concrete generated type. ReadOnlySpan
+        /// lets generated extractors expose a statically cached array without per-call
+        /// allocations and without reflecting over T, which suits Native AOT. Inherited
+        /// attributes are not copied into a derived type's extractor; use the base extractor via
+        /// contravariance if base fields should be indexed for derived instances.
         /// </remarks>
         System.ReadOnlySpan<string> IndexedFields => System.ReadOnlySpan<string>.Empty;
 
         /// <summary>
-        /// Returnerar (fältnamn, värde)-par för alla [QvecIndexed]-properties.
+        /// Returns (field name, value) pairs for all [QvecIndexed] properties.
         /// </summary>
         IEnumerable<(string Field, string Value)> ExtractFields(T item);
     }

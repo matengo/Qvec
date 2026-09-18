@@ -6,14 +6,14 @@ using System.CommandLine;
 // a different `max` or `dim` silently misreads it. Previously `init` used max:10000
 // while `search` fell back to the default max:1000, which corrupted every lookup.
 // Exposing them as explicit shared options makes the mismatch visible.
-var pathOption = new Option<string>("--path") { Description = "Sökväg till databasfilen", Required = true };
-var dimOption = new Option<int>("--dim") { Description = "Vektordimension", DefaultValueFactory = _ => 1536 };
-var maxOption = new Option<int>("--max") { Description = "Maximalt antal vektorer", DefaultValueFactory = _ => 10000 };
+var pathOption = new Option<string>("--path") { Description = "Path to the database file", Required = true };
+var dimOption = new Option<int>("--dim") { Description = "Vector dimension", DefaultValueFactory = _ => 1536 };
+var maxOption = new Option<int>("--max") { Description = "Maximum number of vectors", DefaultValueFactory = _ => 10000 };
 
-var rootCommand = new RootCommand("Qvec CLI - Högpresterande Vektordatabas");
+var rootCommand = new RootCommand("Qvec CLI - High-performance vector database");
 
-// Kommando: Initiera ny DB
-var initCommand = new Command("init", "Skapa en ny databasfil");
+// Command: Initialize new DB
+var initCommand = new Command("init", "Create a new database file");
 initCommand.Options.Add(pathOption);
 initCommand.Options.Add(dimOption);
 initCommand.Options.Add(maxOption);
@@ -26,22 +26,22 @@ initCommand.SetAction(parseResult =>
     try
     {
         using var db = new QvecDatabase(path, dim, max);
-        Console.WriteLine($"Databas skapad: {path} (dim={dim}, max={max})");
-        Console.WriteLine($"Använd samma --dim {dim} --max {max} för efterföljande kommandon.");
+        Console.WriteLine($"Database created: {path} (dim={dim}, max={max})");
+        Console.WriteLine($"Use the same --dim {dim} --max {max} for subsequent commands.");
         return 0;
     }
     catch (Exception ex)
     {
-        Console.Error.WriteLine($"Kunde inte skapa databasen: {ex.Message}");
+        Console.Error.WriteLine($"Could not create the database: {ex.Message}");
         return 1;
     }
 });
 
-// Kommando: Sök
-var queryOption = new Option<string>("--vector") { Description = "Frågevektor (kommaseparerad)", Required = true };
-var topKOption = new Option<int>("--top-k") { Description = "Antal träffar att returnera", DefaultValueFactory = _ => 3 };
+// Command: Search
+var queryOption = new Option<string>("--vector") { Description = "Query vector (comma-separated)", Required = true };
+var topKOption = new Option<int>("--top-k") { Description = "Number of matches to return", DefaultValueFactory = _ => 3 };
 
-var searchCommand = new Command("search", "Sök i databasen");
+var searchCommand = new Command("search", "Search the database");
 searchCommand.Options.Add(pathOption);
 searchCommand.Options.Add(dimOption);
 searchCommand.Options.Add(maxOption);
@@ -57,13 +57,13 @@ searchCommand.SetAction(parseResult =>
 
     if (!File.Exists(path))
     {
-        Console.Error.WriteLine($"Databasfilen finns inte: {path}");
+        Console.Error.WriteLine($"Database file does not exist: {path}");
         return 1;
     }
 
     if (topK <= 0)
     {
-        Console.Error.WriteLine("--top-k måste vara större än 0.");
+        Console.Error.WriteLine("--top-k must be greater than 0.");
         return 1;
     }
 
@@ -77,13 +77,13 @@ searchCommand.SetAction(parseResult =>
     }
     catch (FormatException ex)
     {
-        Console.Error.WriteLine($"Ogiltig vektor: {ex.Message}");
+        Console.Error.WriteLine($"Invalid vector: {ex.Message}");
         return 1;
     }
 
     if (query.Length == 0)
     {
-        Console.Error.WriteLine("--vector innehöll inga tal.");
+        Console.Error.WriteLine("--vector contained no numbers.");
         return 1;
     }
 
@@ -94,7 +94,7 @@ searchCommand.SetAction(parseResult =>
 
         if (results.Count == 0)
         {
-            Console.WriteLine("Inga träffar.");
+            Console.WriteLine("No matches.");
             return 0;
         }
 
@@ -106,12 +106,12 @@ searchCommand.SetAction(parseResult =>
     catch (QvecDimensionException ex)
     {
         Console.Error.WriteLine(
-            $"Vektorn har {ex.Actual} dimensioner men databasen förväntar sig {ex.Expected}.");
+            $"The vector has {ex.Actual} dimensions but the database expects {ex.Expected}.");
         return 1;
     }
     catch (QvecException ex)
     {
-        Console.Error.WriteLine($"Databasfel: {ex.Message}");
+        Console.Error.WriteLine($"Database error: {ex.Message}");
         return 1;
     }
 });
