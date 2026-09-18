@@ -45,10 +45,13 @@ public class InsertThroughputTests(ITestOutputHelper output)
         // Before the insert-path work this configuration ran at roughly 450 inserts/s on a
         // 12-core developer machine; after it, 1,300-1,450/s on the same machine, with the
         // remaining time spent in the O(M0²) distance arithmetic of the neighbour heuristic
-        // rather than in overhead. The floor is set so that regressing back to the old path
-        // is a clear failure while a CI runner at roughly half developer speed still passes.
-        Assert.True(perSecond >= 800,
-            $"Insert throughput was {perSecond:F0}/s, below the 800/s floor. " +
+        // rather than in overhead. GitHub-hosted ubuntu runners have been measured as low as
+        // 711/s and 786/s for the same code under load (an 800/s floor produced false
+        // failures on two master pushes in September 2026). The floor is set so that
+        // regressing back to the old path -- roughly 225/s on such a runner -- is a clear
+        // failure while a slow, busy runner still passes.
+        Assert.True(perSecond >= 500,
+            $"Insert throughput was {perSecond:F0}/s, below the 500/s floor. " +
             "Profile AddEntry before adjusting this number.");
     }
 }
