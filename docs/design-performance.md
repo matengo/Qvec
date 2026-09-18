@@ -62,6 +62,23 @@ dot product is 1.5× off the reference (18.4 vs 11.9 ns); the array overloads ar
 slower everywhere but are not on any hot path. Kernel work is therefore a small, dimension-
 dependent win, not the "several ×" the first draft of this document expected.
 
+**After PR `perf-kernels` (2026-09-18, same machine and job):**
+
+| dim | Dot Pointer | Dot Span | Dot Array | Dot TensorPrimitives | L2 Pointer | L2 Span | L2 Array | L2 TensorPrimitives |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 128 | 6.9 ns | 6.7 ns | 8.4 ns | 12.0 ns | 7.3 ns | 7.9 ns | 8.5 ns | 14.5 ns |
+| 768 | 52.4 ns | 52.8 ns | 53.6 ns | 130.5 ns | 49.6 ns | 55.1 ns | 49.9 ns | 108.1 ns |
+| 1536 | 111.0 ns | 98.8 ns | 98.5 ns | 270.1 ns | 104.7 ns | 104.6 ns | 111.6 ns | 252.1 ns |
+
+Reading: the paragraph above was wrong about the cause. "Within 5 % of `TensorPrimitives`"
+did not mean load-bound; it meant both were limited by the same thing — a single accumulator
+chain, where every FMA waits ~4 cycles for the previous one. Four independent accumulators
+make the pointer kernels **2.4–2.7× faster at every dimension** (128-d dot 18.4 → 6.9 ns,
+768-d dot 135.6 → 52.4 ns, 1536-d L2 283.2 → 104.7 ns) and now 1.7–2.6× faster than
+`TensorPrimitives` on this ARM64 machine. The three overloads are within noise of each other
+because they are one function. Open question 2 (a `System.Numerics.Tensors` dependency) is
+closed: not needed.
+
 **One `Search(topK 10, efSearch 100)` on a 10,000-node clustered Euclidean index:**
 
 | dim | mode | mean | Gen0 / 1k ops | Gen1 / 1k ops | allocated per query |
@@ -325,29 +342,34 @@ and the ratio between them (owed).
 **Done when** allocations per query are O(result size) ✔, the micro-benchmark shows it ✔, and
 the 12-thread/1-thread ratio has been re-measured and published (pending).
 
-### 4.2 Distance kernels — smaller than expected
+### 4.2 Distance kernels — done in PR `perf-kernels` (larger than expected)
 
-**Today.** Every dot-product variant reduces horizontally on each iteration
-(`dot += Vector.Dot(v1, v2)`, `QvecDatabase.cs` ~1088, ~1104, ~3468) and the Euclidean
-kernels use a single accumulator chain. The first draft of this document expected that to
-cost "several ×" on 4-lane NEON.
+**Before.** Every dot-product variant reduced horizontally on each iteration
+(`dot += Vector.Dot(v1, v2)`) and the Euclidean kernels used a single accumulator chain; the
+pointer variants pinned the query with `fixed` and dereferenced `*(Vector<float>*)`. The
+baseline in §2.1 read the 768/1536 numbers as "within 5 % of `TensorPrimitives`, therefore
+load-bound" and planned a 128-d-only unroll for ~1.3×.
 
-**Measured (§2.1):** it does not. At 768 and 1536 the pointer kernels the walk uses are within
-5 % of `TensorPrimitives`; the loop is bound by the two loads per iteration, not by the
-reduction. At 128-d the pointer dot product is 1.5× off (18.4 vs 11.9 ns) and the span
-Euclidean kernel 1.25× off (20.4 vs 16.3 ns). The public array overloads are 1.4–2.3× slower
-than the span/pointer ones because `new Vector<float>(array, i)` bounds-checks, but nothing
-hot calls them.
+**Change.** One implementation per metric on managed refs (`DotProductCore`,
+`NegativeSquaredDistanceCore`), four independent vector accumulators with
+`Vector.FusedMultiplyAdd`, one horizontal reduction at the end, and a single-vector loop plus
+scalar tail for the remainder. The array, span and pointer overloads all forward to the core
+(`MemoryMarshal.GetArrayDataReference`, `Unsafe.AsRef`), so `fixed` is gone. The 768+
+kernels were *not* left alone after all: the same change is what makes them fast.
 
-**Change.** For 128-d dot product only: multi-accumulator unroll, or delegate to
-`TensorPrimitives.Dot` (see open question 2). Leave the 768+ kernels alone. Bring the array
-overloads down to the span implementation by forwarding to it — a cleanup, not a win.
+**Kept identical.** `NormalizeVector` computes the norm with the old summation order
+(`SquaredNorm`) because normalised cosine vectors are persisted: the 2.0 byte-identity fixture
+(`EntryVersionTests.Untracked_FileIsByteIdenticalToReference`) must — and does — still pass.
+Scores themselves may differ from 2.1 in the last bits (different accumulation order, fused
+multiply-add); the same kernel serves build and search, and recall is checked over the whole
+ef sweep, not assumed.
 
-**Measure.** `FloatKernelBenchmarks`; then SIFT-1M (128-d, dot/Euclidean) query QPS on a
-kept index. Cohere (768-d) is not expected to move and will be measured once to confirm.
+**Measured (§2.1 "after" table).** Pointer kernels 2.4–2.7× at 128, 768 and 1536; the
+public array overloads 3.3× at 128-d. End to end: see the `compare.ps1` results in §2.1.
 
-**Expected.** Up to ~1.3× on the 128-d kernel; a few percent end to end on SIFT; nothing on
-Cohere. Worth doing because SIFT is a headline dataset, but it goes after 4.1.
+**Expected → actual.** Expected ~1.3× on 128-d only; got 2.4–2.7× everywhere. The lesson for
+the rest of this document: "close to `TensorPrimitives`" is not evidence of being at the
+hardware limit on this machine.
 
 ### 4.3 Neighbour list copy in the walk — done in PR `perf-query-scratch` (search side)
 
@@ -443,10 +465,11 @@ measured on the reference machine on the same day, with recall, per the existing
 1. Should `perf.yml` run on every PR touching `Qvec.Core/*.cs` (as a non-blocking summary),
    or only on dispatch and schedule? Every-PR gives reviewers the number when they need it but
    adds ~5–8 minutes of runner time per PR.
-2. `TensorPrimitives` adds a dependency on `System.Numerics.Tensors` to `Qvec.Core`. It is
+2. ~~`TensorPrimitives` adds a dependency on `System.Numerics.Tensors` to `Qvec.Core`. It is
    first-party, AOT-compatible and small, but Core has had no package dependencies so far.
    Decide after the micro-benchmark shows whether our own multi-accumulator loop gets close
-   enough to make it unnecessary.
+   enough to make it unnecessary.~~ Closed by PR `perf-kernels`: our four-accumulator kernels
+   are 1.7–2.6× faster than `TensorPrimitives` on the reference machine. No dependency.
 3. §3.2 says the prune and `SearchLayerNearest` should get internal micro-benchmarks. The
    first PR covers the kernels and the public `Search`; the internal ones are added when
    4.3/4.4 need them, so the internal surface is not widened speculatively.

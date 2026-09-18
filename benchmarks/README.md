@@ -254,12 +254,14 @@ dotnet run -c Release --project benchmarks/Qvec.MicroBenchmarks -- --filter '*Se
 Results land in `BenchmarkDotNet.Artifacts/results/`. The float kernels are measured next to
 `System.Numerics.Tensors.TensorPrimitives` as a "how fast can this machine go" reference. The
 baseline on the reference machine, and what it changed about the plan, is recorded in
-[docs/design-performance.md](../docs/design-performance.md) §2.1 — in short, the kernels the
-graph walk uses are already within 5 % of `TensorPrimitives` at 768 and 1536 dimensions, and a
-single query used to allocate 30–68 KB. That was the first thing the programme fixed: after
-the query-scratch change a `Search(topK 10, ef 100)` allocates 1.48 KB (the result list only),
-gen1 collections are gone, and the single-thread 128-d query dropped from 92 to 51 µs on the
-reference machine. The before/after table is in §2.1 of the same document.
+[docs/design-performance.md](../docs/design-performance.md) §2.1. Two things the programme
+has fixed so far, both visible in that document's before/after tables: a single query used to
+allocate 30–68 KB — after the query-scratch change a `Search(topK 10, ef 100)` allocates
+1.48 KB (the result list only), gen1 collections are gone, and the single-thread 128-d query
+dropped from 92 to 51 µs. And the distance kernels ran on a single accumulator chain — four
+accumulators made the pointer kernels the graph walk calls 2.4–2.7× faster at 128, 768 and
+1536 dimensions (128-d dot product 18.4 → 6.9 ns, 768-d 135.6 → 52.4 ns), which also puts them
+1.7–2.6× ahead of `TensorPrimitives` on the ARM64 reference machine.
 
 ## A/B comparison of two commits
 

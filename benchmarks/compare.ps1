@@ -65,6 +65,9 @@ if (-not $repo) { throw 'compare.ps1 must run inside the Qvec repository.' }
 
 function Resolve-Commit([string]$ref) {
     $sha = (git -C $repo rev-parse --verify --quiet "$ref^{commit}")
+    # A branch that only exists on the remote (a CI checkout of master comparing against a
+    # feature branch, say) resolves through its remote-tracking ref.
+    if (-not $sha) { $sha = (git -C $repo rev-parse --verify --quiet "origin/$ref^{commit}") }
     if (-not $sha) { throw "Cannot resolve '$ref' to a commit." }
     return $sha.Trim()
 }
