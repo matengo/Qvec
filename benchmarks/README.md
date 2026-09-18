@@ -186,6 +186,58 @@ it. Cohere 1M float at efSearch 100 went from 1,883 to 6,441 QPS on 12 threads o
 went through the raw mapping pointer like the distance computations already did. Single-threaded
 throughput was unaffected, which is why the SIFT numbers in the main README did not move.
 
+## Change tracking cost
+
+Change tracking (the foundation for `Qvec.Sync`) is off by default, so the question is what
+turning it on costs a database that may never sync. Two SIFT-1M builds on the reference machine,
+same day, same settings, `--tracking` being the only difference:
+
+| | tracking off | tracking on | delta |
+| --- | ---: | ---: | ---: |
+| Build, 12 threads | 168.9 s (5,920 inserts/s) | 172.0 s (5,813 inserts/s) | +1.8 % |
+| File | 1,323.8 MiB | 1,407.7 MiB | +83.9 MiB |
+| recall@10, efSearch 10 | 84.5 % | 84.5 % | — |
+
+The file delta is exactly what the format says: 24 bytes per row for `EntryVersions` plus 64
+bytes per change-log slot, and the ring here was sized to the dataset (`LogCapacity = 1M`), so
+88 bytes × 1M = 83.9 MiB. The build delta is one HLC stamp and one 64-byte log record per
+insert and sits inside the run-to-run noise of a 170-second build; both runs are slower than the
+142 s quoted in the main README because the machine was not idle, which is also why they were
+run back to back rather than compared against the old number.
+
+The sync step itself, measured after the tracked build by pushing the first 100,000 documents
+through the whole pipeline into a fresh replica:
+
+| step | time | docs/s |
+| --- | ---: | ---: |
+| `GetChanges` (200 batches of 500) | 0.13 s | 763,508 |
+| wire encode (`SyncCompression.Auto`) | 0.24 s | 419,240 |
+| wire decode | 0.08 s | 1,247,837 |
+| `ApplyChanges` into a fresh replica, single thread | 60.80 s | 1,645 |
+
+Wire size was 53.1 MiB, 557 bytes per document — **100 % of the uncompressed encoding**.
+`Auto` only reaches for Brotli when metadata makes up at least a fifth of the payload; SIFT has
+none, and 128 IEEE floats of descriptor data would not have compressed anyway, so the frame went
+out raw. The 45 bytes over the 512-byte vector are the document id, the version, the operation
+and the (empty) metadata. Compression earns its keep on metadata-heavy payloads, not on dense
+float vectors.
+
+`ApplyChanges` is the cost that matters and it is the HNSW insert, not the sync: a replica
+receiving a document has to link it into its own graph exactly like `AddEntry` does, on one
+thread, so it runs at single-threaded insert speed. Reading a batch, checking versions and
+writing the log are rounding errors next to it. That is the argument for snapshot bootstrap:
+replaying this 1M-document database through `ApplyChanges` at this rate is about ten minutes of
+single-threaded graph building on the receiver, while copying the 1.4 GiB file is a file copy.
+
+Reproduce with:
+
+```powershell
+dotnet run -c Release --project benchmarks/Qvec.Benchmarks -- --dataset sift --threads 0 --ef 10
+dotnet run -c Release --project benchmarks/Qvec.Benchmarks -- --dataset sift --threads 0 --ef 10 --tracking
+```
+
+`--sync-items` and `--sync-batch` change the size of the sync step; `--sync-items 0` skips it.
+
 ## Metric
 
 SIFT and GIST ground truth is **Euclidean**, Cohere is **Cosine**. The benchmark defaults to the

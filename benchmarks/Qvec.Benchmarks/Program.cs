@@ -66,6 +66,9 @@ var options = new BenchmarkOptions
     QueryPasses = arguments.Int("passes") ?? 1,
     BuildThreads = arguments.Int("threads") ?? 1,
     ReuseIndex = arguments.Flag("reuse-index"),
+    ChangeTracking = arguments.Flag("tracking"),
+    SyncItems = arguments.Int("sync-items") ?? 100_000,
+    SyncBatchSize = arguments.Int("sync-batch") ?? 500,
 };
 
 var report = RecallBenchmark.Run(options);
@@ -159,6 +162,11 @@ internal sealed class CommandLine
               --index <path>      where to put the .qvec file
               --keep-index        do not delete the .qvec file afterwards
               --reuse-index       open the existing --index file instead of rebuilding it
+              --tracking          build with change tracking on (replica id, per-document version,
+                                  change-log ring sized to the dataset) and, after the build, measure
+                                  GetChanges + wire encoding + ApplyChanges into a fresh replica
+              --sync-items <n>    documents to push through that sync step, default 100000; 0 skips it
+              --sync-batch <n>    documents per ChangeBatch in the sync step, default 500
               --hardware <text>   hardware description to print with the results
               --out <path>        also write the Markdown report to a file
 
