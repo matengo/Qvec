@@ -14,4 +14,8 @@
     <PackageReference Include="System.IO.Hashing" />
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="Qvec.MicroBenchmarks" />
+  </ItemGroup>
+
 </Project>

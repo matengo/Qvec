@@ -1,6 +1,6 @@
 # Design: Performance programme (tracking and improvement)
 
-Status: plan, September 2026. Nothing in this document is implemented yet. Every number
+Status: plan, September 2026. §3.2 (micro-benchmarks) is implemented; the rest is not. Every number
 quoted as "expected" is a hypothesis to be measured, not a claim; the README rule applies —
 no figure is published without a measurement on the reference machine.
 
@@ -38,6 +38,45 @@ path on this machine.
 | Cohere 1M int8, efSearch 100, 12 threads | 13,540 QPS | same |
 | Thread scaling, queries, 1 → 12 threads | 6.7× float, 8.2× int8, 9–11× rescored | same |
 | Local `InsertThroughputTests` (5k × 128-d, 1 thread) | 1,300–1,450/s dev machine; 711–786/s observed on CI | test comment, CI logs |
+
+### 2.1 Micro-benchmark baseline (measured 2026-09-18, PR `perf-micro`)
+
+`Qvec.MicroBenchmarks`, BenchmarkDotNet 0.15.8, .NET 10.0.12, Arm64 RyuJIT, reference
+machine. Kernel figures are the default job; the search figures are the `--job short` job
+(3 iterations) and should be read to ±5 %.
+
+**Float kernels, one call, both operands in L1.** "Pointer" is the variant the graph walk
+calls (`DotProductUnsafe` / `NegativeSquaredDistanceUnsafe`), "Span" the one the prune calls,
+"Array" the public overload the tests use. `TensorPrimitives` is the reference.
+
+| dim | Dot Pointer | Dot Span | Dot Array | Dot TensorPrimitives | L2 Pointer | L2 Span | L2 Array | L2 TensorPrimitives |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 128 | 18.4 ns | 12.3 ns | 27.8 ns | 11.9 ns | 12.5 ns | 20.4 ns | 26.0 ns | 16.3 ns |
+| 768 | 135.6 ns | 136.0 ns | 187.6 ns | 139.0 ns | 123.2 ns | 137.1 ns | 181.7 ns | 125.2 ns |
+| 1536 | 263.4 ns | 259.0 ns | 356.6 ns | 266.4 ns | 283.2 ns | 256.5 ns | 346.7 ns | 316.9 ns |
+
+Reading: at 768 and 1536 the kernels the hot paths use are **within 5 % of
+`TensorPrimitives`** — the loop is bound by the loads, and the per-iteration `Vector.Dot`
+reduction that §4.2 originally singled out costs nothing measurable there. At 128 the pointer
+dot product is 1.5× off the reference (18.4 vs 11.9 ns); the array overloads are 1.4–2.3×
+slower everywhere but are not on any hot path. Kernel work is therefore a small, dimension-
+dependent win, not the "several ×" the first draft of this document expected.
+
+**One `Search(topK 10, efSearch 100)` on a 10,000-node clustered Euclidean index:**
+
+| dim | mode | mean | Gen0 / 1k ops | Gen1 / 1k ops | allocated per query |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 128 | float | 92.4 µs | 7.4 | — | 30.8 KB |
+| 128 | int8 | 88.8 µs | 7.4 | — | 30.8 KB |
+| 128 | int8 rescored | 95.3 µs | 7.4 | — | 30.7 KB |
+| 768 | float | 425.7 µs | 16.6 | 0.49 | 67.9 KB |
+| 768 | int8 | 211.8 µs | 16.6 | 0.24 | 68.8 KB |
+| 768 | int8 rescored | 275.5 µs | 16.6 | 0.98 | 68.7 KB |
+
+Reading: **30–68 KB of garbage per query and a gen1 collection every one to four thousand
+queries** on a graph that fits in cache. At 128-d the arithmetic for a walk of this size is on
+the order of 20–40 µs, so more than half the query is overhead. This is the §4.1 finding
+quantified, and it is why §4.1 is first in the queue.
 
 Two of these are already suspicious as a starting point: 6.3× build scaling and 6.7× query
 scaling on 12 cores leave a third of the machine idle, and the 128-d single-thread insert rate
@@ -126,67 +165,65 @@ machine to CI; the A/B approach above gives most of the value without it.
 
 ## 4. Improvement candidates
 
-Ordered by (expected gain × confidence) / effort. Each item states what the code does today,
+Ordered by (measured or expected gain × confidence) / effort; the order changed after the
+§2.1 measurements — the kernels moved down, the allocations moved up. Each item states what the code does today,
 what to change, how to measure, and what "done" means. Items marked **profile first** are
 not to be started until a CPU profile of the reference workload confirms they matter.
 
-### 4.1 Distance kernels — horizontal reduction inside the loop
-
-**Today.** Every dot-product variant reduces horizontally on each iteration:
-
-```csharp
-// QvecDatabase.cs ~1088, ~1104, ~3468
-dot += Vector.Dot(v1, v2);
-```
-
-`Vector.Dot` is a lane-wise multiply *plus a full horizontal add* — on NEON that is two
-`FADDP` after the `FMUL`, and the scalar `dot +=` is a serial dependency chain. With four lanes
-per vector this runs at a small fraction of what the FMA units can do. The Euclidean kernels
-use a single vector accumulator (`accumulator += difference * difference`), which is better
-but still one dependency chain: on a core with 4-cycle FMA latency and two FMA pipes, one
-chain uses 1/8 of the throughput.
-
-**Change.** Four (or eight, measured) independent `Vector<float>` accumulators, `dim`-unrolled,
-one `Vector.Sum` at the end; or replace the bodies with `TensorPrimitives.Dot` /
-`TensorPrimitives.Distance` and keep our functions as the metric-dispatch shell.
-`TensorPrimitives` already does the multi-accumulator unroll, picks `Vector512` on AVX-512
-x64 (which `Vector<T>` does not), and is Native-AOT friendly. The pointer variant
-(`DotProductUnsafe(float[], float*, int)`) is the one the graph walk uses; it wraps the
-pointer in a `ReadOnlySpan<float>` for free.
-
-**Measure.** Micro-benchmark first (§3.2). Then Cohere 1M float at efSearch 180 and SIFT-1M
-build on the reference machine, both against a kept index so recall is byte-identical.
-
-**Done when** the micro-benchmark shows the kernel within ~10 % of `TensorPrimitives` at
-128/768/1536, and the macro run reports the QPS change with recall unchanged.
-
-**Expected.** Kernel: several ×. End to end: unknown — the graph walk is also memory-bound;
-the profile referenced in `InsertThroughputTests` said distance arithmetic was "well under one
-percent" of insert time *before* the marshalling fixes, so for inserts the gain may be small.
-For queries at high `ef` on 768-d Cohere, the kernel share is larger. Measure.
-
-### 4.2 Query path allocates per query
+### 4.1 Query path allocates per query — measured, first in line
 
 **Today.** `Search(float[], int, int)` calls `SearchLayerNearest(prepared, entryPoint, 0, ef)`
-with no scratch (line ~2443), so each query allocates a `HashSet<int>`, two
-`PriorityQueue<int,float>`, a `PreparedQuery`, the result array, and (in int8 mode) a
-`byte[dim]` for the quantised query. `InsertScratch` already has the right shape — an epoch-
-stamped visited array and reusable heaps — but only the insert path uses it. At 13,540 QPS
-that is on the order of 100k allocations per second of short-lived objects across 12 threads,
-which is exactly the pattern that costs scaling (gen0 GCs stop all threads).
+with no scratch (line ~2443), so each query allocates a `HashSet<int>` (which resizes several
+times as the walk visits one to two thousand nodes), two `PriorityQueue<int,float>`, a
+`PreparedQuery`, the result array, and (in int8 mode) a `byte[dim]` for the quantised query.
+`InsertScratch` already has the right shape — an epoch-stamped visited array and reusable
+heaps — but only the insert path uses it.
+
+§2.1 puts a number on it: **30.8 KB per query at 128-d, 68 KB at 768-d, with gen1
+collections every 1–4k queries.** At 13,540 QPS on 12 threads that is close to a gigabyte of
+garbage per second, and every gen0/gen1 collection stops all twelve query threads — the
+pattern that caps the measured scaling at 6.7× (float) on 12 cores.
 
 **Change.** A `[ThreadStatic]` or pooled `SearchScratch` (rename/generalise `InsertScratch`),
 passed from both `Search` overloads and the filtered search. Reuse the `PreparedQuery` buffer.
+The result list (`List<(Guid, float, string)>`) and the metadata strings stay — they are what
+the caller asked for.
 
-**Measure.** `dotnet-counters` gen0 count and allocation rate during a 12-thread Cohere 1M
-run, before and after; QPS at 1 and 12 threads; thread-scaling ratio. Recall is unaffected by
-construction (same algorithm, same order) — verify with the byte-identical index.
+**Measure.** `SearchBenchmarks` allocated-bytes column before/after (target: only the result
+list and metadata strings); `dotnet-counters` gen0/gen1 rate during a 12-thread Cohere 1M
+run; QPS at 1 and 12 threads and the ratio between them. Recall is unaffected by construction
+(same algorithm, same visiting order) — verify on a kept index.
 
-**Done when** allocations per query are O(result size) only and the 12-thread/1-thread ratio
-has been re-measured and published.
+**Done when** allocations per query are O(result size), the micro-benchmark shows it, and the
+12-thread/1-thread ratio has been re-measured and published.
 
-**Expected.** Better 12-thread scaling than today's 6.7×; single-thread QPS gain small.
+**Expected.** The 10k-node single-thread query should lose a meaningful share of its 92 µs at
+128-d (the arithmetic accounts for perhaps a third of it); the larger effect is on 12-thread
+scaling, where the number to beat is 6.7×.
 
+### 4.2 Distance kernels — smaller than expected
+
+**Today.** Every dot-product variant reduces horizontally on each iteration
+(`dot += Vector.Dot(v1, v2)`, `QvecDatabase.cs` ~1088, ~1104, ~3468) and the Euclidean
+kernels use a single accumulator chain. The first draft of this document expected that to
+cost "several ×" on 4-lane NEON.
+
+**Measured (§2.1):** it does not. At 768 and 1536 the pointer kernels the walk uses are within
+5 % of `TensorPrimitives`; the loop is bound by the two loads per iteration, not by the
+reduction. At 128-d the pointer dot product is 1.5× off (18.4 vs 11.9 ns) and the span
+Euclidean kernel 1.25× off (20.4 vs 16.3 ns). The public array overloads are 1.4–2.3× slower
+than the span/pointer ones because `new Vector<float>(array, i)` bounds-checks, but nothing
+hot calls them.
+
+**Change.** For 128-d dot product only: multi-accumulator unroll, or delegate to
+`TensorPrimitives.Dot` (see open question 2). Leave the 768+ kernels alone. Bring the array
+overloads down to the span implementation by forwarding to it — a cleanup, not a win.
+
+**Measure.** `FloatKernelBenchmarks`; then SIFT-1M (128-d, dot/Euclidean) query QPS on a
+kept index. Cohere (768-d) is not expected to move and will be measured once to confirm.
+
+**Expected.** Up to ~1.3× on the 128-d kernel; a few percent end to end on SIFT; nothing on
+Cohere. Worth doing because SIFT is a headline dataset, but it goes after 4.1.
 ### 4.3 Neighbour list copy in the walk
 
 **Today.** `SearchLayerNearest` calls `GetNeighborsAtLevel(candidateId, level, neighborBuffer)`,
@@ -197,7 +234,7 @@ copying up to 64 ints out of the mapping into a rented buffer, then iterates the
 mapping cannot be remapped while the lock is held — the same invariant `StoredVector` relies
 on). Same for `AddNeighborConnection`'s first pass.
 
-**Measure.** Part of the §4.2 macro run; separate micro-benchmark on `SearchLayerNearest`.
+**Measure.** Part of the §4.1 macro run; separate micro-benchmark on `SearchLayerNearest`.
 
 **Expected.** Small (a few percent); bundle with 4.2.
 
@@ -219,7 +256,7 @@ because the sort is stable and the arithmetic unchanged. That is a very strong c
 
 **Expected.** Unknown until profiled. The `O(M0²)` `StoredSimilarity` calls in
 `PruneNeighbors` and `FindWorstNonDiverse` — each reading two mapped vectors — may dominate,
-in which case 4.1 helps here too and allocation does not.
+in which case the kernel work in 4.2 helps here too and allocation does not.
 
 ### 4.5 Parallel build scaling — profile first
 
@@ -247,10 +284,10 @@ on the mapped file, nothing short of a layout change helps.
 
 | # | PR | Scope | Depends on |
 | --- | --- | --- | --- |
-| 1 | `perf-micro` | `Qvec.MicroBenchmarks` project (kernels + `TensorPrimitives` reference), `InternalsVisibleTo`, README section | — |
+| 1 | `perf-micro` | `Qvec.MicroBenchmarks` project (kernels + `TensorPrimitives` reference, one-query search with memory diagnoser), `InternalsVisibleTo`, README section; baseline recorded in §2.1 | — |
 | 2 | `perf-workflow` | `compare.ps1` A/B script, `perf.yml` (dispatch + weekly), step-summary tables, `InsertThroughputTests` prints to summary | 1 |
-| 3 | `perf-kernels` | §4.1: multi-accumulator or `TensorPrimitives` kernels; micro + macro results in `benchmarks/README.md` | 1, 2 |
-| 4 | `perf-query-scratch` | §4.2 + §4.3: query-path scratch, direct neighbour pointer; allocation counters and scaling re-measured | 2 |
+| 3 | `perf-query-scratch` | §4.1 + §4.3: query-path scratch, direct neighbour pointer; allocation counters and scaling re-measured | 2 |
+| 4 | `perf-kernels` | §4.2: 128-d dot product only, array overloads forwarded to span; SIFT QPS re-measured | 2 |
 | 5 | `perf-profile` | CPU profile of single-thread build and 12-thread build/query on the reference machine; findings appended to §2 of this document; decides whether 4.4 / 4.5 proceed | 2 |
 | 6 | `perf-insert-prune` | §4.4 if profile says so; byte-identical graph check | 5 |
 | 7 | `perf-parallel-build` | §4.5 if profile says so | 5 |
@@ -267,5 +304,8 @@ measured on the reference machine on the same day, with recall, per the existing
    first-party, AOT-compatible and small, but Core has had no package dependencies so far.
    Decide after the micro-benchmark shows whether our own multi-accumulator loop gets close
    enough to make it unnecessary.
-3. The "well under one percent" profile figure predates the mapped-pointer fixes and the
+3. §3.2 says the prune and `SearchLayerNearest` should get internal micro-benchmarks. The
+   first PR covers the kernels and the public `Search`; the internal ones are added when
+   4.3/4.4 need them, so the internal surface is not widened speculatively.
+4. The "well under one percent" profile figure predates the mapped-pointer fixes and the
    incremental prune. It should be re-taken (PR 5) before it is quoted again.
