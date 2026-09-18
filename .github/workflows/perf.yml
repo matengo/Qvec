@@ -1,0 +1,125 @@
+name: Performance
+
+# Performance tracking, deliberately not a gate. See docs/design-performance.md section 3.
+#
+# GitHub-hosted runners vary by tens of percent between runs of the same binary, so nothing
+# here compares against a stored number. The macro comparison builds base and head in the same
+# job and runs them interleaved; only the head/base ratio means anything. The micro-benchmarks
+# report BenchmarkDotNet's own statistics and, above all, allocated bytes per operation, which
+# is exact on any machine. Absolute numbers for the README come from the reference machine.
+#
+# Nothing in this workflow fails the build. A regression is a review comment, not a red X.
+
+on:
+  workflow_dispatch:
+    inputs:
+      base:
+        description: Baseline commit-ish
+        default: master
+        required: true
+      head:
+        description: Candidate commit-ish (defaults to the ref the workflow runs on)
+        default: ''
+        required: false
+      rounds:
+        description: Interleaved base/head rounds for the macro A/B
+        default: '3'
+        required: false
+  schedule:
+    # Weekly: master against the latest release tag.
+    - cron: '17 4 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  perf:
+    name: Micro-benchmarks and macro A/B
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Resolve base and head
+        id: refs
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            BASE="$(git describe --tags --abbrev=0 --match 'v*' origin/master)"
+            HEAD_REF="origin/master"
+          else
+            BASE="${{ github.event.inputs.base }}"
+            HEAD_REF="${{ github.event.inputs.head }}"
+            [ -z "$HEAD_REF" ] && HEAD_REF="${{ github.sha }}"
+          fi
+          case "$BASE" in
+            origin/*|v*|refs/*) ;;
+            *) git rev-parse --verify --quiet "$BASE^{commit}" >/dev/null || BASE="origin/$BASE" ;;
+          esac
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+          echo "head=$HEAD_REF" >> "$GITHUB_OUTPUT"
+          echo "rounds=${{ github.event.inputs.rounds || '3' }}" >> "$GITHUB_OUTPUT"
+          echo "Comparing head=$HEAD_REF against base=$BASE"
+
+      - name: Micro-benchmarks (head)
+        # BenchmarkDotNet's statistics are enough here; the allocation column is exact.
+        continue-on-error: true
+        run: >
+          dotnet run -c Release --project benchmarks/Qvec.MicroBenchmarks --
+          --filter '*Search*' --job short --exporters json
+          --artifacts BenchmarkDotNet.Artifacts
+
+      - name: Publish micro-benchmark summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Micro-benchmarks (head \`${{ steps.refs.outputs.head }}\`)"
+            echo
+            echo "Shared runner: compare the **Allocated** column, treat timings as indicative only."
+            echo
+            for f in BenchmarkDotNet.Artifacts/results/*-report-github.md; do
+              [ -f "$f" ] && cat "$f" && echo
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Macro A/B on siftsmall
+        # The dataset comes from ftp.irisa.fr; if the runner cannot reach it the step is skipped
+        # rather than failing the workflow.
+        continue-on-error: true
+        shell: pwsh
+        run: >
+          ./benchmarks/compare.ps1
+          -Base '${{ steps.refs.outputs.base }}'
+          -Head '${{ steps.refs.outputs.head }}'
+          -Rounds ${{ steps.refs.outputs.rounds }}
+          -Out compare.md
+
+      - name: Publish macro A/B summary
+        if: always()
+        shell: bash
+        run: |
+          if [ -f compare.md ]; then
+            cat compare.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "## Macro A/B: not run (dataset download or build failed; see the step log)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-results
+          if-no-files-found: ignore
+          path: |
+            BenchmarkDotNet.Artifacts/results/
+            compare.md

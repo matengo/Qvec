@@ -261,6 +261,25 @@ the query-scratch change a `Search(topK 10, ef 100)` allocates 1.48 KB (the resu
 gen1 collections are gone, and the single-thread 128-d query dropped from 92 to 51 µs on the
 reference machine. The before/after table is in §2.1 of the same document.
 
+## A/B comparison of two commits
+
+`compare.ps1` answers "did this change make it faster?" honestly on a noisy machine. It builds
+`Qvec.Benchmarks` at two commits in throw-away git worktrees and runs the two binaries
+alternating — base, head, base, head — on the same dataset, then reports the head/base ratio
+as the median over the paired rounds with the per-round spread, and recall next to every
+throughput number. Alternating cancels the slow drift a shared machine exhibits; only the ratio
+is meaningful, the absolute values are not comparable across runs.
+
+```powershell
+pwsh benchmarks/compare.ps1 -Base master -Head my-branch            # siftsmall, 3 rounds
+pwsh benchmarks/compare.ps1 -Base v2.1.0 -Head master -Rounds 5 -Concurrency 12
+```
+
+`.github/workflows/perf.yml` runs the same script (plus the search micro-benchmarks) on a
+GitHub runner on demand and weekly against the latest release tag, and writes the tables to the
+job summary. It never fails the build: a regression is a review comment, not a red X. Details
+and the reasoning are in [docs/design-performance.md](../docs/design-performance.md) §3.
+
 ## Metric
 
 SIFT and GIST ground truth is **Euclidean**, Cohere is **Cosine**. The benchmark defaults to the

@@ -96,6 +96,27 @@ distance kernel (768 × 4 B per candidate is memory traffic, not allocation), wh
 territory. `--job short` error bars are wide (see the artifacts), so treat the percentages as
 indicative to ±10 %; the allocation column is exact.
 
+**Macro confirmation with `compare.ps1`** (reference machine, siftsmall, `e8ebef2` → `607dda6`,
+3 interleaved rounds, 10 query passes, build threads 1; PR `perf-workflow`):
+
+| metric | 1 query thread, head/base | 12 query threads, head/base |
+| --- | ---: | ---: |
+| build inserts/s | 1.06× (rounds 0.99–1.19) | 1.02× (rounds 0.75–1.06) |
+| QPS @ ef 10 | 1.87× (1.75–1.94) | 1.58× (0.73–1.77) |
+| QPS @ ef 40 | 1.89× (1.78–1.90) | 1.56× (0.78–7.01) |
+| QPS @ ef 160 | 2.33× (2.28–2.77) | 2.06× (1.59–2.30) |
+| recall@10, every ef | unchanged | unchanged |
+
+Reading: end to end the query path is 1.9–2.3× faster on 128-d single-threaded with recall
+identical, which is more than the micro-benchmark's −45 % because a real query loop also pays
+for the GC pauses the micro-benchmark amortises away. The build did not move, as expected —
+inserts already used the scratch. The 12-thread columns at ef 10/40 are not measurements:
+100 queries × 10 passes finish in a few milliseconds across 12 threads, hence the 0.73–7.01
+spread. The ef 160 row is long enough to trust. Absolute 12-thread QPS on siftsmall
+(head, ef 160): 84,921 against 10,675 single-threaded, a 7.95× ratio on 12 cores; the base
+binary's ratio (9.0×) was higher only because its single-thread number was worse. The
+Cohere-1M 12-thread re-measurement that §4.1 owes is a reference-machine job, not a CI one.
+
 Two of these are already suspicious as a starting point: 6.3× build scaling and 6.7× query
 scaling on 12 cores leave a third of the machine idle, and the 128-d single-thread insert rate
 is about 1,400/s while the arithmetic it has to do (an `O(M0²)` prune at 64 neighbours) is on
@@ -139,38 +160,48 @@ Kernels are compared against `System.Numerics.Tensors.TensorPrimitives.Dot` /
 `.Distance` as a reference implementation in the same run, so we know how far from
 "library-quality" our own loops are before deciding whether to rewrite or replace them.
 
-### 3.3 Macro A/B: `benchmarks/compare.ps1` and a `perf` workflow
+### 3.3 Macro A/B: `benchmarks/compare.ps1` and a `perf` workflow — done in PR `perf-workflow`
 
-A script that builds two commits of `Qvec.Benchmarks` (base and head), then runs them
-**alternating** on the same dataset — base, head, base, head — and reports the paired medians.
-Alternating cancels the slow drift a runner exhibits; pairing makes a 10 % difference visible
-under 20 % noise.
+`benchmarks/compare.ps1` builds two commits of `Qvec.Benchmarks` (base and head) in
+throw-away git worktrees, then runs them **alternating** on the same dataset — base, head,
+base, head — and reports the paired medians. Alternating cancels the slow drift a runner
+exhibits; pairing makes a 10 % difference visible under 20 % noise. It parses the Markdown each
+binary writes with `--out`, so it works against any commit since that flag existed, and it
+forces invariant globalization on both binaries so the numbers parse on any host culture.
 
-Datasets for CI: `siftsmall` (10k × 128) for insert and query, `--threads 1` and `--threads 0`.
-It fits in a few minutes. Cohere is for the reference machine only.
+Datasets for CI: `siftsmall` (10k × 128) for insert and query, `--threads 1`; `-Concurrency`
+is a parameter. It fits in a few minutes. Cohere is for the reference machine only. Note that
+siftsmall has only 100 queries: the script defaults to 10 passes per `ef` row, and even then
+12-thread numbers at low `ef` are too short to be stable (see §2.1) — multi-threaded query
+scaling is a reference-machine measurement.
 
 Workflow `.github/workflows/perf.yml`:
 
-- `workflow_dispatch` with `base` / `head` inputs (defaults `master` / current branch), and a
-  weekly `schedule` that compares `master` against the last release tag.
-- Runs the micro-benchmarks once (BenchmarkDotNet's own statistics are enough there) and the
-  macro A/B script.
-- Writes both to `$GITHUB_STEP_SUMMARY` as Markdown tables: build time, inserts/s, QPS at the
-  swept `ef`, recall, and the head/base ratio with its confidence interval.
-- Uploads BenchmarkDotNet's JSON as an artifact.
-- **Does not fail the build.** A regression is a review comment, not a red X; the reviewer
-  decides. Turning it into a gate is deferred until we have a month of data showing what the
-  noise floor actually is.
+- `workflow_dispatch` with `base` / `head` / `rounds` inputs (defaults `master` / the ref the
+  workflow runs on / 3), and a weekly `schedule` that compares `master` against the latest
+  `v*` tag.
+- Runs the `SearchBenchmarks` micro-benchmarks once (`--job short`; BenchmarkDotNet's own
+  statistics are enough there and the allocation column is exact) and the macro A/B script.
+- Writes both to `$GITHUB_STEP_SUMMARY` as Markdown tables: build inserts/s, QPS and recall@k
+  at each swept `ef`, and the head/base ratio as the median over rounds with the per-round
+  spread.
+- Uploads BenchmarkDotNet's results and the A/B Markdown as an artifact.
+- **Does not fail the build.** Every measuring step is `continue-on-error`; a regression is a
+  review comment, not a red X; the reviewer decides. Turning it into a gate is deferred until
+  we have a month of data showing what the noise floor actually is. The siftsmall download is
+  FTP (`ftp.irisa.fr`); if the runner cannot reach it the macro step is skipped and says so in
+  the summary.
 
-Optional, once the data looks stable: publish the JSON to a `gh-pages` branch with
-`benchmark-action/github-action-benchmark` so there is a chart to link from the README.
+Not done: a confidence interval proper (three rounds are too few for one; the spread is
+reported instead), and publishing JSON to `gh-pages` with
+`benchmark-action/github-action-benchmark` — worth it once the weekly data looks stable.
 
-### 3.4 Fix the existing gate
+### 3.4 Fix the existing gate — done in PR `perf-workflow`
 
 `InsertThroughputTests` stays as a coarse smoke test, but:
 
-- it prints the measured value into `$GITHUB_STEP_SUMMARY` when that variable is set (a
-  passing test today leaves no trace), so we accumulate a series of CI values for free;
+- it appends the measured value to `$GITHUB_STEP_SUMMARY` when that variable is set (a
+  passing test previously left no trace), so we accumulate a series of CI values for free;
 - the comment records that 500/s is a *smoke* floor, and points to the perf workflow for the
   real measurement.
 
@@ -191,8 +222,9 @@ not to be started until a CPU profile of the reference workload confirms they ma
 ### 4.1 Query path allocates per query — done in PR `perf-query-scratch`
 
 **Status.** Implemented. §2.1 "after" table: 30.8/68 KB → 1.48 KB per query, gen1 gone,
-single-thread 128-d query −34…−60 %. The 12-thread scaling re-measurement (below) is still
-owed and will land with PR `perf-workflow`'s A/B script.
+single-thread 128-d query −34…−60 % in the micro-benchmark and 1.9–2.3× QPS end to end on
+siftsmall (`compare.ps1`, §2.1). The Cohere-1M 12-thread re-measurement for the README is
+still owed and is a reference-machine job.
 
 **Before.** `Search(float[], int, int)` called `SearchLayerNearest(prepared, entryPoint, 0, ef)`
 with no scratch, so each query allocated a `HashSet<int>` (which resized several
@@ -307,8 +339,8 @@ on the mapped file, nothing short of a layout change helps.
 | # | PR | Scope | Depends on |
 | --- | --- | --- | --- |
 | 1 | `perf-micro` | `Qvec.MicroBenchmarks` project (kernels + `TensorPrimitives` reference, one-query search with memory diagnoser), `InternalsVisibleTo`, README section; baseline recorded in §2.1 | — |
-| 2 | `perf-workflow` | `compare.ps1` A/B script, `perf.yml` (dispatch + weekly), step-summary tables, `InsertThroughputTests` prints to summary | 1 |
-| 3 | `perf-query-scratch` | §4.1 + §4.3: query-path scratch, direct neighbour pointer; micro-benchmark before/after in §2.1 — **done**; 12-thread scaling re-measurement moved to PR 2 | 1 |
+| 2 | `perf-workflow` | `compare.ps1` A/B script, `perf.yml` (dispatch + weekly), step-summary tables, `InsertThroughputTests` prints to summary — **done**; validated by re-measuring PR 3 end to end (§2.1) | 1 |
+| 3 | `perf-query-scratch` | §4.1 + §4.3: query-path scratch, direct neighbour pointer; micro-benchmark before/after in §2.1 — **done**; Cohere 12-thread README re-measurement still owed | 1 |
 | 4 | `perf-kernels` | §4.2: 128-d dot product only, array overloads forwarded to span; SIFT QPS re-measured | 2 |
 | 5 | `perf-profile` | CPU profile of single-thread build and 12-thread build/query on the reference machine; findings appended to §2 of this document; decides whether 4.4 / 4.5 proceed | 2 |
 | 6 | `perf-insert-prune` | §4.4 if profile says so; byte-identical graph check | 5 |
