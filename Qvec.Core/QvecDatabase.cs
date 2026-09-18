@@ -1808,7 +1808,7 @@ namespace Qvec.Core
                 return;
             }
 
-            using var scratch = new ThreadLocal<InsertScratch>(() => new InsertScratch());
+            using var scratch = new ThreadLocal<SearchScratch>(() => new SearchScratch());
             var options = new ParallelOptions { MaxDegreeOfParallelism = threads };
             Parallel.For(first, pending.Count, options, i => LinkOne(pending[i], scratch.Value!));
         }
@@ -1819,7 +1819,7 @@ namespace Qvec.Core
             return entryPoint >= 0 && entryPoint < _header.CurrentCount && !_deletedIndices.Contains(entryPoint);
         }
 
-        private void LinkOne(PendingInsert node, InsertScratch scratch)
+        private void LinkOne(PendingInsert node, SearchScratch scratch)
         {
             _topologyLock.EnterReadLock();
             try
@@ -2328,11 +2328,12 @@ namespace Qvec.Core
             ValidateEfSearch(efSearch);
 
             _lock.EnterReadLock();
+            var scratch = RentSearchScratch();
             try
             {
                 if (IsEffectivelyEmpty) return new List<(Guid, float, string)>();
 
-                var prepared = Prepare(query);
+                var prepared = Prepare(query, scratch);
 
                 int entryPoint = ResolveEntryPoint();
                 if (entryPoint < 0) return new List<(Guid, float, string)>();
@@ -2352,14 +2353,17 @@ namespace Qvec.Core
                 int visitBudget = Math.Min(liveCount, Math.Max(ef * 16, 1024));
 
                 var nearest = SearchLayerFiltered(
-                    prepared, entryPoint, 0, ef, filter, visitBudget, out _);
+                    prepared, entryPoint, 0, ef, filter, visitBudget, out _, scratch);
                 RescoreCandidates(prepared, nearest);
 
-                var matches = nearest
-                    .OrderByDescending(r => r.Score)
-                    .Take(topK)
-                    .Select(r => (ReadGuidFromDisk(r.Id), r.Score, r.Meta))
-                    .ToList();
+                // The walk returns its results best-first; rescoring can reorder them. The
+                // sort is stable, like the OrderByDescending it replaces, so ties keep walk order.
+                if (_rescore) InsertionSortDescending(nearest);
+
+                int count = Math.Min(topK, nearest.Length);
+                var matches = new List<(Guid Id, float Score, string Metadata)>(count);
+                for (int i = 0; i < count; i++)
+                    matches.Add((ReadGuidFromDisk(nearest[i].Id), nearest[i].Score, nearest[i].Meta));
 
                 if (matches.Count >= topK) return matches;
 
@@ -2371,7 +2375,11 @@ namespace Qvec.Core
                 // topK reachable entries.
                 return ExhaustiveFilteredSearch(prepared, filter, topK);
             }
-            finally { _lock.ExitReadLock(); }
+            finally
+            {
+                ReturnSearchScratch(scratch);
+                _lock.ExitReadLock();
+            }
         }
 
         private long _filteredFallbackCount;
@@ -2425,11 +2433,12 @@ namespace Qvec.Core
             ValidateEfSearch(efSearch);
 
             _lock.EnterReadLock();
+            var scratch = RentSearchScratch();
             try
             {
                 if (IsEffectivelyEmpty) return new List<(Guid, float, string)>();
 
-                var prepared = Prepare(query);
+                var prepared = Prepare(query, scratch);
 
                 int entryPoint = ResolveEntryPoint();
                 if (entryPoint < 0) return new List<(Guid, float, string)>();
@@ -2440,18 +2449,61 @@ namespace Qvec.Core
                 }
 
                 int ef = Math.Max(topK, efSearch);
-                var nearest = SearchLayerNearest(prepared, entryPoint, 0, ef);
+                var nearest = SearchLayerNearest(prepared, entryPoint, 0, ef, scratch);
                 // Rescored files: the walk ranked ef candidates on int8 codes; the exact floats
                 // decide the final order and the reported scores.
                 RescoreCandidates(prepared, nearest);
 
-                return nearest
-                    .OrderByDescending(r => r.Score)
-                    .Take(topK)
-                    .Select(r => (ReadGuidFromDisk(r.Id), r.Score, GetMetadata(r.Id)))
-                    .ToList();
+                // The walk returns its results best-first; rescoring can reorder them. The
+                // sort is stable, like the OrderByDescending it replaces, so ties keep walk order.
+                if (_rescore) InsertionSortDescending(nearest);
+
+                int count = Math.Min(topK, nearest.Length);
+                var matches = new List<(Guid Id, float Score, string Metadata)>(count);
+                for (int i = 0; i < count; i++)
+                    matches.Add((ReadGuidFromDisk(nearest[i].Id), nearest[i].Score, GetMetadata(nearest[i].Id)));
+                return matches;
             }
-            finally { _lock.ExitReadLock(); }
+            finally
+            {
+                ReturnSearchScratch(scratch);
+                _lock.ExitReadLock();
+            }
+        }
+
+        /// <summary>
+        /// Stable descending sort by score for the small (ef-sized) candidate arrays that come
+        /// out of a layer walk. Insertion sort is stable and allocation-free, which
+        /// <see cref="Array.Sort{T}(T[], IComparer{T})"/> is not.
+        /// </summary>
+        private static void InsertionSortDescending((int Id, float Score)[] items)
+        {
+            for (int i = 1; i < items.Length; i++)
+            {
+                var item = items[i];
+                int j = i - 1;
+                while (j >= 0 && items[j].Score < item.Score)
+                {
+                    items[j + 1] = items[j];
+                    j--;
+                }
+                items[j + 1] = item;
+            }
+        }
+
+        private static void InsertionSortDescending((int Id, float Score, string Meta)[] items)
+        {
+            for (int i = 1; i < items.Length; i++)
+            {
+                var item = items[i];
+                int j = i - 1;
+                while (j >= 0 && items[j].Score < item.Score)
+                {
+                    items[j + 1] = items[j];
+                    j--;
+                }
+                items[j + 1] = item;
+            }
         }
 
         /// <summary>
@@ -2465,7 +2517,7 @@ namespace Qvec.Core
         /// into it rather than overwritten. Searches read neighbour lists without locking, which
         /// is fine because slots are written as whole int32s and hold either a valid row or -1.
         /// </remarks>
-        private bool ConnectNewNode(int newIndex, float[] newVector, int newLevel, InsertScratch scratch)
+        private bool ConnectNewNode(int newIndex, float[] newVector, int newLevel, SearchScratch scratch)
         {
             int currentElement = ResolveEntryPoint();
             if (currentElement < 0 || currentElement == newIndex) return false;
@@ -2662,49 +2714,52 @@ namespace Qvec.Core
 
             return selected.ToArray();
         }
-        private int GreedyClosest(PreparedQuery query, int entryPoint, int level)
+        private unsafe int GreedyClosest(PreparedQuery query, int entryPoint, int level)
         {
             int current = entryPoint;
             float currentScore = CalculateScore(query, current);
-            int[] neighbors = ArrayPool<int>.Shared.Rent(MaxNeighborsAnyLevel);
-            try
+            int slots = NeighborsAtLevel(level);
+            bool changed = true;
+            while (changed)
             {
-                bool changed = true;
-                int slots = NeighborsAtLevel(level);
-                while (changed)
+                changed = false;
+                // Read in place: the lock held by every caller keeps the mapping from moving,
+                // and slots are whole int32s, so this sees the same values a copy would. The
+                // pointer stays on the node the scan started from even after current moves.
+                int* neighbors = NeighborPointer(current, level);
+                for (int j = 0; j < slots; j++)
                 {
-                    changed = false;
-                    GetNeighborsAtLevel(current, level, neighbors);
-                    for (int j = 0; j < slots; j++)
+                    int neighbor = neighbors[j];
+                    if (neighbor == -1) break;
+                    if (_deletedIndices.Contains(neighbor)) continue;
+                    float score = CalculateScore(query, neighbor);
+                    if (score > currentScore)
                     {
-                        if (neighbors[j] == -1) break;
-                        if (_deletedIndices.Contains(neighbors[j])) continue;
-                        float score = CalculateScore(query, neighbors[j]);
-                        if (score > currentScore)
-                        {
-                            currentScore = score;
-                            current = neighbors[j];
-                            changed = true;
-                        }
+                        currentScore = score;
+                        current = neighbor;
+                        changed = true;
                     }
                 }
-            }
-            finally
-            {
-                ArrayPool<int>.Shared.Return(neighbors);
             }
             return current;
         }
         /// <summary>
-        /// Reusable per-database scratch state for the insert path. Only touched while the write
-        /// lock is held, so a single instance is safe; the concurrent read path allocates its own.
+        /// Reusable per-walk scratch state: the epoch-stamped visited set, the two heaps, a
+        /// neighbour buffer and the prepared query's buffers. The insert path owns one instance
+        /// under the write lock (plus one per thread in <see cref="AddEntries"/>); the read path
+        /// rents from <see cref="_searchScratchPool"/> so that concurrent searches allocate
+        /// nothing per query beyond the results they return. Before the pool a single
+        /// <c>Search</c> allocated 30–68 KB (design-performance.md §2.1).
         /// </summary>
-        private sealed class InsertScratch
+        private sealed class SearchScratch
         {
             public int[] VisitedEpoch = Array.Empty<int>();
             public int Epoch;
             public readonly PriorityQueue<int, float> Candidates = new();
             public readonly PriorityQueue<int, float> Results = new();
+            public readonly PreparedQuery Query = new();
+            public float[]? PreparedFloats;
+            public byte[]? QueryCodes;
 
             public void Begin(int capacity)
             {
@@ -2730,72 +2785,63 @@ namespace Qvec.Core
             }
         }
 
-        private readonly InsertScratch _insertScratch = new();
+        private readonly SearchScratch _insertScratch = new();
 
-        private (int Id, float Score)[] SearchLayerNearest(PreparedQuery query, int entryPoint, int level, int ef, InsertScratch? scratch = null)
+        /// <summary>
+        /// Scratch objects for the concurrent read path. Bounded in practice by the number of
+        /// threads that have ever searched at once; each holds a visited array of
+        /// <c>MaxCount</c> ints. Released with the database.
+        /// </summary>
+        private readonly ConcurrentBag<SearchScratch> _searchScratchPool = new();
+
+        private SearchScratch RentSearchScratch()
+            => _searchScratchPool.TryTake(out var scratch) ? scratch : new SearchScratch();
+
+        private void ReturnSearchScratch(SearchScratch scratch) => _searchScratchPool.Add(scratch);
+
+        private unsafe (int Id, float Score)[] SearchLayerNearest(PreparedQuery query, int entryPoint, int level, int ef, SearchScratch scratch)
         {
-            HashSet<int>? visitedSet = null;
-            PriorityQueue<int, float> candidates;
-            PriorityQueue<int, float> results;
-
-            if (scratch is null)
-            {
-                visitedSet = new HashSet<int> { entryPoint };
-                candidates = new PriorityQueue<int, float>();
-                results = new PriorityQueue<int, float>();
-            }
-            else
-            {
-                scratch.Begin(_header.MaxCount);
-                scratch.Visit(entryPoint);
-                candidates = scratch.Candidates;
-                results = scratch.Results;
-            }
+            scratch.Begin(_header.MaxCount);
+            scratch.Visit(entryPoint);
+            var candidates = scratch.Candidates;
+            var results = scratch.Results;
 
             float entryScore = CalculateScore(query, entryPoint);
             candidates.Enqueue(entryPoint, -entryScore);
             results.Enqueue(entryPoint, entryScore);
             float worstScore = entryScore;
 
-            int[] neighborBuffer = ArrayPool<int>.Shared.Rent(MaxNeighborsAnyLevel);
-            try
+            int slots = NeighborsAtLevel(level);
+            while (candidates.TryDequeue(out int candidateId, out float negScore))
             {
-                int slots = NeighborsAtLevel(level);
-                while (candidates.TryDequeue(out int candidateId, out float negScore))
+                float candidateScore = -negScore;
+                if (candidateScore < worstScore && results.Count >= ef)
+                    break;
+
+                // Neighbour lists are read in place (see GreedyClosest).
+                int* neighbors = NeighborPointer(candidateId, level);
+                for (int j = 0; j < slots; j++)
                 {
-                    float candidateScore = -negScore;
-                    if (candidateScore < worstScore && results.Count >= ef)
-                        break;
+                    int neighbor = neighbors[j];
+                    if (neighbor < 0) break;
+                    if (!scratch.Visit(neighbor)) continue;
+                    if (_deletedIndices.Contains(neighbor)) continue;
 
-                    GetNeighborsAtLevel(candidateId, level, neighborBuffer);
-                    for (int j = 0; j < slots; j++)
+                    float score = CalculateScore(query, neighbor);
+
+                    if (results.Count < ef || score > worstScore)
                     {
-                        int neighbor = neighborBuffer[j];
-                        if (neighbor < 0) break;
-                        bool firstVisit = visitedSet is null ? scratch!.Visit(neighbor) : visitedSet.Add(neighbor);
-                        if (!firstVisit) continue;
-                        if (_deletedIndices.Contains(neighbor)) continue;
+                        candidates.Enqueue(neighbor, -score);
+                        results.Enqueue(neighbor, score);
 
-                        float score = CalculateScore(query, neighbor);
-
-                        if (results.Count < ef || score > worstScore)
+                        if (results.Count > ef)
                         {
-                            candidates.Enqueue(neighbor, -score);
-                            results.Enqueue(neighbor, score);
-
-                            if (results.Count > ef)
-                            {
-                                results.Dequeue();
-                            }
-
-                            results.TryPeek(out _, out worstScore);
+                            results.Dequeue();
                         }
+
+                        results.TryPeek(out _, out worstScore);
                     }
                 }
-            }
-            finally
-            {
-                ArrayPool<int>.Shared.Return(neighborBuffer);
             }
 
             var resultArray = new (int Id, float Score)[results.Count];
@@ -2827,34 +2873,42 @@ namespace Qvec.Core
         /// to <see cref="ExhaustiveFilteredSearch"/>, which is O(N) but exact.
         /// </para>
         /// </remarks>
-        private (int Id, float Score, string Meta)[] SearchLayerFiltered(
+        private unsafe (int Id, float Score, string Meta)[] SearchLayerFiltered(
             PreparedQuery query, int entryPoint, int level, int ef,
-            Func<string, bool> filter, int visitBudget, out bool budgetExhausted)
+            Func<string, bool> filter, int visitBudget, out bool budgetExhausted, SearchScratch scratch)
         {
             budgetExhausted = false;
 
-            var visited = new HashSet<int> { entryPoint };
+            scratch.Begin(_header.MaxCount);
+            scratch.Visit(entryPoint);
+            int visitedCount = 1;
+
+            // Metadata is kept only for nodes that entered the result set; it is what the
+            // caller gets back. Non-matching nodes are decoded for the filter and dropped.
             var metadata = new Dictionary<int, string>();
 
             float entryScore = CalculateScore(query, entryPoint);
 
-            var candidates = new PriorityQueue<int, float>();
+            var candidates = scratch.Candidates;
             candidates.Enqueue(entryPoint, -entryScore);
 
             // Only matching nodes enter the result set; the entry point is not special-cased.
-            var results = new PriorityQueue<int, float>();
+            var results = scratch.Results;
             float worstScore = float.MinValue;
 
             void TryAdmit(int node, float score)
             {
                 string meta = GetMetadata(node);
-                metadata[node] = meta;
                 if (!filter(meta)) return;
 
                 if (results.Count < ef || score > worstScore)
                 {
+                    metadata[node] = meta;
                     results.Enqueue(node, score);
-                    if (results.Count > ef) results.Dequeue();
+                    if (results.Count > ef)
+                    {
+                        metadata.Remove(results.Dequeue());
+                    }
                     results.TryPeek(out _, out worstScore);
                 }
             }
@@ -2862,43 +2916,36 @@ namespace Qvec.Core
             if (!_deletedIndices.Contains(entryPoint))
                 TryAdmit(entryPoint, entryScore);
 
-            int[] neighborBuffer = ArrayPool<int>.Shared.Rent(MaxNeighborsAnyLevel);
-            try
+            int slots = NeighborsAtLevel(level);
+            while (candidates.TryDequeue(out int candidateId, out float negScore))
             {
-                int slots = NeighborsAtLevel(level);
-                while (candidates.TryDequeue(out int candidateId, out float negScore))
+                // Stop only once the result set is full, since until then a worse-scoring
+                // candidate may still be the only route to a matching node.
+                if (results.Count >= ef && -negScore < worstScore)
+                    break;
+
+                if (visitedCount > visitBudget)
                 {
-                    // Stop only once the result set is full, since until then a worse-scoring
-                    // candidate may still be the only route to a matching node.
-                    if (results.Count >= ef && -negScore < worstScore)
-                        break;
-
-                    if (visited.Count > visitBudget)
-                    {
-                        budgetExhausted = true;
-                        break;
-                    }
-
-                    GetNeighborsAtLevel(candidateId, level, neighborBuffer);
-                    for (int j = 0; j < slots; j++)
-                    {
-                        int neighbor = neighborBuffer[j];
-                        if (neighbor < 0) break;
-                        if (!visited.Add(neighbor)) continue;
-                        if (_deletedIndices.Contains(neighbor)) continue;
-
-                        float score = CalculateScore(query, neighbor);
-
-                        // The frontier is deliberately unfiltered: a non-matching node is still a
-                        // valid stepping stone towards matching ones.
-                        candidates.Enqueue(neighbor, -score);
-                        TryAdmit(neighbor, score);
-                    }
+                    budgetExhausted = true;
+                    break;
                 }
-            }
-            finally
-            {
-                ArrayPool<int>.Shared.Return(neighborBuffer);
+
+                int* neighbors = NeighborPointer(candidateId, level);
+                for (int j = 0; j < slots; j++)
+                {
+                    int neighbor = neighbors[j];
+                    if (neighbor < 0) break;
+                    if (!scratch.Visit(neighbor)) continue;
+                    visitedCount++;
+                    if (_deletedIndices.Contains(neighbor)) continue;
+
+                    float score = CalculateScore(query, neighbor);
+
+                    // The frontier is deliberately unfiltered: a non-matching node is still a
+                    // valid stepping stone towards matching ones.
+                    candidates.Enqueue(neighbor, -score);
+                    TryAdmit(neighbor, score);
+                }
             }
 
             var resultArray = new (int Id, float Score, string Meta)[results.Count];
@@ -3113,6 +3160,42 @@ namespace Qvec.Core
                 prepared.Codes = new byte[_header.VectorDimension];
                 prepared.Parameters = Int8Quantizer.Quantize(prepared.Floats.AsSpan(0, _header.VectorDimension), prepared.Codes);
             }
+            return prepared;
+        }
+
+        /// <summary>
+        /// Same as <see cref="Prepare(float[])"/> but into the scratch object's buffers: the
+        /// cosine copy and the int8 codes are reused across queries instead of allocated. The
+        /// caller's array is referenced directly when no normalisation is needed.
+        /// </summary>
+        private PreparedQuery Prepare(float[] query, SearchScratch scratch)
+        {
+            int dim = _header.VectorDimension;
+            var prepared = scratch.Query;
+
+            if (_header.DistanceFunction == DistanceFunction.Cosine)
+            {
+                scratch.PreparedFloats ??= new float[dim];
+                Array.Copy(query, scratch.PreparedFloats, dim);
+                NormalizeVector(scratch.PreparedFloats);
+                prepared.Floats = scratch.PreparedFloats;
+            }
+            else
+            {
+                prepared.Floats = query;
+            }
+
+            if (_quantized)
+            {
+                scratch.QueryCodes ??= new byte[dim];
+                prepared.Codes = scratch.QueryCodes;
+                prepared.Parameters = Int8Quantizer.Quantize(prepared.Floats.AsSpan(0, dim), prepared.Codes);
+            }
+            else
+            {
+                prepared.Codes = null;
+            }
+
             return prepared;
         }
 
