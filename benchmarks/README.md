@@ -256,7 +256,10 @@ Results land in `BenchmarkDotNet.Artifacts/results/`. The float kernels are meas
 baseline on the reference machine, and what it changed about the plan, is recorded in
 [docs/design-performance.md](../docs/design-performance.md) §2.1 — in short, the kernels the
 graph walk uses are already within 5 % of `TensorPrimitives` at 768 and 1536 dimensions, and a
-single query allocates 30–68 KB, which is the first thing that programme fixes.
+single query used to allocate 30–68 KB. That was the first thing the programme fixed: after
+the query-scratch change a `Search(topK 10, ef 100)` allocates 1.48 KB (the result list only),
+gen1 collections are gone, and the single-thread 128-d query dropped from 92 to 51 µs on the
+reference machine. The before/after table is in §2.1 of the same document.
 
 ## Metric
 

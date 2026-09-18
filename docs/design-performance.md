@@ -78,6 +78,24 @@ queries** on a graph that fits in cache. At 128-d the arithmetic for a walk of t
 the order of 20–40 µs, so more than half the query is overhead. This is the §4.1 finding
 quantified, and it is why §4.1 is first in the queue.
 
+**After PR `perf-query-scratch` (same machine, same benchmark, `--job short`):**
+
+| dim | mode | mean before → after | Gen0 / 1k ops | Gen1 / 1k ops | allocated per query |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 128 | float | 92.4 → 50.9 µs (−45 %) | 0.31 | — | 1.48 KB |
+| 128 | int8 | 88.8 → 58.5 µs (−34 %) | 0.31 | — | 1.48 KB |
+| 128 | int8 rescored | 95.3 → 38.4 µs (−60 %) | 0.31 | — | 1.48 KB |
+| 768 | float | 425.7 → 386.4 µs (−9 %) | — | — | 1.48 KB |
+| 768 | int8 | 211.8 → 163.6 µs (−23 %) | 0.24 | — | 1.48 KB |
+| 768 | int8 rescored | 275.5 → 243.5 µs (−12 %) | 0.24 | — | 1.48 KB |
+
+The remaining 1.48 KB is the result: the `ef`-sized candidate array the walk returns and the
+`List<(Guid, float, string)>` handed to the caller. Gen1 collections are gone entirely, gen0
+dropped 20–70×. The 768-d float row moved least because that walk is dominated by the
+distance kernel (768 × 4 B per candidate is memory traffic, not allocation), which is §4.2's
+territory. `--job short` error bars are wide (see the artifacts), so treat the percentages as
+indicative to ±10 %; the allocation column is exact.
+
 Two of these are already suspicious as a starting point: 6.3× build scaling and 6.7× query
 scaling on 12 cores leave a third of the machine idle, and the 128-d single-thread insert rate
 is about 1,400/s while the arithmetic it has to do (an `O(M0²)` prune at 64 neighbours) is on
@@ -170,36 +188,41 @@ Ordered by (measured or expected gain × confidence) / effort; the order changed
 what to change, how to measure, and what "done" means. Items marked **profile first** are
 not to be started until a CPU profile of the reference workload confirms they matter.
 
-### 4.1 Query path allocates per query — measured, first in line
+### 4.1 Query path allocates per query — done in PR `perf-query-scratch`
 
-**Today.** `Search(float[], int, int)` calls `SearchLayerNearest(prepared, entryPoint, 0, ef)`
-with no scratch (line ~2443), so each query allocates a `HashSet<int>` (which resizes several
-times as the walk visits one to two thousand nodes), two `PriorityQueue<int,float>`, a
-`PreparedQuery`, the result array, and (in int8 mode) a `byte[dim]` for the quantised query.
-`InsertScratch` already has the right shape — an epoch-stamped visited array and reusable
-heaps — but only the insert path uses it.
+**Status.** Implemented. §2.1 "after" table: 30.8/68 KB → 1.48 KB per query, gen1 gone,
+single-thread 128-d query −34…−60 %. The 12-thread scaling re-measurement (below) is still
+owed and will land with PR `perf-workflow`'s A/B script.
 
-§2.1 puts a number on it: **30.8 KB per query at 128-d, 68 KB at 768-d, with gen1
+**Before.** `Search(float[], int, int)` called `SearchLayerNearest(prepared, entryPoint, 0, ef)`
+with no scratch, so each query allocated a `HashSet<int>` (which resized several
+times as the walk visited one to two thousand nodes), two `PriorityQueue<int,float>`, a
+`PreparedQuery`, the result array, an `ArrayPool` neighbour copy per hop, and (in int8 mode) a
+`byte[dim]` for the quantised query, then ran a LINQ `OrderByDescending.Take.Select.ToList`
+chain. `InsertScratch` already had the right shape — an epoch-stamped visited array and
+reusable heaps — but only the insert path used it.
+
+§2.1 put a number on it: **30.8 KB per query at 128-d, 68 KB at 768-d, with gen1
 collections every 1–4k queries.** At 13,540 QPS on 12 threads that is close to a gigabyte of
 garbage per second, and every gen0/gen1 collection stops all twelve query threads — the
 pattern that caps the measured scaling at 6.7× (float) on 12 cores.
 
-**Change.** A `[ThreadStatic]` or pooled `SearchScratch` (rename/generalise `InsertScratch`),
-passed from both `Search` overloads and the filtered search. Reuse the `PreparedQuery` buffer.
-The result list (`List<(Guid, float, string)>`) and the metadata strings stay — they are what
-the caller asked for.
+**Change (as landed).** `InsertScratch` renamed `SearchScratch` and extended with a reusable
+`PreparedQuery`, normalised-query buffer and int8 query-code buffer. `Search` rents one from a
+`ConcurrentBag` pool under the read lock and returns it in `finally`; inserts keep their
+`ThreadLocal` instance. `SearchLayerNearest`, `SearchLayerFiltered` and `GreedyClosest` read
+neighbour lists in place via `NeighborPointer` (safe: searches hold the read lock, and slots
+are whole int32 writes — see §4.3). The LINQ tail is replaced by a stable insertion sort that
+runs only in rescored mode (the heap already yields descending order otherwise) and a
+pre-sized result list. `SearchLayerFiltered` keeps metadata strings only for admitted nodes.
+Visiting order is unchanged, so recall and the built graph are identical by construction.
 
-**Measure.** `SearchBenchmarks` allocated-bytes column before/after (target: only the result
-list and metadata strings); `dotnet-counters` gen0/gen1 rate during a 12-thread Cohere 1M
-run; QPS at 1 and 12 threads and the ratio between them. Recall is unaffected by construction
-(same algorithm, same visiting order) — verify on a kept index.
+**Measure.** `SearchBenchmarks` allocated-bytes column before/after (done, §2.1);
+`dotnet-counters` gen0/gen1 rate during a 12-thread Cohere 1M run; QPS at 1 and 12 threads
+and the ratio between them (owed).
 
-**Done when** allocations per query are O(result size), the micro-benchmark shows it, and the
-12-thread/1-thread ratio has been re-measured and published.
-
-**Expected.** The 10k-node single-thread query should lose a meaningful share of its 92 µs at
-128-d (the arithmetic accounts for perhaps a third of it); the larger effect is on 12-thread
-scaling, where the number to beat is 6.7×.
+**Done when** allocations per query are O(result size) ✔, the micro-benchmark shows it ✔, and
+the 12-thread/1-thread ratio has been re-measured and published (pending).
 
 ### 4.2 Distance kernels — smaller than expected
 
@@ -224,19 +247,18 @@ kept index. Cohere (768-d) is not expected to move and will be measured once to 
 
 **Expected.** Up to ~1.3× on the 128-d kernel; a few percent end to end on SIFT; nothing on
 Cohere. Worth doing because SIFT is a headline dataset, but it goes after 4.1.
-### 4.3 Neighbour list copy in the walk
 
-**Today.** `SearchLayerNearest` calls `GetNeighborsAtLevel(candidateId, level, neighborBuffer)`,
-copying up to 64 ints out of the mapping into a rented buffer, then iterates the buffer.
-`NeighborPointer` already exists and is used by `MergeNeighborsAtLevel`.
+### 4.3 Neighbour list copy in the walk — done in PR `perf-query-scratch` (search side)
 
-**Change.** Iterate `NeighborPointer(candidateId, level)` directly under the read lock (the
-mapping cannot be remapped while the lock is held — the same invariant `StoredVector` relies
-on). Same for `AddNeighborConnection`'s first pass.
+**Before.** `SearchLayerNearest` called `GetNeighborsAtLevel(candidateId, level, neighborBuffer)`,
+copying up to 64 ints out of the mapping into a rented buffer, then iterated the buffer.
+`NeighborPointer` already existed and was used by `MergeNeighborsAtLevel`.
 
-**Measure.** Part of the §4.1 macro run; separate micro-benchmark on `SearchLayerNearest`.
-
-**Expected.** Small (a few percent); bundle with 4.2.
+**Change.** `SearchLayerNearest`, `SearchLayerFiltered` and `GreedyClosest` now iterate
+`NeighborPointer(candidateId, level)` directly under the read lock (the mapping cannot be
+remapped while the lock is held — the same invariant `StoredVector` relies on). Landed
+together with §4.1; not measured separately. `AddNeighborConnection`'s first pass still
+copies and belongs to §4.4.
 
 ### 4.4 Insert prune: allocation and sorting — profile first
 
@@ -286,7 +308,7 @@ on the mapped file, nothing short of a layout change helps.
 | --- | --- | --- | --- |
 | 1 | `perf-micro` | `Qvec.MicroBenchmarks` project (kernels + `TensorPrimitives` reference, one-query search with memory diagnoser), `InternalsVisibleTo`, README section; baseline recorded in §2.1 | — |
 | 2 | `perf-workflow` | `compare.ps1` A/B script, `perf.yml` (dispatch + weekly), step-summary tables, `InsertThroughputTests` prints to summary | 1 |
-| 3 | `perf-query-scratch` | §4.1 + §4.3: query-path scratch, direct neighbour pointer; allocation counters and scaling re-measured | 2 |
+| 3 | `perf-query-scratch` | §4.1 + §4.3: query-path scratch, direct neighbour pointer; micro-benchmark before/after in §2.1 — **done**; 12-thread scaling re-measurement moved to PR 2 | 1 |
 | 4 | `perf-kernels` | §4.2: 128-d dot product only, array overloads forwarded to span; SIFT QPS re-measured | 2 |
 | 5 | `perf-profile` | CPU profile of single-thread build and 12-thread build/query on the reference machine; findings appended to §2 of this document; decides whether 4.4 / 4.5 proceed | 2 |
 | 6 | `perf-insert-prune` | §4.4 if profile says so; byte-identical graph check | 5 |
