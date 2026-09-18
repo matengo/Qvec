@@ -280,6 +280,29 @@ GitHub runner on demand and weekly against the latest release tag, and writes th
 job summary. It never fails the build: a regression is a review comment, not a red X. Details
 and the reasoning are in [docs/design-performance.md](../docs/design-performance.md) §3.
 
+## CPU profiling
+
+`dotnet-trace` (install with `dotnet tool install -g dotnet-trace`) samples the benchmark
+process; `profile-summary.py` turns the speedscope export into a self/inclusive time table so
+the hot frames can be read off without a GUI.
+
+```powershell
+$env:DOTNET_SYSTEM_GLOBALIZATION_INVARIANT = '1'
+dotnet build benchmarks/Qvec.Benchmarks -c Release -o $env:TEMP/qvec-prof
+# single-thread build: sample the first three minutes (the process is stopped afterwards,
+# so the index is incomplete — fine for a profile, useless for recall)
+dotnet-trace collect --duration 00:03:00 --format speedscope -o build1.nettrace -- `
+    dotnet $env:TEMP/qvec-prof/Qvec.Benchmarks.dll --dataset sift --threads 1 --ef 40
+python benchmarks/profile-summary.py build1.speedscope.json --top 25
+python benchmarks/profile-summary.py build1.speedscope.json --callers Enter_Slowpath
+```
+
+Two things to know before reading the table. Small kernels are inlined, so distance time
+shows up as `SearchLayerNearest` self time. And on the Windows/ARM64 reference machine the
+sample walker attributes time spent *inside* a `lock` body to `Monitor.Enter_Slowpath`; that
+frame is "the locked region", not lock cost — the ablation that proved it, and the profiles
+that came out of it, are in [docs/design-performance.md](../docs/design-performance.md) §2.2.
+
 ## Metric
 
 SIFT and GIST ground truth is **Euclidean**, Cohere is **Cosine**. The benchmark defaults to the

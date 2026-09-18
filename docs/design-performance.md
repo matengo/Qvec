@@ -123,6 +123,75 @@ is about 1,400/s while the arithmetic it has to do (an `O(M0²)` prune at 64 nei
 the order of a few thousand 128-d distance evaluations per insert — that should be well under
 half a millisecond.
 
+### 2.2 CPU profiles (measured 2026-09-19, PR `perf-profile`)
+
+Reference machine on mains power (a first run on battery gave the same distribution with
+lower absolute rates; battery numbers are not quoted). `dotnet-trace collect --format
+speedscope` (EventPipe sample profiler, 1 ms), summarised by `benchmarks/profile-summary.py`
+(self time; pseudo frames excluded). Head `cabcfc9`, SIFT-1M, M = 32, `Release`, JIT.
+
+**A. Single-thread build**, first 180 s of a SIFT-1M build (~250k rows indexed):
+
+| frame (self) | share |
+| --- | ---: |
+| `SearchLayerNearest` (distance kernel and `CalculateScore` inlined into it) | 52.3 % |
+| `Monitor.Enter_Slowpath` — **an artefact, see below** | 38.9 % |
+| `PruneNeighbors` | 4.9 % |
+| `AddNeighborConnection` | 1.8 % |
+| sorting (`IntroSort`, `StableSortDescending`, `Sort` with comparer) | 0.7 % |
+| everything else, including dataset decode | < 1 % |
+
+**The `Monitor` frame is a stack-walk artefact, not lock cost.** It was ruled out in three
+steps. (1) Uncontended `lock (object)` costs ~25 ns on this machine (20 M iterations over
+1,024 stripes); at ≤ 65 lock acquisitions per level per insert that is ≈ 2 µs of a
+~350–700 µs insert, under 1 %. (2) An ablation build that skips the node locks entirely in
+the single-thread path changed nothing: siftsmall 2,850/2,737 inserts/s with locks against
+2,723/2,618 without (alternating runs), and the first 100k of SIFT-1M 1,406 against 1,218 —
+noise, if anything the wrong sign. (3) Profiling that ablation build, the `Monitor` frame is
+gone and the same share reappears as `AddNeighborConnection` 24.7 %, `PruneNeighbors` 9.4 %,
+`FindWorstNonDiverse` 4.7 % and `IntroSort` 4.6 %. The samples had been taken inside the
+`lock` bodies and the walk attributed them to the frame that took the lock; the reported
+"callers" (`LinkPending`, which only calls `LinkOne`, and in the 12-thread trace
+`Parallel.ForWorker` directly) are likewise impossible and confirm a truncated walk. Treat
+any `Monitor.Enter_Slowpath` self time in an EventPipe profile from this Windows/ARM64
+machine as "time inside a locked region" until proven otherwise.
+
+Corrected reading of the single-thread build, therefore:
+
+| phase | share |
+| --- | ---: |
+| candidate search (`SearchLayerNearest` incl. kernels) | ≈ 50 % |
+| back-linking the new node into its neighbours' lists (`AddNeighborConnection` + `FindWorstNonDiverse` + `PruneNeighbors` + sort) | ≈ 44 % |
+| selecting the new node's own neighbours (`SelectNeighborsHeuristic`, `StableSortDescending`) | < 1 % |
+
+The back-link phase is the one §2.1 already found suspicious. What it does, per neighbour
+whose list is full (the steady state on layer 0 with `M0 = 64`): re-read the 64 stored ids,
+recompute 65 `StoredSimilarity` values from the mapped vectors, sort them with an `IComparer`
+object, run `FindWorstNonDiverse` (up to 64 more `StoredSimilarity`), and when that finds
+nothing to evict fall back to the full `PruneNeighbors` — `O(M0²)`, up to ~2,000
+`StoredSimilarity` calls, two `List` allocations and a `ToArray`. Multiplied by up to 64
+neighbours per insert this rivals the candidate search itself. That is the §4.4 target, and
+it is arithmetic, not allocation: a `StoredSimilarity` reads two vectors from the mapping and
+runs the kernel, so the kernel work of §4.2 helps here as much as it helps the query.
+
+**B. 12-thread build**, full SIFT-1M (`--threads 0`, 16 sampled threads, idle-wait samples on
+pool threads included in the total): `SearchLayerNearest` 32.5 %, `Monitor` frame 26.6 %,
+`AddNeighborConnection` 6.0 %, `PruneNeighbors` 2.6 %, thread-pool waits (`LowLevelLifoSemaphore`,
+`WaitHandle`) 22 %, `GC.RunFinalizers` 6 % (finalizer thread idle). The ratio of the `Monitor`
+frame to `SearchLayerNearest` is 0.82 against 0.74 single-threaded, so real lock contention
+on the 1,024 stripes is at most a few percent of build time; the idle-wait share says the
+`Parallel.For` batches leave workers waiting at batch boundaries (50k rows per `AddEntries`
+call in the benchmark) rather than that the locks serialise them. Neither is the first thing
+to fix; §4.5 stays parked behind §4.4.
+
+**C. 12-thread query** on the index from B (`--concurrency 12 --passes 20`, ef 40 and 160;
+17,169 and 9,615 QPS under the profiler): `SearchLayerNearest` 83.9 %, `Search` 1.4 %,
+`Monitor` frame 6.0 % (caller `Search`, which takes no `lock` — the same artefact covering
+the RWLS read lock, scratch rent/return and the result sort), `Thread.Join` 6.7 % (the
+benchmark's main thread waiting). The query path is now the distance kernel plus the
+candidate heap and nothing else, which is what §4.1 set out to reach and what §4.2 has to
+attack next.
+
 ## 3. Tracking
 
 ### 3.1 Principles
@@ -292,7 +361,7 @@ remapped while the lock is held — the same invariant `StoredVector` relies on)
 together with §4.1; not measured separately. `AddNeighborConnection`'s first pass still
 copies and belongs to §4.4.
 
-### 4.4 Insert prune: allocation and sorting — profile first
+### 4.4 Insert back-link prune — profiled, proceed (PR 6)
 
 **Today.** Per insert, per level: `SelectNeighborsHeuristic` allocates `ordered`,
 `StableSortDescending` allocates an index array, a sorted copy and a closure for the
@@ -300,29 +369,49 @@ comparer, `PruneNeighbors` allocates two `List`s. `AddNeighborConnection` on a f
 steady state) allocates a `candidates` array and sorts with a comparer object. With `M0 = 64`
 these are up to ~65 back-link prunes per insert.
 
-**Change.** Move all of it into `InsertScratch` buffers; replace the comparer sort with an
-insertion sort (≤ 200 candidates after search, ≤ 65 in the back-link path — insertion sort
-wins at these sizes and is naturally stable).
+**Profile verdict (§2.2 A).** The back-link phase is ≈ 44 % of a single-thread build and it
+is dominated by `StoredSimilarity` arithmetic, not by allocation: `AddNeighborConnection`
+recomputes all 65 owner–neighbour similarities on every full list, `FindWorstNonDiverse` adds
+up to 64, and the `PruneNeighbors` fallback adds `O(M0²)`. Sorting is < 5 %; the `List`s and
+arrays are cheap by comparison.
 
-**Measure.** Micro-benchmark on the prune; then single-thread SIFT/Cohere build time and the
-graph-bytes comparison (`--keep-index`, `--threads 1`) — the graph must be byte-identical
-because the sort is stable and the arithmetic unchanged. That is a very strong check.
+**Change (in order of expected pay-off).**
+1. Cut `StoredSimilarity` calls without changing the outcome: `FindWorstNonDiverse` already
+   computes candidate-to-new-node similarities that `PruneNeighbors` recomputes when it runs
+   as the fallback; reuse them. Check how often the fallback runs at all (a counter in a
+   `Slow` test) — if it is the common case, the two-step scheme is doing the `O(M0²)` work
+   twice over and the cheaper first step should be dropped or folded in.
+2. Make the kernel behind `StoredSimilarity` as fast as the query kernel (§4.2 covers both).
+3. Only then the scratch buffers and insertion sort from the original plan, measured
+   separately, since the profile says they are worth a few percent at most.
 
-**Expected.** Unknown until profiled. The `O(M0²)` `StoredSimilarity` calls in
-`PruneNeighbors` and `FindWorstNonDiverse` — each reading two mapped vectors — may dominate,
-in which case the kernel work in 4.2 helps here too and allocation does not.
+**Measure.** Single-thread SIFT-1M build rate via `compare.ps1` (`-Threads 1`), and the
+graph comparison. Note that the `.qvec` file is **not** byte-identical between two identical
+builds (header carries an id/timestamp), so the check must compare the graph section, not the
+file hash; the `Array.Sort` in `AddNeighborConnection` is unstable and SIFT has many tied
+distances (integer-valued vectors), so replacing that sort with a stable one *will* change
+tie order and hence the graph. Either keep that sort or accept the change and prove recall
+unchanged across the whole ef sweep.
 
-### 4.5 Parallel build scaling — profile first
+**Expected.** If the fallback prune is frequent, removing the duplicate arithmetic alone
+could take a third off the back-link phase, ≈ 15 % of build time; the kernel work adds to
+that. Not to be quoted until measured.
+
+### 4.5 Parallel build scaling — profiled, parked
 
 **Today.** 6.3× on 12 cores (Cohere 100K). Candidates: the entry-point lock in `LinkPending`,
 1,024 striped `NodeLock`s (with 12 threads and 64 back-links per insert, collisions are
 frequent enough to matter), `Parallel.For` chunking, and `ArrayPool.Shared` contention.
 
-**Change.** Not decided. First: `dotnet-trace` with the `ThreadPool`/contention providers
-during a 12-thread build, and a `--threads 1,2,4,8,12` sweep to see where the curve bends.
+**Profile verdict (§2.2 B).** Lock contention is at most a few percent; the visible loss is
+pool threads waiting at the boundaries of the 50k-row `AddEntries` batches. Whatever §4.4
+removes from the critical section shortens the locked regions too, so redo this profile after
+PR 6 rather than optimising the locks now. If the batch-boundary wait is confirmed, the fix is
+on the caller's side (larger or pipelined batches in the benchmark and README guidance), not
+in `Qvec.Core`.
 
-**Expected.** If the bend is lock contention, 8–10× is plausible. If it is memory bandwidth
-on the mapped file, nothing short of a layout change helps.
+**Expected.** Unchanged: 8–10× is plausible if the remaining loss is synchronisation; nothing
+short of a layout change helps if it is memory bandwidth on the mapped file.
 
 ### 4.6 Not on the list (and why)
 
@@ -342,9 +431,9 @@ on the mapped file, nothing short of a layout change helps.
 | 2 | `perf-workflow` | `compare.ps1` A/B script, `perf.yml` (dispatch + weekly), step-summary tables, `InsertThroughputTests` prints to summary — **done**; validated by re-measuring PR 3 end to end (§2.1) | 1 |
 | 3 | `perf-query-scratch` | §4.1 + §4.3: query-path scratch, direct neighbour pointer; micro-benchmark before/after in §2.1 — **done**; Cohere 12-thread README re-measurement still owed | 1 |
 | 4 | `perf-kernels` | §4.2: 128-d dot product only, array overloads forwarded to span; SIFT QPS re-measured | 2 |
-| 5 | `perf-profile` | CPU profile of single-thread build and 12-thread build/query on the reference machine; findings appended to §2 of this document; decides whether 4.4 / 4.5 proceed | 2 |
-| 6 | `perf-insert-prune` | §4.4 if profile says so; byte-identical graph check | 5 |
-| 7 | `perf-parallel-build` | §4.5 if profile says so | 5 |
+| 5 | `perf-profile` | CPU profile of single-thread build and 12-thread build/query on the reference machine; `benchmarks/profile-summary.py`; findings in §2.2 — **done**: 4.4 proceeds (back-link arithmetic), 4.5 parked until after 6 | 2 |
+| 6 | `perf-insert-prune` | §4.4: remove duplicate `StoredSimilarity` work in the back-link path, then scratch/sort; graph-section comparison, recall sweep | 5 |
+| 7 | `perf-parallel-build` | §4.5: re-profile after 6; batch-boundary waits first, locks only if still visible | 6 |
 
 Each PR that changes `Qvec.Core` publishes a before/after row in `benchmarks/README.md`
 measured on the reference machine on the same day, with recall, per the existing convention.
@@ -361,5 +450,10 @@ measured on the reference machine on the same day, with recall, per the existing
 3. §3.2 says the prune and `SearchLayerNearest` should get internal micro-benchmarks. The
    first PR covers the kernels and the public `Search`; the internal ones are added when
    4.3/4.4 need them, so the internal surface is not widened speculatively.
-4. The "well under one percent" profile figure predates the mapped-pointer fixes and the
-   incremental prune. It should be re-taken (PR 5) before it is quoted again.
+4. ~~The "well under one percent" profile figure predates the mapped-pointer fixes and the
+   incremental prune. It should be re-taken (PR 5) before it is quoted again.~~ Re-taken in
+   §2.2: sorting and selection are indeed under one percent; the back-link arithmetic is not.
+5. The EventPipe stack-walk artefact in §2.2 (`Monitor.Enter_Slowpath` absorbing the locked
+   region) makes lock cost unmeasurable by sampling on the reference machine. If §4.5 ever
+   needs a real contention number, use the runtime's contention events
+   (`Microsoft-Windows-DotNETRuntime:Contention`) or an x64 machine for that profile.
