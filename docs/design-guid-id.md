@@ -1,36 +1,36 @@
-# Design: Guid som dokument-ID
+# Design: Guid as document ID
 
-## Bakgrund
+## Background
 
-Idag identifieras varje dokument av ett sekventiellt `int`-index som direkt mappar till en fysisk position i den minnesmappade filen:
+Today, each document is identified by a sequential `int` index that maps directly to a physical position in the memory-mapped file:
 
 ```
 offset = index * dimension * sizeof(float)
 ```
 
-Det ger O(1)-åtkomst utan lookup, men gör det omöjligt att synkronisera eller merga flera databaser — ett index i databas A har ingen relation till samma index i databas B.
+This gives O(1) access without lookup, but makes it impossible to synchronize or merge multiple databases — an index in database A has no relation to the same index in database B.
 
-## Mål
+## Goals
 
-Införa `Guid` som **logiskt dokument-ID** medan `int` behålls som **fysiskt positionsindex**. Detta möjliggör:
+Introduce `Guid` as the **logical document ID** while `int` is kept as the **physical position index**. This enables:
 
-- Deterministisk deduplicering vid synk mellan noder
-- Idempotent `AddEntry` (samma Guid = samma dokument)
-- Stabil extern referens som överlever rebuild/kompaktering
+- Deterministic deduplication when syncing between nodes
+- Idempotent `AddEntry` (same Guid = same document)
+- Stable external reference that survives rebuild/compaction
 
-## Jämförelse
+## Comparison
 
-| Aspekt | `int` index (nuläge) | `Guid` + `int` index (nytt) |
+| Aspect | `int` index (current state) | `Guid` + `int` index (new) |
 |---|---|---|
-| Lagring per post | 0 extra bytes | +16 bytes (Guid) |
-| Lookup by ID | O(1) direkt offset | O(1) via `Dictionary<Guid, int>` |
-| Synk/merge | Omöjligt (index är lokala) | Naturlig dedup via Guid |
-| Minnesoverhead | Inget | ~40 bytes/post i dictionary |
-| Uppstartstid | Direkt | Linjärt scan för att bygga Guid?index-map |
+| Storage per entry | 0 extra bytes | +16 bytes (Guid) |
+| Lookup by ID | O(1) direct offset | O(1) via `Dictionary<Guid, int>` |
+| Sync/merge | Impossible (indices are local) | Natural dedup via Guid |
+| Memory overhead | None | ~40 bytes/entry in dictionary |
+| Startup time | Direct | Linear scan to build Guid?index map |
 
-## Filformat: ny Guid-sektion
+## File format: new Guid section
 
-En ny sektion läggs till efter metadata-sektionen. Varje post är exakt 16 bytes (`sizeof(Guid)`).
+A new section is added after the metadata section. Each entry is exactly 16 bytes (`sizeof(Guid)`).
 
 ```
 ??????????????????????????  0
@@ -41,16 +41,16 @@ En ny sektion läggs till efter metadata-sektionen. Varje post är exakt 16 byte
 ?  Graph Section         ?  max * maxLayers * maxNeighbors * 4 bytes
 ??????????????????????????
 ?  Metadata Section      ?  max * 512 bytes
-??????????????????????????  ? NYTT
+??????????????????????????  ? NEW
 ?  Guid Section          ?  max * 16 bytes
 ??????????????????????????
 ```
 
-`DbHeader.Version` bumpas till `2` för att skilja det nya formatet.
+`DbHeader.Version` is bumped to `2` to distinguish the new format.
 
-## Ändringar i kod
+## Code changes
 
-### 1. Nya fält i `QvecDatabase`
+### 1. New fields in `QvecDatabase`
 
 ```csharp
 private const int GuidSize = 16;
@@ -58,14 +58,14 @@ private readonly long _guidSectionOffset;
 private readonly Dictionary<Guid, int> _guidIndex = new();
 ```
 
-### 2. Konstruktor — beräkna Guid-sektion och bygga index
+### 2. Constructor — calculate Guid section and build index
 
 ```csharp
 _guidSectionOffset = _metadataSectionOffset + metadataSpace;
 long guidSpace = (long)max * GuidSize;
 long totalSize = _guidSectionOffset + guidSpace;
 
-// Vid uppstart av befintlig databas:
+// On startup of an existing database:
 if (exists)
 {
     _headerAccessor.Read(0, out _header);
@@ -73,7 +73,7 @@ if (exists)
 }
 ```
 
-### 3. Disk I/O för Guid
+### 3. Disk I/O for Guid
 
 ```csharp
 private void WriteGuidToDisk(int index, Guid guid)
@@ -92,7 +92,7 @@ private Guid ReadGuidFromDisk(int index)
 }
 ```
 
-### 4. Index-rebuild vid uppstart
+### 4. Index rebuild at startup
 
 ```csharp
 private void RebuildGuidIndex()
@@ -107,7 +107,7 @@ private void RebuildGuidIndex()
 }
 ```
 
-### 5. Ändrad `AddEntry` — returnerar Guid, stödjer extern Guid
+### 5. Changed `AddEntry` — returns Guid, supports external Guid
 
 ```csharp
 public Guid AddEntry(float[] vector, string metadata, Guid? externalId = null)
@@ -119,7 +119,7 @@ public Guid AddEntry(float[] vector, string metadata, Guid? externalId = null)
 
         Guid docId = externalId ?? Guid.NewGuid();
 
-        // Dedup: om Guid redan finns, hoppa över
+        // Dedup: if the Guid already exists, skip
         if (_guidIndex.ContainsKey(docId))
             return docId;
 
@@ -134,7 +134,7 @@ public Guid AddEntry(float[] vector, string metadata, Guid? externalId = null)
         _guidIndex[docId] = index;
         _header.CurrentCount++;
 
-        // ... resten av HNSW-logiken oförändrad ...
+        // ... rest of the HNSW logic unchanged ...
 
         _headerAccessor.Write(0, ref _header);
         return docId;
@@ -143,19 +143,19 @@ public Guid AddEntry(float[] vector, string metadata, Guid? externalId = null)
 }
 ```
 
-### 6. Sökresultat returnerar Guid
+### 6. Search results return Guid
 
-Alla publika `Search`-metoder ändrar sin returtyp:
+All public `Search` methods change their return type:
 
 ```csharp
-// Före:
+// Before:
 List<(int Id, float Score, string Metadata)>
 
-// Efter:
+// After:
 List<(Guid Id, float Score, string Metadata)>
 ```
 
-Internt används fortfarande `int` för all graf-navigering och vektor-åtkomst.
+Internally, `int` is still used for all graph navigation and vector access.
 
 ### 7. Lookup via Guid
 
@@ -173,7 +173,7 @@ public (float[] Vector, string Metadata)? GetByGuid(Guid id)
 }
 ```
 
-### 8. Synk mellan databaser
+### 8. Sync between databases
 
 ```csharp
 public int SyncFrom(QvecDatabase source)
@@ -194,28 +194,28 @@ public int SyncFrom(QvecDatabase source)
 }
 ```
 
-## Påverkade filer
+## Affected files
 
-| Fil | Ändring |
+| File | Change |
 |---|---|
-| `Qvec.Core\QvecDatabase.cs` | Ny sektion, Guid-fält, ändrad `AddEntry`, nya metoder |
-| `Qvec.Core\PartitionedQvecDatabase.cs` | Propagera Guid genom partitioner |
-| `Qvec.Core.Client\QvecClient.cs` | Uppdatera returtyper till Guid |
-| `Qvec.Api\*` | Uppdatera API-endpoints att returnera Guid |
-| `Qvec.Console.Test\*` | Uppdatera tester |
+| `Qvec.Core\QvecDatabase.cs` | New section, Guid field, changed `AddEntry`, new methods |
+| `Qvec.Core\PartitionedQvecDatabase.cs` | Propagate Guid through partitions |
+| `Qvec.Core.Client\QvecClient.cs` | Update return types to Guid |
+| `Qvec.Api\*` | Update API endpoints to return Guid |
+| `Qvec.Console.Test\*` | Update tests |
 
-## Bakåtkompatibilitet
+## Backward compatibility
 
-- Filer med `Version == 1` saknar Guid-sektionen. Vid öppning av en v1-fil kan vi antingen:
-  - **Migrera:** Generera Guid:s för alla befintliga poster och bumpa version till 2.
-  - **Avvisa:** Kasta ett undantag som uppmanar till manuell migrering.
-- Rekommendation: automatisk migrering vid första öppning.
+- Files with `Version == 1` lack the Guid section. When opening a v1 file, we can either:
+  - **Migrate:** Generate Guids for all existing entries and bump the version to 2.
+  - **Reject:** Throw an exception that prompts manual migration.
+- Recommendation: automatic migration on first open.
 
-## Prestandabudget
+## Performance budget
 
-| Operation | Kostnad |
+| Operation | Cost |
 |---|---|
-| `AddEntry` | +1 `WriteArray` (16 bytes) — försumbart |
-| `Search` | +1 `ReadGuidFromDisk` per resultat (topK st) — försumbart |
-| Uppstart (1M poster) | ~16 MB sekventiell läsning + dictionary-allokering ? <100 ms |
-| Minne | ~56 bytes/post (16 Guid + 40 dictionary entry) ? ~56 MB vid 1M poster |
+| `AddEntry` | +1 `WriteArray` (16 bytes) — negligible |
+| `Search` | +1 `ReadGuidFromDisk` per result (topK items) — negligible |
+| Startup (1M entries) | ~16 MB sequential read + dictionary allocation ? <100 ms |
+| Memory | ~56 bytes/entry (16 Guid + 40 dictionary entry) ? ~56 MB at 1M entries |
