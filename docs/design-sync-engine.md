@@ -228,15 +228,18 @@ Regel för implementationen: allt spårningsarbete sker under det skrivlås som 
 ```csharp
 public interface ISyncPeer : IAsyncDisposable
 {
-    Guid PeerId { get; }
-    Task<ChangeBatch?> PullAsync(SyncCursor cursor, int maxItems, CancellationToken ct);
+    Guid PeerId { get; }                                                // Guid.Empty = buss (ingen enskild motpart)
+    Task<ChangeBatch?> PullAsync(SyncCursor cursor, int maxItems, CancellationToken ct);   // null = inget nytt
     Task PushAsync(ChangeBatch batch, CancellationToken ct);
-    Task<Stream?> OpenSnapshotAsync(CancellationToken ct);              // null = stöds ej
+    Task<Stream?> OpenSnapshotAsync(SyncCursor cursor, CancellationToken ct); // null = stöds ej / finns inte; cursor.Self låter en buss hoppa över egen snapshot
+    Task PublishSnapshotAsync(Func<Stream, SnapshotInfo> export, CancellationToken ct);  // no-op tillåtet
     IAsyncEnumerable<SyncSignal> WatchAsync(CancellationToken ct);      // default: tom → agenten pollar
 }
 ```
 
-`SyncCursor` är en vektorklocka `Dictionary<Guid, long>` (replika → senast sedda `Seq`). För en hubb finns en post; för en buss en per replika.
+`SyncCursor` är en vektorklocka `Dictionary<Guid, long>` (replika → senast sedda `Seq`) plus `Self`, den lokala replikans id — en cursor är "min vy", så den vet vem "jag" är och peeren kan hoppa över det egna prefixet utan att känna till agenten. För en hubb finns en post; för en buss en per replika.
+
+**Topologi avgörs av `PeerId`.** En hubb har en identitet och agenten pushar med `excludeOrigin: PeerId` (hubben har redan sina egna ändringar). På en buss (`PeerId == Guid.Empty`) pushas utan filter: ett `Upsert` som A tog emot från B skrivs även till A:s segment. Det är redundant (C läser både A:s och B:s prefix och skippar idempotent) men korrekt, och kräver ingen `onlyOrigin`-variant av `GetChanges`. Redundansen kan tas bort i 2.x med ett `onlyOrigin`-filter utan formatändring.
 
 ### 5.2 `SyncAgent`
 
@@ -252,28 +255,35 @@ await using var agent = new SyncAgent(db, peer, new SyncOptions
 await agent.StartAsync();
 ```
 
-Loop per iteration:
+Loop per iteration (`SyncOnceAsync`, även anropbar direkt utan bakgrundsloop — det är så testerna kör):
 
-1. **Push**: `db.GetChanges(state.PushedSeq, BatchSize, excludeOrigin: peer.PeerId)` → `peer.PushAsync` → `state.PushedSeq = batch.ToSeq` → spara state.
-2. **Pull**: `peer.PullAsync(state.Cursor)` → `db.ApplyChanges` → uppdatera cursor → spara state.
-3. Vid `SyncCursorTooOldException` från peer och `BootstrapFromSnapshotIfBehind`: hämta snapshot, `AdoptAsReplica`, öppna om databasen (agenten äger då `QvecDatabase`-livscykeln — se öppen fråga 7.3).
-4. Exponentiell backoff vid nätverksfel (1 s → 60 s), återställs vid lyckad iteration.
-5. `WatchAsync`-signaler kortsluter väntan på nästa iteration.
+1. **Push**: `db.GetChanges(state.PushedSeq, BatchSize, excludeOrigin)` → `peer.PushAsync` (bara icke-tomma batchar) → `state.PushedSeq = batch.ToSeq` → spara state; upprepa medan `HasMore`.
+2. **Pull**: `peer.PullAsync(state.Cursor)` → `db.ApplyChanges` → `cursor[batch.SourceReplicaId] = batch.ToSeq` → spara state; upprepa tills `null`. En batch som inte flyttar cursorn framåt är ett protokollfel (`SyncProtocolException`), inte en oändlig loop.
+3. **Snapshot-publicering** (valfritt, `SnapshotInterval`): `peer.PublishSnapshotAsync(db.ExportSnapshot)`.
+4. Vid `SyncCursorTooOldException` från **peeren** och `BootstrapFromSnapshotIfBehind`: hämta snapshot till `<db>.bootstrap`, stäng databasen, `AdoptAsReplica` med **nytt** `ReplicaId`, ersätt filen, öppna om, bygg om fältindex om `FieldIndexExtractor` finns, sätt cursor `{källa → seq}` och `PushedSeq = seq`, nollställ övriga cursorer (deras ändringar i den gamla filen är borta; omhämtning skippas idempotent). Agenten äger då `QvecDatabase`-livscykeln: `agent.Database` byts och `DatabaseReplaced` höjs. Utan flaggan bubblar undantaget upp via `IterationFailed`.
+   Nytt id är nödvändigt: filens logg är nu källans logg, så andra replikers cursorer mot det gamla id:t vore meningslösa.
+5. Vid `SyncCursorTooOldException` från **den lokala** `GetChanges` (ringen har roterat förbi `PushedSeq`, dvs. fler lokala mutationer offline än `LogCapacity`): `SyncLogOverrunException`. Agenten läker inte detta själv — dokument vars enda loggpost roterat ut kan bara nå peers via snapshot. Åtgärd: större ring, eller `PublishSnapshotAsync`.
+6. Exponentiell backoff vid fel (1 s → 60 s), återställs vid lyckad iteration. `IterationCompleted`/`IterationFailed`-events.
+7. `WatchAsync`-signaler kortsluter väntan på nästa iteration.
 
-State-filen skrivs med temp + rename. Om den saknas startar agenten med tom cursor och `PushedSeq = 0` (skickar allt, mottagaren skippar idempotent).
+State-filen (`{ replicaId, pushedSeq, cursor, lastSnapshotUtc }`, System.Text.Json med source-generator) skrivs med temp + rename. Om den saknas startar agenten med tom cursor och `PushedSeq = 0` (skickar allt i ringen, mottagaren skippar idempotent). Korrupt fil eller fil för ett annat `replicaId` → `SyncStateException` med sökväg; agenten gissar inte.
 
 ### 5.3 Wire-format `ChangeBatch`
 
 Binärt, versionerat, AOT-rent (ingen reflection):
 
 ```
-"QVCB" (4) | FormatVersion u16 | Flags u16 (bit0 = Brotli-komprimerad body)
-Dim i32 | PayloadKind u8 (1=Float, 2=Int8) | Count i32 | FromSeq i64 | ToSeq i64 | Origin Guid
-Body: Count × { Type u8 | DocumentId 16 | Hlc i64 | Origin 16 | [vector] | MetadataLen i32 | UTF-8 }
+"QVCB" (4) | FormatVersion u16 = 1 | Compression u8 (0 = ingen, 1 = Brotli, 2 = reserverad Zstd)
+PayloadKind u8 (1=Float, 2=Int8) | Dim i32 | DistanceFunction u8 | HasMore u8 | Count i32
+FromSeq i64 | ToSeq i64 | Origin Guid | BodyRawLength i32 | BodyStoredLength i32
+Body (BodyStoredLength bytes): Count × { Type u8 | DocumentId 16 | Hlc i64 | Origin 16
+      | Upsert: [Float: Dim × f32 | Int8: Dim × u8 + 16 params] MetadataLen i32 | UTF-8 }
 Crc32 (4) över allt ovan
 ```
 
-Body komprimeras med Brotli om `Flags.bit0` — metadata komprimerar bra, vektorer knappt; agenten väljer per batch utifrån metadataandel (tröskel 20 %).
+Body komprimeras om `Compression != 0` — metadata komprimerar bra, vektorer knappt; komprimeringsval är transportens sak (`DirectorySyncPeer(root, SyncCompression.Auto)`): `Auto` väljer per batch utifrån metadataandel (tröskel 20 %), `None`/`Brotli` tvingar. `ChangeBatchWire.Read(Stream)` läser exakt en batch och lämnar positionen efter den, så flera batchar kan följa på varandra i en ström.
+
+**Brotli kontra Zstandard.** Zstd är tekniskt bättre (3–5× snabbare komprimering vid jämförbar ratio, dictionary-stöd), men finns inte i BCL förrän .NET 11 (`ZstandardStream/Encoder/Decoder`). På .NET 10 skulle det kräva `ZstdSharp` (managed, långsammare än native) eller native binärer per plattform — båda strider mot Qvecs noll-beroenden/AOT-linje. Payloaden domineras dessutom av float32-vektorer som komprimerar dåligt oavsett kodek, och sync-batchar är inte CPU-kritiska. Därför Brotli (`Quality = 4`, hastighet före ratio) nu; `Compression = 2` är reserverat så att Zstd kan läggas till vid uppgradering till net11 utan formatbrytning.
 
 ### 5.4 `DirectorySyncPeer`
 
@@ -287,7 +297,7 @@ Ingår i `Qvec.Sync`. Layout i målmappen:
   manifest/<replicaId>.json                 { latestSeq, snapshotSeq, updatedUtc }
 ```
 
-`PushAsync` skriver segment till `.tmp` och byter namn. `PullAsync` listar `replicas/*` utom egen, läser manifest, hämtar segment med `toSeq > cursor[replica]`. Fungerar identiskt på lokal disk, SMB och — via `Qvec.Sync.AzureBlob` — i en blob-container. Den här peeren är också **testtransporten**: två `QvecDatabase` i samma process, en temp-mapp, ingen nätverkskod.
+`PushAsync` skriver segment till `.tmp` och byter namn, sedan manifestet på samma sätt. `PullAsync` listar `replicas/*` utom `cursor.Self`, hoppar över replikor vars manifest säger `latestSeq <= cursor[replica]`, och returnerar det äldsta segmentet med `toSeq > cursor[replica]` — ett segment per anrop; `maxItems` ignoreras eftersom segmentstorleken sattes av pushande agent. Överlappande segment (en agent som förlorat sitt state och pushat om från 0) är ofarliga tack vare idempotent apply. Segment tas aldrig bort i v1 (ingen kompaktering), så en directory-peer kastar aldrig `SyncCursorTooOldException`. `PublishSnapshotAsync` skriver `snapshot/<seq>.qvec` via tmp + rename och tar bort äldre; `OpenSnapshotAsync` väljer den främmande replika med högst `snapshotSeq`. `WatchAsync` är tom i v1. Fungerar identiskt på lokal disk, SMB och — via `Qvec.Sync.AzureBlob` — i en blob-container. Den här peeren är också **testtransporten**: två `QvecDatabase` i samma process, en temp-mapp, ingen nätverkskod.
 
 ### 5.5 `Qvec.Sync.AzureBlob`
 
@@ -311,7 +321,7 @@ Principer från tidigare faser gäller: **tester först**, noll varningar, snabb
 | **1** ✅ #36 | `sync-versions` | Headerfält 4.1, flagga, formatversion 6 villkorad på spårning, `EntryVersions`-sektion, HLC-klass, `ReplicaId`. Stämpling i alla lokala mutationer. `Vacuum`/`CreateGrown` bevarar. `EnableChangeTracking` på tom och på befintlig fil. | `Format/ChangeTrackingHeaderTests`: fälten round-trippar, CRC, v5-fil utan spårning öppnas av 2.0.0-läsare (simulerat via versionskontroll), v6 avvisas av "gammal" läsare. `HlcTests`: monotonicitet, tick-regler, `LastHlc` över omstart. `EntryVersionTests`: version följer GUID genom `UpdateVector`, överlever `Vacuum` och grow. | Alla befintliga tester gröna; nya filer utan spårning är byte-identiska med 2.0.0; `AddEntries` 1M utan spårning inom mätbrus mot 2.0.0 på referensmaskinen. |
 | **2** ✅ #37 | `sync-changelog` | `ChangeLog`-ring, `ChangeRecord`, `Delete`-tombstoner, `_deletedVersions`, `GetChanges` med koalescering och `excludeOrigin`, `ApplyChanges` med LWW, `OldestChangeSeq`, `SyncCursorTooOldException`. Fältindex-extractor som egenskap. Ta bort `SyncFrom` (ersätts; markera `[Obsolete]` i 2.1, ta bort i 3.0). | `ChangeLogTests`: append, rotation, krasch-simulering (record bortom count ignoreras), packning vid grow. `GetChangesTests`: koalescering, delete efter upsert, cursor för gammal. `ApplyChangesTests`: idempotens, LWW båda riktningar, delete vinner över äldre upsert, upsert vinner över äldre delete, egen ändring tillbaka = skipped, dim-fel = rejected, int8→float = rejected, float→int8 = applied. **Konvergenstest**: två databaser, slumpade interleavade mutationer offline, byt batchar i båda riktningar tills tomt → identisk `(Guid, Version, Metadata)`-mängd. | Konvergenstestet grönt 1 000 iterationer med seed-loggning. |
 | **3** ✅ | `sync-snapshot` | `ExportSnapshot`, `AdoptAsReplica`. | Snapshot-fil öppnas, är hälsosam, har källans `ReplicaId`/`ChangeSeq`; efter `Adopt` nytt id, versioner intakta; delta från `sourceSeq` ger konvergens utan dubbletter. | Bootstrap 1M-fil = filkopiering, ingen omindexering (Slow-test mäter). |
-| **4** | `sync-agent` | Nytt projekt `Qvec.Sync`: `ISyncPeer`, `SyncCursor`, `ChangeBatch`-wire (5.3) med Brotli, `SyncAgent` (5.2) med state-fil och backoff, `DirectorySyncPeer` (5.4). NuGet-metadata, AOT-kompilering i CI (som `Qvec.Core`). | `ChangeBatchWireTests`: round-trip, CRC-fel, versionsfel, komprimerad/okomprimerad. `DirectorySyncPeerTests`: segmentnamn, tmp+rename, manifest, ignorerar egen prefix. `SyncAgentTests` (in-process, temp-mapp): två agenter konvergerar; tre agenter i stjärna; agent startad utan state skickar allt och mottagaren skippar; agent bakom ringen bootstrappar från snapshot; state-fil korrupt → tydligt fel; avbryt mitt i → återupptar. | Exempel i `samples/` som kör två processer mot samma mapp. |
+| **4** ✅ | `sync-agent` | Nytt projekt `Qvec.Sync`: `ISyncPeer`, `SyncCursor`, `ChangeBatch`-wire (5.3) med Brotli, `SyncAgent` (5.2) med state-fil och backoff, `DirectorySyncPeer` (5.4). NuGet-metadata, AOT-kompilering i CI (som `Qvec.Core`). | `ChangeBatchWireTests`: round-trip, CRC-fel, versionsfel, komprimerad/okomprimerad. `DirectorySyncPeerTests`: segmentnamn, tmp+rename, manifest, ignorerar egen prefix. `SyncAgentTests` (in-process, temp-mapp): två agenter konvergerar; tre agenter i stjärna; agent startad utan state skickar allt och mottagaren skippar; agent bakom ringen bootstrappar från snapshot; state-fil korrupt → tydligt fel; avbryt mitt i → återupptar. | Exempel i `samples/Qvec.Samples.Sync` som kör två processer mot samma mapp (`add`/`list`/`watch`). Noterat: på en buss återannonseras tillämpade främmande rader under eget prefix och skippas av övriga — ett par tysta varv innan `DidWork` blir falskt. |
 | **5** | `sync-docs` | README: nytt avsnitt "Sync" med ärlig text om LWW, ringretention, klockskev och payload-kompatibilitet. `docs/design-format.md`: sektion 11/12, headerfält, version 6. `benchmarks/README.md`: kostnad för spårning (skrivgenomströmning med/utan). Roadmap uppdaterad. | Benchmark: `AddEntries` 1M med och utan spårning; `GetChanges` 100k; `ApplyChanges` 100k. | Ingen påstådd siffra utan mätning på referensmaskinen. |
 | **6** | `sync-azure-blob` | Nytt paket `Qvec.Sync.AzureBlob` med `BlobSyncPeer` (5.5). | Integrationstester mot Azurite i CI (`Slow`), samma testsvit som `DirectorySyncPeer` via delad abstrakt testklass. | Publiceras som eget NuGet-paket. |
 | **7** | `sync-api-hub` | `Qvec.Api` endpoints (5.6) + `HttpSyncPeer`. | `Qvec.Api.Tests` med `WebApplicationFactory`: push/pull/snapshot/SSE; auth via befintlig API-nyckel. | Valfritt; kan skjutas till efter release. |
@@ -328,8 +338,8 @@ Beslut föreslås; avvikelse ändrar planen ovan.
 
 1. **Loggkapacitet.** Förslag: `MaxCount` records (64 B vardera). Alternativ: tidsbaserad retention — svårare att garantera i en ring; avråds.
 2. **Version 6 villkorad på spårning** (4.1) kontra alltid 6 i 2.1. Förslag: villkorad, så att 2.0.0-läsare kan läsa ospårade 2.1-filer.
-3. **Vem äger `QvecDatabase` vid snapshot-bootstrap?** Agenten måste stänga och öppna om filen. Förslag: `SyncAgent` tar en `Func<QvecDatabase>`-fabrik och exponerar `agent.Database`; alternativt kastar agenten `SnapshotRequiredException` och låter appen sköta det. Fabriken är bekvämare; undantaget är explicitare. Förslag: fabrik, med undantaget som fallback när ingen fabrik givits.
-4. **`excludeOrigin` vid buss-topologi.** På en buss pushar varje replika sitt eget segment; ett `Upsert` som replikan tog emot från B ska inte skrivas till A:s segment (B har det redan). Men C som bara ser A:s segment missar då B:s ändring om C inte också läser B:s prefix. Regel: på bussen läser alla alla prefix, och `excludeOrigin` används **inte** vid push (bara mot hubb). Agenten får `SyncTopology { Hub, Bus }`.
+3. **Vem äger `QvecDatabase` vid snapshot-bootstrap?** *Beslut (PR 4):* agenten, men bara när `BootstrapFromSnapshotIfBehind = true`. Den öppnar om via `QvecDatabase.Open(db.FilePath)`, exponerar `agent.Database` och höjer `DatabaseReplaced`. Ingen fabrik behövs eftersom filen bär alla parametrar. Utan flaggan bubblar `SyncCursorTooOldException` upp och appen bestämmer.
+4. **`excludeOrigin` vid buss-topologi.** *Beslut (PR 4):* på bussen läser alla alla prefix och `excludeOrigin` används **inte** vid push (bara mot hubb). Ingen separat `SyncTopology`-enum: `ISyncPeer.PeerId == Guid.Empty` betyder buss. Se 5.1.
 5. **Ren int8 → float-mottagare** avvisas (4.10). Alternativ: tillåt med dekvantiserad vektor och en `Approximate`-flagga i versionen. Förslag: avvisa i v1; det är ärligare.
 6. **`AddEntries` parallell + logg.** Loggappend i insättningsordning kräver att seq tas ut i ordning men graf-arbetet kan ske parallellt. Förslag: ta ut `(slot, seq, hlc)` för hela batchen under låset först, som redan görs för slots.
 7. **Kryptering av segment** i buss-läge. Förslag: utanför v1; dokumentera att lagrets ACL är säkerhetsgränsen.

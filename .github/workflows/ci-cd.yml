@@ -56,6 +56,9 @@ jobs:
       - name: Publish Qvec.Api with Native AOT
         run: dotnet publish Qvec.Api/Qvec.Api.csproj --configuration Release -r linux-x64 /p:PublishAot=true --self-contained true
 
+      - name: Publish sync sample with Native AOT
+        run: dotnet publish samples/Qvec.Samples.Sync/Qvec.Samples.Sync.csproj --configuration Release -r linux-x64 /p:PublishAot=true --self-contained true
+
   publish:
     name: Publish NuGet Packages
     needs: build-and-test
@@ -98,6 +101,12 @@ jobs:
       - name: Pack Qvec.Core.Client
         run: |
           dotnet pack Qvec.Core.Client/Qvec.Core.Client.csproj \
+            --no-build --configuration Release --output ./packages \
+            /p:Version=${{ steps.version.outputs.VERSION }}
+
+      - name: Pack Qvec.Sync
+        run: |
+          dotnet pack Qvec.Sync/Qvec.Sync.csproj \
             --no-build --configuration Release --output ./packages \
             /p:Version=${{ steps.version.outputs.VERSION }}
 
