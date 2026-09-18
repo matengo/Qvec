@@ -3426,7 +3426,7 @@ namespace Qvec.Core
                 ? NegativeSquaredDistanceUnsafe(query, stored, dim)
                 : DotProductUnsafe(query, stored, dim);
 
-        private static unsafe float NegativeSquaredDistanceUnsafe(float[] left, float* right, int dim)
+        internal static unsafe float NegativeSquaredDistanceUnsafe(float[] left, float* right, int dim)
         {
             int i = 0;
             var accumulator = Vector<float>.Zero;
@@ -3452,7 +3452,7 @@ namespace Qvec.Core
         }
 
         // SIMD DotProduct that works directly against a raw pointer
-        private static unsafe float DotProductUnsafe(float[] left, float* right, int dim)
+        internal static unsafe float DotProductUnsafe(float[] left, float* right, int dim)
         {
             int i = 0;
             float dot = 0;

@@ -24,6 +24,7 @@
   </Folder>
   <Folder Name="/benchmarks/">
     <Project Path="benchmarks/Qvec.Benchmarks/Qvec.Benchmarks.csproj" />
+    <Project Path="benchmarks/Qvec.MicroBenchmarks/Qvec.MicroBenchmarks.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/Qvec.Api.Tests/Qvec.Api.Tests.csproj" />

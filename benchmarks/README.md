@@ -238,6 +238,26 @@ dotnet run -c Release --project benchmarks/Qvec.Benchmarks -- --dataset sift --t
 
 `--sync-items` and `--sync-batch` change the size of the sync step; `--sync-items 0` skips it.
 
+## Micro-benchmarks
+
+`benchmarks/Qvec.MicroBenchmarks` is a [BenchmarkDotNet](https://benchmarkdotnet.org/) project
+for the pieces the dataset benchmark cannot separate: the distance kernels on their own, the int8
+quantise/dequantise/dot path, and one `Search` call on a 10,000-node in-memory-sized index with
+the memory diagnoser on. It needs no download and takes a few minutes.
+
+```bash
+dotnet run -c Release --project benchmarks/Qvec.MicroBenchmarks -- --list flat
+dotnet run -c Release --project benchmarks/Qvec.MicroBenchmarks -- --filter '*FloatKernel*'
+dotnet run -c Release --project benchmarks/Qvec.MicroBenchmarks -- --filter '*Search*' --job short
+```
+
+Results land in `BenchmarkDotNet.Artifacts/results/`. The float kernels are measured next to
+`System.Numerics.Tensors.TensorPrimitives` as a "how fast can this machine go" reference. The
+baseline on the reference machine, and what it changed about the plan, is recorded in
+[docs/design-performance.md](../docs/design-performance.md) §2.1 — in short, the kernels the
+graph walk uses are already within 5 % of `TensorPrimitives` at 768 and 1536 dimensions, and a
+single query allocates 30–68 KB, which is the first thing that programme fixes.
+
 ## Metric
 
 SIFT and GIST ground truth is **Euclidean**, Cohere is **Cosine**. The benchmark defaults to the
