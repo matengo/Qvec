@@ -15,6 +15,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\Qvec.Core\Qvec.Core.csproj" />
+    <ProjectReference Include="..\..\Qvec.Sync\Qvec.Sync.csproj" />
   </ItemGroup>
 
   <ItemGroup>

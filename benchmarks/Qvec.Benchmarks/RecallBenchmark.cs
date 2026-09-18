@@ -1,6 +1,7 @@
 using System.Buffers.Binary;
 using System.Diagnostics;
 using Qvec.Core;
+using Qvec.Core.Sync;
 
 namespace Qvec.Benchmarks;
 
@@ -97,7 +98,9 @@ public static class RecallBenchmark
             // default, so without this two runs of the identical command produce two different
             // graphs and recall moves by a point or two for no visible reason.
             indexSeed: options.IndexSeed,
-            quantization: options.Quantization);
+            quantization: options.Quantization,
+            // The whole build must fit in the ring so the sync step can read all of it back.
+            changeTracking: options.ChangeTracking ? new ChangeTrackingOptions { LogCapacity = Math.Max(dataset.Base.Count, 1024) } : null);
 
         TimeSpan buildTime;
         if (reuse)
@@ -121,6 +124,10 @@ public static class RecallBenchmark
         Console.WriteLine(
             (reuse ? "Reused, " : $"Built in {buildTime.TotalSeconds:F1}s ({dataset.Base.Count / Math.Max(buildTime.TotalSeconds, 0.001):N0} inserts/s), ") +
             $"file {fileSizeBytes / 1024.0 / 1024.0:F1} MiB.");
+
+        SyncCostReport? syncCost = options.ChangeTracking && options.SyncItems > 0
+            ? SyncCostBenchmark.Measure(db, options.SyncItems, options.SyncBatchSize)
+            : null;
 
         var points = new List<RecallQpsPoint>();
         foreach (int efSearch in options.EfSearchSweep)
@@ -147,7 +154,9 @@ public static class RecallBenchmark
             options.BuildThreads <= 0 ? Environment.ProcessorCount : options.BuildThreads,
             buildTime,
             fileSizeBytes,
-            points);
+            points,
+            options.ChangeTracking,
+            syncCost);
     }
 
     private static TimeSpan BuildIndex(QvecDatabase db, AnnDataset dataset, BenchmarkOptions options)
@@ -332,6 +341,15 @@ public sealed class BenchmarkOptions
     /// <summary>Open an existing index at <see cref="IndexPath"/> instead of rebuilding it.</summary>
     public bool ReuseIndex { get; init; }
 
+    /// <summary>Build with change tracking enabled and measure the sync step afterwards.</summary>
+    public bool ChangeTracking { get; init; }
+
+    /// <summary>Documents to push through GetChanges/wire/ApplyChanges when tracking is on; 0 skips it.</summary>
+    public int SyncItems { get; init; } = 100_000;
+
+    /// <summary>Documents per ChangeBatch in the sync step.</summary>
+    public int SyncBatchSize { get; init; } = 500;
+
     /// <summary>
     /// Seed for the HNSW layer assignment, so a published curve can be reproduced exactly.
     /// </summary>
@@ -353,7 +371,9 @@ public sealed record BenchmarkReport(
     int BuildThreads,
     TimeSpan BuildTime,
     long FileSizeBytes,
-    IReadOnlyList<RecallQpsPoint> Points)
+    IReadOnlyList<RecallQpsPoint> Points,
+    bool ChangeTracking = false,
+    SyncCostReport? SyncCost = null)
 {
     /// <summary>Renders the run as a Markdown section, parameters included.</summary>
     public string ToMarkdown(string hardware)
@@ -361,7 +381,7 @@ public sealed record BenchmarkReport(
         var writer = new StringWriter();
 
         writer.WriteLine($"Dataset: **{Dataset}** — {BaseCount:N0} base vectors, {Dimension} dimensions, {QueryCount:N0} queries.");
-        writer.WriteLine($"Metric: `{Distance}`. Index: `maxNeighbors = {MaxNeighbors}`, `maxLayers = {MaxLayers}`, `quantization = {Quantization}`.");
+        writer.WriteLine($"Metric: `{Distance}`. Index: `maxNeighbors = {MaxNeighbors}`, `maxLayers = {MaxLayers}`, `quantization = {Quantization}`, change tracking {(ChangeTracking ? "on" : "off")}.");
         writer.WriteLine($"Build: {BuildTime.TotalSeconds:F1} s ({BaseCount / Math.Max(BuildTime.TotalSeconds, 0.001):N0} inserts/s, {BuildThreads} build thread{(BuildThreads == 1 ? "" : "s")}). File: {FileSizeBytes / 1024.0 / 1024.0:F1} MiB.");
         writer.WriteLine($"Hardware: {hardware}. {(Concurrency <= 1 ? "Single-threaded queries." : $"{Concurrency} concurrent query threads; QPS is aggregate, latency is estimated per query under that load.")}");
         writer.WriteLine();
@@ -373,6 +393,12 @@ public sealed record BenchmarkReport(
             writer.WriteLine(
                 $"| {point.EfSearch} | {point.RecallAt1:P1} | {point.RecallAtK:P1} | " +
                 $"{point.QueriesPerSecond:N0} | {point.MeanLatencyMs:F3} ms |");
+        }
+
+        if (SyncCost is not null)
+        {
+            writer.WriteLine();
+            writer.Write(SyncCost.ToMarkdown());
         }
 
         return writer.ToString();

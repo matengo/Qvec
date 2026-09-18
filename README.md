@@ -24,6 +24,7 @@ Unlike client-server vector DBs, Qvec runs in-process, using **MemoryMappedFiles
 *   **Guid Document IDs:** `AddEntry` returns a stable `Guid` document identifier; external IDs can be supplied for deduplication and sync scenarios.
 *   **Update and Delete:** Supports tombstone-based delete, metadata updates, and vector updates by delete-and-reinsert. `Vacuum()` compacts the file, reuses tombstoned rows, reclaims orphaned metadata, and rebuilds the HNSW graph.
 *   **Metadata Filtering:** General metadata predicates are supported after HNSW retrieval; `[QvecIndexed]` equality filters can pre-filter via an in-memory inverted index.
+*   **Opt-in Sync:** Turn on change tracking and the file carries a replica id, a hybrid-logical-clock version per document and a change-log ring. The separate `Qvec.Sync` package replicates between instances over a shared directory with deterministic last-write-wins, and bootstraps new nodes by copying the file instead of rebuilding the index. Off by default; untracked files are byte-identical to 2.0. See [Sync](#-sync).
 *   **AOT-Friendly Core:** `Qvec.Core` is dependency-free and avoids JSON/reflection requirements. The typed client currently uses reflection and expression compilation; see the AOT notes below.
 
 ---
@@ -96,6 +97,12 @@ Or for the typed client:
 
 ```bash
 dotnet add package Qvec.Core.Client
+```
+
+And for replication between instances (see [Sync](#-sync)):
+
+```bash
+dotnet add package Qvec.Sync
 ```
 
 > **Upgrading from 1.0.x:** 2.0 is a rewrite. The on-disk format (v5) is not readable by 1.0.x and 1.0.x files are rejected with `QvecFormatException`; there is no in-place migration. Export from the old database and re-insert into a new one.
@@ -299,6 +306,64 @@ var client = new QvecClient<Product>(
 
 ---
 
+## 🔄 Sync
+
+Qvec can replicate between instances — two desktops, an edge gateway and a server, a fleet of kiosks. It is **opt-in**: a database created without `changeTracking:` is exactly the file 2.0 wrote and pays nothing. With tracking on, `Qvec.Core` records what changed; the `Qvec.Sync` package moves those changes between replicas.
+
+### What the core records
+
+Pass `changeTracking: new ChangeTrackingOptions()` when creating a database (or call `EnableChangeTracking()` on an existing one, which stamps every live row and writes one change record per row). The file is then written as format **version 6** and carries:
+
+- a **`ReplicaId`** (a `Guid`) identifying this copy;
+- a **version per document** — a 64-bit hybrid logical clock (48 bits of wall-clock milliseconds, a 16-bit counter) plus the origin replica id, stamped on every insert, update and delete;
+- a **change-log ring** — a fixed-size ring (`ChangeTrackingOptions.LogCapacity`, default = the row capacity `max`, 64 bytes per slot) of `(seq, document, version, operation)`; `db.ChangeSeq` is the latest sequence number, `db.OldestChangeSeq` the oldest still in the ring.
+
+Three methods expose it: `GetChanges(sinceSeq, maxItems)` returns a `ChangeBatch` with the vectors and metadata of the affected documents; `ApplyChanges(batch)` merges a batch into another replica and reports `Applied`/`Skipped`/`Rejected`; `ExportSnapshot(stream)` writes a consistent copy of the whole file for bootstrapping.
+
+### Running an agent
+
+```csharp
+using Qvec.Core;
+using Qvec.Core.Sync;
+using Qvec.Sync;
+
+using var db = File.Exists(path)
+    ? QvecDatabase.Open(path)
+    : new QvecDatabase(path, dim: 768, max: 100_000, changeTracking: new ChangeTrackingOptions());
+
+// Any directory every replica can reach: a network share, a synced folder, a mounted volume.
+await using var peer = new DirectorySyncPeer(@"\\fileserver\qvec-sync");
+await using var agent = new SyncAgent(db, peer, new SyncOptions
+{
+    PollInterval = TimeSpan.FromSeconds(5),
+    BootstrapFromSnapshotIfBehind = true,   // copy a snapshot instead of failing when too far behind
+    SnapshotInterval = TimeSpan.FromHours(1),
+});
+
+agent.IterationCompleted += r => { if (r.Applied > 0) Console.WriteLine($"applied {r.Applied} remote changes"); };
+agent.DatabaseReplaced += fresh => { /* re-point your references after a snapshot bootstrap */ };
+
+agent.Start();                 // background loop: push own changes, pull everyone else's
+// ... or drive it yourself:
+SyncIterationResult once = await agent.SyncOnceAsync();
+```
+
+`SyncAgent` pushes its own unsent changes in `ChangeBatch`es, pulls the other replicas' batches and applies them, and persists its cursor (`SyncOptions.StatePath`, default next to the database) so a restart continues where it stopped. Every batch is CRC-checked and, by default (`SyncCompression.Auto`), Brotli-compressed when metadata is a meaningful share of the payload — dense float vectors do not compress, so those go out raw. `Qvec.Sync` has no cloud SDK dependency; `DirectorySyncPeer` is plain `System.IO`. The `ISyncPeer` interface is public, so another transport (object store, HTTP hub) is a class, not a fork. A runnable two-process example lives in [`samples/Qvec.Samples.Sync`](samples/Qvec.Samples.Sync).
+
+### What you should know before relying on it
+
+- **Conflicts are resolved by last-write-wins, per document.** The document version with the greater HLC wins; ties break on origin replica id. Concurrent edits to the same document on two replicas lose one of them — silently, deterministically, the same way on every replica. A delete is a version like any other, so a later update on another replica resurrects the document. There is no field-level merge.
+- **Clock skew is bounded, not eliminated.** The HLC never goes backwards and advances past anything it receives, so causally later writes always win. Two *independent* writes are ordered by wall clock; a replica whose clock runs ahead wins those races. Keep NTP running.
+- **The change log is a ring.** A replica that has been offline longer than the ring covers cannot catch up incrementally: `GetChanges` throws `SyncCursorTooOldException` on the source side, the agent surfaces it as `SyncLogOverrunException`, or — with `BootstrapFromSnapshotIfBehind` — replaces the local file with the newest published snapshot. The bootstrapped copy gets a **new `ReplicaId`** and any unsent local changes are lost; `DatabaseReplaced` fires so you can re-point references. Size `LogCapacity` for the longest outage you want to survive.
+- **Payloads must match.** Replicas must share dimension (checked — `ApplyChanges` throws) and distance function (not checked — your responsibility). Float and `Int8Rescored` replicas send floats, which any replica can apply (int8 replicas quantize on the way in). A plain `Int8` replica only has codes to send, and those are **rejected** by float and `Int8Rescored` replicas; `ApplyResult.Items` carries the reason and `SyncIterationResult.Rejected` counts them.
+- **The directory transport echoes.** Every replica publishes its applied changes under its own prefix, so a change fans out through the folder and other replicas skip what they already have. Cheap and dependency-free, but the folder grows with every hop and it takes a couple of quiet polls before an idle fleet reports `DidWork == false`.
+- **Field indexes are rebuilt, not synced.** `ApplyChanges` keeps the typed client's in-memory inverted index current like any other mutation; after a snapshot bootstrap the agent rebuilds it from scratch if `SyncOptions.FieldIndexExtractor` is set.
+- **Cost.** Change tracking adds 24 bytes per row for the version plus 64 bytes per ring slot, and stamps one version and writes one log record per mutation. Measured numbers are in [benchmarks/README.md](benchmarks/README.md#change-tracking-cost).
+
+The full design — file layout, HLC rules, the wire format and what was deliberately left out — is in [docs/design-sync-engine.md](docs/design-sync-engine.md) and [docs/design-format.md](docs/design-format.md).
+
+---
+
 ## 🎯 Use Cases
 
 Qvec is built as an **embedded** vector database — no server, no network overhead, just a library running in your process. This makes it suitable for scenarios where low latency, offline capability, and a small deployment footprint matter:
@@ -323,7 +388,8 @@ Qvec is built as an **embedded** vector database — no server, no network overh
 3. **Graph Store:** Hierarchical adjacency lists for HNSW layers.
 4. **Metadata Store:** Fixed-size 512-byte UTF-8 slots for caller-supplied metadata strings.
 5. **ID and Tombstone Stores:** Stable `Guid` document IDs plus soft-delete markers.
-6. **Optional Inverted Index:** In-memory equality index rebuilt by the typed client when an extractor is supplied.
+6. **Entry Versions and Change Log (version 6, opt-in):** A hybrid-logical-clock version and origin replica per row, plus a fixed-size ring of change records that peers pull from. Present only when change tracking is enabled.
+7. **Optional Inverted Index:** In-memory equality index rebuilt by the typed client when an extractor is supplied.
 
 ## ☁️ Cloud Readiness
 
@@ -333,9 +399,9 @@ Planned cloud work is tracked in design documents and the roadmap below.
 
 ## 📜 Roadmap / Not yet implemented
 
-- **Storage format v5** — The on-disk format is self-describing (magic, version, CRC-32 over the header, a section table, and a `WriteInProgress` flag). There is **no migration** from earlier formats; older files are rejected with `QvecFormatException`.
+- **Storage format v5 / v6** — The on-disk format is self-describing (magic, version, CRC-32 over the header, a section table, and a `WriteInProgress` flag). Files with change tracking are written as v6; files without stay v5 and readable by 2.0. There is **no migration** from earlier formats; older files are rejected with `QvecFormatException`.
 - **int8 scalar quantization** — ✅ Done. `quantization: VectorQuantization.Int8` stores one byte per dimension and scores on integers. `VectorQuantization.Int8Rescored` additionally keeps the floats and re-ranks the candidates on them, closing the recall gap at ~1.25× float storage.
-- **Sync Engine** — Opt-in replication between Qvec instances. Not implemented. The [design](docs/design-sync-engine.md) puts change tracking in the core (a replica id, a hybrid-logical-clock version per document and a fixed-size change-log ring in the file), resolves conflicts with deterministic last-write-wins, bootstraps new nodes by copying the `.qvec` file instead of rebuilding the index, and keeps transports pluggable: a directory/SMB share, an object store (Azure Blob / S3-compatible, separate package) or `Qvec.Api` as a hub. No cloud dependency in `Qvec.Core` or the planned `Qvec.Sync` package.
+- **Sync Engine** — ✅ Core done in 2.1: opt-in change tracking in `Qvec.Core` (replica id, HLC version per document, change-log ring, `GetChanges`/`ApplyChanges`/`ExportSnapshot`) and the `Qvec.Sync` package with `SyncAgent`, persisted cursors, CRC-checked, optionally Brotli-compressed batches, snapshot bootstrap and the `DirectorySyncPeer` transport (any shared folder). See [Sync](#-sync) and the [design](docs/design-sync-engine.md). Remaining: an object-store transport (`Qvec.Sync.AzureBlob`, S3-compatible) and `Qvec.Api` as a hub peer; the `ISyncPeer` interface they plug into is already public.
 - **Azure Blob Storage and Managed Identity integration** — Planned as the `Qvec.Sync.AzureBlob` transport; no Azure SDK dependency is shipped today.
 - **Container packaging** — A `Dockerfile` for `Qvec.Api` is included. Chiseled base images are not used yet.
 - **ASP.NET health-check integration** — The core exposes `IsHealthy()` and the sample API maps `/health`; packaged Kubernetes/Azure health-check wiring is not implemented yet.

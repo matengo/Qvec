@@ -1,11 +1,14 @@
-# Design: Filformat (aktuell version 5)
+# Design: Filformat (aktuell version 5, version 6 med change tracking)
 
 > **Om namngivningen.** Layouten i det här dokumentet infördes som formatversion 4 och kallas
-> därför "v4" i löptexten nedan. Headerfältet `Version` är idag **5** (`CurrentFormatVersion`):
+> därför "v4" i löptexten nedan. Headerfältet `Version` är idag **5** (`CurrentFormatVersion`)
+> för filer utan change tracking och **6** (`ChangeTrackingFormatVersion`) för filer med:
 > version 5 bumpades när baslagret fick dubbel fan-out (`M0 = 2 * MaxNeighbors`) och
-> ändrade `Graph.ElementSize`, se [Version och kompatibilitet](#version-och-kompatibilitet).
-> Allt som sägs om "v4-reader", "v4-fil" osv. gäller alltså även version 5, om inte annat
-> anges. Nästa planerade bump är version 6 för [sync-spårning](design-sync-engine.md).
+> ändrade `Graph.ElementSize`; version 6 lägger till headerfälten 184..239 och sektionerna
+> `EntryVersions`/`ChangeLog` för [sync-spårning](design-sync-engine.md), se
+> [Version och kompatibilitet](#version-och-kompatibilitet).
+> Allt som sägs om "v4-reader", "v4-fil" osv. gäller alltså även version 5 och 6, om inte annat
+> anges.
 
 ## Bakgrund
 
