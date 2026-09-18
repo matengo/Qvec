@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <PublishAot>true</PublishAot>
+    <IsAotCompatible>true</IsAotCompatible>
+    <Description>Replication for Qvec: change-batch wire format, sync agent and pluggable peers (directory/SMB). Requires change tracking on the database.</Description>
+    <PackageTags>vector-database;embeddings;sync;replication;aot;dotnet</PackageTags>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.IO.Hashing" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Qvec.Core\Qvec.Core.csproj" />
+  </ItemGroup>
+
+</Project>

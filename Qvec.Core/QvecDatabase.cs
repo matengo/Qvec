@@ -434,6 +434,9 @@ namespace Qvec.Core
         }
 
         /// <summary>Vektordimensionen databasen skapades med.</summary>
+        /// <summary>Absolute path of the database file.</summary>
+        public string FilePath => _path;
+
         public int VectorDimension => _header.VectorDimension;
 
         /// <summary>The distance function this database was created with, read from its header.</summary>
