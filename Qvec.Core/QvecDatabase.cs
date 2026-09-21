@@ -4,6 +4,7 @@ using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.IO.MemoryMappedFiles;
 using System.Numerics;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
 using Qvec.Core.Format;
@@ -1069,6 +1070,15 @@ namespace Qvec.Core
         }
 
         // --- CORE: SIMD MATH ---
+        //
+        // One implementation per metric, on managed refs, and every public/internal overload
+        // forwards to it. Four independent vector accumulators (16 floats per iteration on
+        // 4-lane NEON, 32 on AVX2) keep the FMA pipeline busy instead of serialising on a
+        // single accumulator chain, and the horizontal reduction happens once at the end.
+        // Accumulating in vectors rather than `Vector.Dot` per iteration changes the order in
+        // which partial sums are added, so results can differ from a scalar loop in the last
+        // bits; the same kernel serves build and search, so the graph and the queries agree.
+
         public static float DotProduct(float[] left, float[] right)
         {
             return DotProduct(left, right, left.Length);
@@ -1076,34 +1086,47 @@ namespace Qvec.Core
 
         internal static float DotProduct(ReadOnlySpan<float> left, ReadOnlySpan<float> right)
         {
-            int i = 0;
-            float dot = 0;
-            int vectorSize = Vector<float>.Count;
-            int count = Math.Min(left.Length, right.Length);
-
-            ref float l = ref MemoryMarshal.GetReference(left);
-            ref float r = ref MemoryMarshal.GetReference(right);
-            for (; i <= count - vectorSize; i += vectorSize)
-            {
-                dot += Vector.Dot(
-                    Vector.LoadUnsafe(ref l, (nuint)i),
-                    Vector.LoadUnsafe(ref r, (nuint)i));
-            }
-            for (; i < count; i++) dot += left[i] * right[i];
-            return dot;
+            return DotProductCore(
+                ref MemoryMarshal.GetReference(left),
+                ref MemoryMarshal.GetReference(right),
+                Math.Min(left.Length, right.Length));
         }
 
         public static float DotProduct(float[] left, float[] right, int count)
         {
-            int i = 0;
-            float dot = 0;
-            int vectorSize = Vector<float>.Count;
+            ArgumentOutOfRangeException.ThrowIfGreaterThan((uint)count, (uint)Math.Min(left.Length, right.Length));
+            return DotProductCore(
+                ref MemoryMarshal.GetArrayDataReference(left),
+                ref MemoryMarshal.GetArrayDataReference(right),
+                count);
+        }
 
-            for (; i <= count - vectorSize; i += vectorSize)
+        private static float DotProductCore(ref float left, ref float right, int count)
+        {
+            int i = 0;
+            int lanes = Vector<float>.Count;
+
+            var acc0 = Vector<float>.Zero;
+            var acc1 = Vector<float>.Zero;
+            var acc2 = Vector<float>.Zero;
+            var acc3 = Vector<float>.Zero;
+
+            for (; i <= count - 4 * lanes; i += 4 * lanes)
             {
-                dot += Vector.Dot(new Vector<float>(left, i), new Vector<float>(right, i));
+                acc0 = Vector.FusedMultiplyAdd(Vector.LoadUnsafe(ref left, (nuint)i), Vector.LoadUnsafe(ref right, (nuint)i), acc0);
+                acc1 = Vector.FusedMultiplyAdd(Vector.LoadUnsafe(ref left, (nuint)(i + lanes)), Vector.LoadUnsafe(ref right, (nuint)(i + lanes)), acc1);
+                acc2 = Vector.FusedMultiplyAdd(Vector.LoadUnsafe(ref left, (nuint)(i + 2 * lanes)), Vector.LoadUnsafe(ref right, (nuint)(i + 2 * lanes)), acc2);
+                acc3 = Vector.FusedMultiplyAdd(Vector.LoadUnsafe(ref left, (nuint)(i + 3 * lanes)), Vector.LoadUnsafe(ref right, (nuint)(i + 3 * lanes)), acc3);
             }
-            for (; i < count; i++) dot += left[i] * right[i];
+
+            for (; i <= count - lanes; i += lanes)
+            {
+                acc0 = Vector.FusedMultiplyAdd(Vector.LoadUnsafe(ref left, (nuint)i), Vector.LoadUnsafe(ref right, (nuint)i), acc0);
+            }
+
+            float dot = Vector.Sum((acc0 + acc1) + (acc2 + acc3));
+            for (; i < count; i++)
+                dot += Unsafe.Add(ref left, i) * Unsafe.Add(ref right, i);
             return dot;
         }
 
@@ -1118,47 +1141,53 @@ namespace Qvec.Core
         /// </summary>
         public static float NegativeSquaredDistance(float[] left, float[] right, int count)
         {
-            int i = 0;
-            var accumulator = Vector<float>.Zero;
-            int vectorSize = Vector<float>.Count;
-
-            for (; i <= count - vectorSize; i += vectorSize)
-            {
-                var difference = new Vector<float>(left, i) - new Vector<float>(right, i);
-                accumulator += difference * difference;
-            }
-
-            float sum = Vector.Sum(accumulator);
-            for (; i < count; i++)
-            {
-                float d = left[i] - right[i];
-                sum += d * d;
-            }
-
-            return -sum;
+            ArgumentOutOfRangeException.ThrowIfGreaterThan((uint)count, (uint)Math.Min(left.Length, right.Length));
+            return NegativeSquaredDistanceCore(
+                ref MemoryMarshal.GetArrayDataReference(left),
+                ref MemoryMarshal.GetArrayDataReference(right),
+                count);
         }
 
         internal static float NegativeSquaredDistance(ReadOnlySpan<float> left, ReadOnlySpan<float> right)
         {
-            int i = 0;
-            var accumulator = Vector<float>.Zero;
-            int vectorSize = Vector<float>.Count;
-            int count = Math.Min(left.Length, right.Length);
+            return NegativeSquaredDistanceCore(
+                ref MemoryMarshal.GetReference(left),
+                ref MemoryMarshal.GetReference(right),
+                Math.Min(left.Length, right.Length));
+        }
 
-            // LoadUnsafe skips the per-iteration slice bounds checks; the loop bound above
-            // already guarantees every load stays inside both spans.
-            ref float l = ref MemoryMarshal.GetReference(left);
-            ref float r = ref MemoryMarshal.GetReference(right);
-            for (; i <= count - vectorSize; i += vectorSize)
+        private static float NegativeSquaredDistanceCore(ref float left, ref float right, int count)
+        {
+            int i = 0;
+            int lanes = Vector<float>.Count;
+
+            var acc0 = Vector<float>.Zero;
+            var acc1 = Vector<float>.Zero;
+            var acc2 = Vector<float>.Zero;
+            var acc3 = Vector<float>.Zero;
+
+            for (; i <= count - 4 * lanes; i += 4 * lanes)
             {
-                var difference = Vector.LoadUnsafe(ref l, (nuint)i) - Vector.LoadUnsafe(ref r, (nuint)i);
-                accumulator += difference * difference;
+                var d0 = Vector.LoadUnsafe(ref left, (nuint)i) - Vector.LoadUnsafe(ref right, (nuint)i);
+                var d1 = Vector.LoadUnsafe(ref left, (nuint)(i + lanes)) - Vector.LoadUnsafe(ref right, (nuint)(i + lanes));
+                var d2 = Vector.LoadUnsafe(ref left, (nuint)(i + 2 * lanes)) - Vector.LoadUnsafe(ref right, (nuint)(i + 2 * lanes));
+                var d3 = Vector.LoadUnsafe(ref left, (nuint)(i + 3 * lanes)) - Vector.LoadUnsafe(ref right, (nuint)(i + 3 * lanes));
+                acc0 = Vector.FusedMultiplyAdd(d0, d0, acc0);
+                acc1 = Vector.FusedMultiplyAdd(d1, d1, acc1);
+                acc2 = Vector.FusedMultiplyAdd(d2, d2, acc2);
+                acc3 = Vector.FusedMultiplyAdd(d3, d3, acc3);
             }
 
-            float sum = Vector.Sum(accumulator);
+            for (; i <= count - lanes; i += lanes)
+            {
+                var d = Vector.LoadUnsafe(ref left, (nuint)i) - Vector.LoadUnsafe(ref right, (nuint)i);
+                acc0 = Vector.FusedMultiplyAdd(d, d, acc0);
+            }
+
+            float sum = Vector.Sum((acc0 + acc1) + (acc2 + acc3));
             for (; i < count; i++)
             {
-                float d = left[i] - right[i];
+                float d = Unsafe.Add(ref left, i) - Unsafe.Add(ref right, i);
                 sum += d * d;
             }
 
@@ -1198,7 +1227,7 @@ namespace Qvec.Core
         /// </summary>
         public static void NormalizeVector(float[] vector)
         {
-            float norm = MathF.Sqrt(DotProduct(vector, vector));
+            float norm = MathF.Sqrt(SquaredNorm(vector));
             if (norm > 0f)
             {
                 float invNorm = 1f / norm;
@@ -1213,6 +1242,28 @@ namespace Qvec.Core
                 }
                 for (; i < vector.Length; i++) vector[i] *= invNorm;
             }
+        }
+
+        /// <summary>
+        /// Squared L2 norm with the summation order the 2.0 kernels used (one horizontal
+        /// reduction per vector step, then a scalar tail). Normalised vectors are persisted, so
+        /// this must keep producing bit-identical values when the scoring kernels change their
+        /// accumulation order; it runs once per vector and is not on a hot path.
+        /// </summary>
+        private static float SquaredNorm(float[] vector)
+        {
+            int i = 0;
+            float sum = 0;
+            int lanes = Vector<float>.Count;
+            ref float v = ref MemoryMarshal.GetArrayDataReference(vector);
+
+            for (; i <= vector.Length - lanes; i += lanes)
+            {
+                var step = Vector.LoadUnsafe(ref v, (nuint)i);
+                sum += Vector.Dot(step, step);
+            }
+            for (; i < vector.Length; i++) sum += vector[i] * vector[i];
+            return sum;
         }
 
         // --- SKRIVNING ---
@@ -3511,50 +3562,19 @@ namespace Qvec.Core
 
         internal static unsafe float NegativeSquaredDistanceUnsafe(float[] left, float* right, int dim)
         {
-            int i = 0;
-            var accumulator = Vector<float>.Zero;
-            int vectorSize = Vector<float>.Count;
-
-            fixed (float* pLeft = left)
-            {
-                for (; i <= dim - vectorSize; i += vectorSize)
-                {
-                    var difference = *(Vector<float>*)(pLeft + i) - *(Vector<float>*)(right + i);
-                    accumulator += difference * difference;
-                }
-            }
-
-            float sum = Vector.Sum(accumulator);
-            for (; i < dim; i++)
-            {
-                float d = left[i] - right[i];
-                sum += d * d;
-            }
-
-            return -sum;
+            return NegativeSquaredDistanceCore(
+                ref MemoryMarshal.GetArrayDataReference(left),
+                ref Unsafe.AsRef<float>(right),
+                dim);
         }
 
-        // SIMD DotProduct that works directly against a raw pointer
+        /// <summary>Dot product of a query array against a raw pointer into the mapping.</summary>
         internal static unsafe float DotProductUnsafe(float[] left, float* right, int dim)
         {
-            int i = 0;
-            float dot = 0;
-            int vectorSize = Vector<float>.Count;
-
-            fixed (float* pLeft = left)
-            {
-                for (; i <= dim - vectorSize; i += vectorSize)
-                {
-                    // Load 8 floats (AVX2) from both the array and pointer at the same time
-                    var v1 = *(Vector<float>*)(pLeft + i);
-                    var v2 = *(Vector<float>*)(right + i);
-                    dot += Vector.Dot(v1, v2);
-                }
-            }
-
-            // Resterande element
-            for (; i < dim; i++) dot += left[i] * right[i];
-            return dot;
+            return DotProductCore(
+                ref MemoryMarshal.GetArrayDataReference(left),
+                ref Unsafe.AsRef<float>(right),
+                dim);
         }
         // Reads through the raw mapping pointer rather than the accessor: every accessor call
         // takes an interlocked ref on the shared SafeBuffer, and a top-100 result set makes a
