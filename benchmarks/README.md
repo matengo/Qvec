@@ -59,7 +59,8 @@ so rows from different modes cannot be confused for each other.
 
 `--reuse-index` opens the file a previous `--keep-index` run left behind instead of rebuilding
 it, so `--k`, `--ef` and `--concurrency` can be swept without paying for the build again. The
-build time is reported as zero in that case, not as the previous run's number.
+build time is reported as zero in that case, not as the previous run's number. Pass
+`--keep-index` again on every such run: the file is deleted at exit like after any other run.
 
 `--passes <n>` runs the query set `n` times per `efSearch` row inside the timed region. Cohere
 ships only 1,000 queries, which at several thousand QPS is over in a fraction of a second — too

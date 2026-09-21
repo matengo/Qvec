@@ -79,6 +79,39 @@ make the pointer kernels **2.4–2.7× faster at every dimension** (128-d dot 18
 because they are one function. Open question 2 (a `System.Numerics.Tensors` dependency) is
 closed: not needed.
 
+**Macro confirmation for PR `perf-kernels`** (`compare.ps1`, siftsmall, `f9f6733` → head,
+3 interleaved rounds, build threads 1, 1 query thread):
+
+| metric | x64 CI runner (ubuntu-latest), head/base | reference machine (ARM64), head/base |
+| --- | ---: | ---: |
+| build inserts/s | 1.062× (rounds 1.04–1.08) | 1.09× (1.07–1.24) |
+| QPS @ ef 10 | 1.037× | — |
+| QPS @ ef 40 | 0.989× | 1.28× (1.04–1.39) |
+| QPS @ ef 160 | 0.997× | 1.125× (0.95–1.14) |
+| recall@10, every ef | unchanged | unchanged |
+
+**SIFT-1M, query only** (reference machine, one 12-thread build of the 1M index reused by both
+binaries via `--reuse-index --keep-index`, 1 query thread, 2 passes, base/head alternated
+over 3 rounds, 2026-09-21; the machine carried 40–70 % background load from an unrelated
+system service throughout, so absolute QPS is below the README table's conditions):
+
+| ef | base QPS (3 rounds) | head QPS (3 rounds) | head/base per round | recall@10 |
+| ---: | ---: | ---: | ---: | ---: |
+| 40 | 3,581 / 3,651 / 3,769 | 3,896 / 4,107 / 4,040 | 1.09 / 1.12 / 1.07 | 97.0 % both |
+| 160 | 1,202 / 1,223 / 1,267 | 1,395 / 1,406 / 1,400 | 1.16 / 1.15 / 1.10 | 99.7 % both |
+
+Reading: **the end-to-end gain is a fraction of the kernel gain.** At 128-d on a 10,000-node
+graph the distance is 7–18 ns of a walk step whose heap and visited-set work is tens of
+nanoseconds, so a 2.6× kernel is worth single-digit percent on the build and is neutral on
+x64 queries (whose AVX2 8-lane kernel was already less latency-bound than the 4-lane NEON
+one). On the 1.3 GB SIFT-1M index, where each candidate's vector is a cache miss, the kernel
+is worth a consistent **+7–16 % QPS** on ARM64 with the head rounds spread within 5 % — the
+number to quote for this PR. The siftsmall ARM64 column was measured while the machine
+carried the same background load and had earlier round spreads of 0.45–2.27 (discarded), so
+treat it as "positive, magnitude uncertain"; the CI column had spreads ≤ 0.05. Where the
+kernel *should* matter most is 768/1536-d (Cohere, GIST), which the §4.1 Cohere-1M
+re-measurement will cover once the machine is quiet.
+
 **One `Search(topK 10, efSearch 100)` on a 10,000-node clustered Euclidean index:**
 
 | dim | mode | mean | Gen0 / 1k ops | Gen1 / 1k ops | allocated per query |
@@ -365,7 +398,9 @@ multiply-add); the same kernel serves build and search, and recall is checked ov
 ef sweep, not assumed.
 
 **Measured (§2.1 "after" table).** Pointer kernels 2.4–2.7× at 128, 768 and 1536; the
-public array overloads 3.3× at 128-d. End to end: see the `compare.ps1` results in §2.1.
+public array overloads 3.3× at 128-d. End to end (§2.1 macro tables): siftsmall build +6 %
+on x64 CI with queries neutral; SIFT-1M single-thread queries +7–16 % on the reference
+machine, recall unchanged everywhere.
 
 **Expected → actual.** Expected ~1.3× on 128-d only; got 2.4–2.7× everywhere. The lesson for
 the rest of this document: "close to `TensorPrimitives`" is not evidence of being at the
@@ -452,7 +487,7 @@ short of a layout change helps if it is memory bandwidth on the mapped file.
 | 1 | `perf-micro` | `Qvec.MicroBenchmarks` project (kernels + `TensorPrimitives` reference, one-query search with memory diagnoser), `InternalsVisibleTo`, README section; baseline recorded in §2.1 | — |
 | 2 | `perf-workflow` | `compare.ps1` A/B script, `perf.yml` (dispatch + weekly), step-summary tables, `InsertThroughputTests` prints to summary — **done**; validated by re-measuring PR 3 end to end (§2.1) | 1 |
 | 3 | `perf-query-scratch` | §4.1 + §4.3: query-path scratch, direct neighbour pointer; micro-benchmark before/after in §2.1 — **done**; Cohere 12-thread README re-measurement still owed | 1 |
-| 4 | `perf-kernels` | §4.2: 128-d dot product only, array overloads forwarded to span; SIFT QPS re-measured | 2 |
+| 4 | `perf-kernels` | §4.2: four-accumulator kernels for every dimension, all overloads forward to one core, `fixed` removed; micro 2.4–2.7×, SIFT-1M query +7–16 % (§2.1) — **done**; main-README SIFT-1M table re-measurement owed (quiet machine) | 2 |
 | 5 | `perf-profile` | CPU profile of single-thread build and 12-thread build/query on the reference machine; `benchmarks/profile-summary.py`; findings in §2.2 — **done**: 4.4 proceeds (back-link arithmetic), 4.5 parked until after 6 | 2 |
 | 6 | `perf-insert-prune` | §4.4: remove duplicate `StoredSimilarity` work in the back-link path, then scratch/sort; graph-section comparison, recall sweep | 5 |
 | 7 | `perf-parallel-build` | §4.5: re-profile after 6; batch-boundary waits first, locks only if still visible | 6 |
