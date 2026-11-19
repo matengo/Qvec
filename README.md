@@ -127,6 +127,8 @@ IReadOnlyList<Guid> ids = db.AddEntries(
 > **Capacity note:** `max` is a **starting** size, not a ceiling. The file is laid out for that capacity up front and **grows geometrically** when it runs out of rows or metadata heap space. It is also created **sparse**, so `dim: 1536, max: 1_000_000` describes a ~7.3 GB layout while consuming only the pages you actually write. Set `AutoGrow = false` if you want a hard bound instead — a full database then throws `QvecFullException`.
 >
 > **Metadata note:** metadata is stored in an append-only heap addressed by a per-row `(offset, length)` descriptor. There is no per-entry size limit and the heap grows on demand. Updating metadata orphans the previous blob until `Vacuum()` reclaims it.
+>
+> **Build cache note:** inserts keep an exact in-memory cache of each node's neighbour similarity scores so the back-link prune does not recompute them (`NeighborScoreCacheBytes`, 64 MiB by default — enough for ≈ 230k nodes at `M = 32`). It never changes the graph; raise it before a large bulk load, or set it to `0` to disable.
 
 ## HNSW Vector Search
 

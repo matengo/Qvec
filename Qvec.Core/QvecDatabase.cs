@@ -843,6 +843,9 @@ namespace Qvec.Core
                 // Store the peer's exact codes so replicas stay bit-identical instead of
                 // re-quantising a dequantised approximation.
                 WriteCodesToDisk(newIndex, item.Codes!, item.Parameters!.Value);
+                // The codes just changed under edges that were scored against the re-quantised
+                // approximation; cached scores no longer match what a recompute would give.
+                ClearScoreCache();
             }
 
             if (FieldIndexExtractor is { } extractor) AddFieldIndex(newIndex, extractor(item.Metadata));
@@ -1282,6 +1285,7 @@ namespace Qvec.Core
                 _deletedIndices.Remove(slot);
                 WriteTombstone(slot, 0);
                 _header.DeletedCount--;
+                ClearScoreCache();
                 return slot;
             }
 
@@ -1668,6 +1672,7 @@ namespace Qvec.Core
 
             _guidIndex.Clear();
             _deletedIndices.Clear();
+            DropScoreCache();
             RebuildGuidIndex();
             LoadTombstones();
             LoadDeletedVersions();
@@ -1725,6 +1730,7 @@ namespace Qvec.Core
                 }
                 else
                 {
+                    EnsureScoreCache();
                     // If every earlier node was deleted there is nothing to attach to, so the
                     // new node has to become the entry point itself.
                     if (!ConnectNewNode(index, vector, level, _insertScratch) || level > _header.EntryPointLevel)
@@ -1824,6 +1830,7 @@ namespace Qvec.Core
                     if (pending.Count == 0) continue;
 
                     // Phase B, parallel: link the rows into the graph.
+                    EnsureScoreCache();
                     LinkPending(pending, threads);
                     CommitHeader();
                 }
@@ -1970,6 +1977,8 @@ namespace Qvec.Core
             {
                 Buffer.MemoryCopy(source, DataBasePointer + (offset - HeaderSize), bytes, bytes);
             }
+            // A reused slot (after a delete) may still carry the old row's scores.
+            ScoreCacheInvalidate(index, 0);
         }
         // --- INVERTED INDEX ---
 
@@ -2631,6 +2640,7 @@ namespace Qvec.Core
         {
             int slots = NeighborsAtLevel(level);
             int* target = NeighborPointer(nodeIndex, level);
+            ScoreCacheInvalidate(nodeIndex, level);
 
             int existing = 0;
             while (existing < slots && target[existing] != -1) existing++;
@@ -3061,19 +3071,38 @@ namespace Qvec.Core
                     {
                         neighbors[i] = newNode;
                         WriteNeighborsAtLevel(existingNode, level, neighbors);
+                        ScoreCacheInvalidate(existingNode, level);
                         return;
                     }
 
                     if (neighbors[i] == newNode) return;
                 }
 
-                // The list is full. Scores are recomputed because the graph section stores ids
-                // only; the new node's vector is already on disk, so it needs no special casing.
+                // The list is full. The graph section stores ids only, so the owner's scores
+                // either come from the layer-0 score cache or are recomputed here; the new
+                // node's vector is already on disk, so it needs no special casing.
                 int candidateCount = slots + 1;
                 var candidates = new (int Id, float Score)[candidateCount];
+                float[]? cached = ScoreCacheGet(existingNode, level);
 
-                for (int i = 0; i < slots; i++)
-                    candidates[i] = (neighbors[i], StoredSimilarity(existingNode, neighbors[i]));
+                if (cached != null)
+                {
+                    for (int i = 0; i < slots; i++)
+                        candidates[i] = (neighbors[i], cached[i]);
+                }
+                else
+                {
+                    for (int i = 0; i < slots; i++)
+                        candidates[i] = (neighbors[i], StoredSimilarity(existingNode, neighbors[i]));
+
+                    // Remember the scores in stored order before the sort below reorders them:
+                    // if the new node is rejected the stored list, and so this alignment, is kept.
+                    cached = ScoreCacheReserve(existingNode, level);
+                    if (cached != null)
+                    {
+                        for (int i = 0; i < slots; i++) cached[i] = candidates[i].Score;
+                    }
+                }
 
                 candidates[slots] = (newNode, StoredSimilarity(existingNode, newNode));
 
@@ -3089,7 +3118,12 @@ namespace Qvec.Core
                     // neighbours that were topped up past the diversity check when it was
                     // built (keepPrunedConnections), and those are the ones to give up before
                     // a diverse long-range link. Only the full heuristic can tell them apart.
-                    WriteNeighborsAtLevel(existingNode, level, PruneNeighbors(candidates, slots));
+                    var pruned = PruneNeighbors(candidates, slots);
+                    WriteNeighborsAtLevel(existingNode, level, pruned);
+                    if (cached != null && pruned.Length >= slots)
+                    {
+                        for (int i = 0; i < slots; i++) cached[i] = pruned[i].Score;
+                    }
                     return;
                 }
 
@@ -3100,11 +3134,121 @@ namespace Qvec.Core
                     if (i != evict) neighbors[j++] = candidates[i].Id;
 
                 WriteNeighborsAtLevel(existingNode, level, neighbors);
+                if (cached != null)
+                {
+                    for (int i = 0, j = 0; i < candidateCount; i++)
+                        if (i != evict) cached[j++] = candidates[i].Score;
+                }
             }
             finally
             {
                 ArrayPool<int>.Shared.Return(neighbors);
             }
+        }
+
+        /// <summary>
+        /// Owner-to-neighbour similarities for layer-0 lists, kept in memory while the graph is
+        /// built. Indexed by node; each entry is aligned with the node's stored id list and
+        /// exists only for lists that have been full at least once. <see cref="AddNeighborConnection"/>
+        /// is the only path that rewrites a full list and it refreshes the entry in place from
+        /// the scores it has just used; every other writer drops the entry. A present entry is
+        /// therefore always exact and the resulting graph is identical with or without the
+        /// cache. Allocated under the write lock (<see cref="EnsureScoreCache"/>); entries are
+        /// read and replaced only under the owning node's <see cref="NodeLock"/>.
+        /// </summary>
+        private float[]?[]? _scoreCache;
+        private int _scoreCacheEntries;
+
+        /// <summary>
+        /// Memory budget, in bytes, for the layer-0 neighbour score cache used while inserting.
+        /// Each node whose base-layer list has filled up costs about
+        /// <c>MaxNeighbors × 2 × 4</c> bytes (256 B at the default M = 32); once the budget is
+        /// reached further nodes are simply not cached. The default of 64 MiB covers roughly
+        /// 230,000 nodes at M = 32. Set to 0 to disable. The cache never changes the graph —
+        /// it only avoids recomputing similarities the insert path would otherwise re-read
+        /// from the mapped vectors — and it is released when the database is disposed.
+        /// </summary>
+        public long NeighborScoreCacheBytes { get; set; } = 64L << 20;
+
+        private int ScoreCacheEntryBytes => NeighborsAtLevel(0) * sizeof(float) + 32;
+
+        /// <summary>
+        /// Sizes the cache to the current <c>MaxCount</c>. Called serially under the write lock
+        /// before any linking, and again after growth, so parallel linkers never see it move.
+        /// </summary>
+        private void EnsureScoreCache()
+        {
+            if (NeighborScoreCacheBytes <= 0)
+            {
+                DropScoreCache();
+                return;
+            }
+
+            if (_scoreCache == null)
+                _scoreCache = new float[]?[_header.MaxCount];
+            else if (_scoreCache.Length < _header.MaxCount)
+                Array.Resize(ref _scoreCache, _header.MaxCount);
+        }
+
+        private void DropScoreCache()
+        {
+            _scoreCache = null;
+            _scoreCacheEntries = 0;
+        }
+
+        /// <summary>
+        /// Forgets every cached score but keeps the array. Needed when a deleted slot is
+        /// reused: neighbour lists are not symmetric, so owners that still point at the old id
+        /// cannot be enumerated from the deleted node, and their cached scores would otherwise
+        /// describe the vector that used to live in the slot. Serial, under the write lock.
+        /// </summary>
+        private void ClearScoreCache()
+        {
+            var cache = _scoreCache;
+            if (cache == null || _scoreCacheEntries == 0) return;
+            Array.Clear(cache);
+            _scoreCacheEntries = 0;
+        }
+
+        private float[]? ScoreCacheGet(int nodeIndex, int level)
+        {
+            var cache = _scoreCache;
+            if (level != 0 || cache == null || nodeIndex >= cache.Length) return null;
+            return cache[nodeIndex];
+        }
+
+        /// <summary>
+        /// Returns an entry for the node to fill, or null when the cache is off, the node is out
+        /// of range, or the budget is spent.
+        /// </summary>
+        private float[]? ScoreCacheReserve(int nodeIndex, int level)
+        {
+            var cache = _scoreCache;
+            if (level != 0 || cache == null || nodeIndex >= cache.Length) return null;
+
+            var entry = cache[nodeIndex];
+            if (entry != null) return entry;
+
+            long maxEntries = NeighborScoreCacheBytes / ScoreCacheEntryBytes;
+            if (Interlocked.Increment(ref _scoreCacheEntries) > maxEntries)
+            {
+                Interlocked.Decrement(ref _scoreCacheEntries);
+                return null;
+            }
+
+            entry = new float[NeighborsAtLevel(0)];
+            cache[nodeIndex] = entry;
+            return entry;
+        }
+
+        /// <summary>Must be called by every writer of a layer-0 list other than <see cref="AddNeighborConnection"/>.</summary>
+        private void ScoreCacheInvalidate(int nodeIndex, int level)
+        {
+            var cache = _scoreCache;
+            if (level != 0 || cache == null || nodeIndex >= cache.Length) return;
+            if (cache[nodeIndex] == null) return;
+            cache[nodeIndex] = null;
+            Interlocked.Decrement(ref _scoreCacheEntries);
         }
 
         /// <summary>
@@ -3392,6 +3536,7 @@ namespace Qvec.Core
 
                 _header.EntryPoint = -1;
                 _header.EntryPointLevel = 0;
+                EnsureScoreCache();
 
                 foreach (int index in live)
                 {
@@ -3793,6 +3938,7 @@ namespace Qvec.Core
                     neighbors[i] = -1;
 
                 WriteNeighborsAtLevel(nodeIndex, level, neighbors);
+                ScoreCacheInvalidate(nodeIndex, level);
             }
             finally
             {
@@ -3805,6 +3951,7 @@ namespace Qvec.Core
             BeginWrite();
             int slots = NeighborsAtLevel(level);
             new Span<int>(NeighborPointer(nodeIndex, level), slots).Fill(-1);
+            ScoreCacheInvalidate(nodeIndex, level);
         }
 
         /// <summary>
@@ -4006,6 +4153,7 @@ namespace Qvec.Core
             }
             else
             {
+                EnsureScoreCache();
                 if (!ConnectNewNode(index, vector, level, _insertScratch) || level > _header.EntryPointLevel)
                 {
                     _header.EntryPoint = index;

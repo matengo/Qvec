@@ -418,41 +418,58 @@ remapped while the lock is held — the same invariant `StoredVector` relies on)
 together with §4.1; not measured separately. `AddNeighborConnection`'s first pass still
 copies and belongs to §4.4.
 
-### 4.4 Insert back-link prune — profiled, proceed (PR 6)
+### 4.4 Insert back-link prune — done (PR 6)
 
-**Today.** Per insert, per level: `SelectNeighborsHeuristic` allocates `ordered`,
-`StableSortDescending` allocates an index array, a sorted copy and a closure for the
-comparer, `PruneNeighbors` allocates two `List`s. `AddNeighborConnection` on a full list (the
+**Today (before PR 6).** Per insert, per level: `SelectNeighborsHeuristic` allocates
+`ordered`, `StableSortDescending` allocates an index array, a sorted copy and a comparer
+closure, `PruneNeighbors` allocates two `List`s. `AddNeighborConnection` on a full list (the
 steady state) allocates a `candidates` array and sorts with a comparer object. With `M0 = 64`
 these are up to ~65 back-link prunes per insert.
 
 **Profile verdict (§2.2 A).** The back-link phase is ≈ 44 % of a single-thread build and it
-is dominated by `StoredSimilarity` arithmetic, not by allocation: `AddNeighborConnection`
-recomputes all 65 owner–neighbour similarities on every full list, `FindWorstNonDiverse` adds
-up to 64, and the `PruneNeighbors` fallback adds `O(M0²)`. Sorting is < 5 %; the `List`s and
-arrays are cheap by comparison.
+is dominated by `StoredSimilarity` arithmetic, not by allocation. Sorting is < 5 %; the
+`List`s and arrays are cheap by comparison.
 
-**Change (in order of expected pay-off).**
-1. Cut `StoredSimilarity` calls without changing the outcome: `FindWorstNonDiverse` already
-   computes candidate-to-new-node similarities that `PruneNeighbors` recomputes when it runs
-   as the fallback; reuse them. Check how often the fallback runs at all (a counter in a
-   `Slow` test) — if it is the common case, the two-step scheme is doing the `O(M0²)` work
-   twice over and the cheaper first step should be dropped or folded in.
-2. Make the kernel behind `StoredSimilarity` as fast as the query kernel (§4.2 covers both).
-3. Only then the scratch buffers and insertion sort from the original plan, measured
-   separately, since the profile says they are worth a few percent at most.
+**Counting instead of guessing.** Temporary counters on a serial siftsmall build (10k × 128-d,
+`M = 32`, 1 thread) attributed every `StoredSimilarity` call made during an insert
+(≈ 5,250 per insert):
 
-**Measure.** Single-thread SIFT-1M build rate via `compare.ps1` (`-Threads 1`), and the
-graph comparison. Note that the `.qvec` file is **not** byte-identical between two identical
-builds (header carries an id/timestamp), so the check must compare the graph section, not the
-file hash; the `Array.Sort` in `AddNeighborConnection` is unstable and SIFT has many tied
-distances (integer-valued vectors), so replacing that sort with a stable one *will* change
-tie order and hence the graph. Either keep that sort or accept the change and prove recall
-unchanged across the whole ef sweep.
+| Caller | Share of calls |
+| --- | --- |
+| `AddNeighborConnection` — recomputing the owner's scores to its *existing* neighbours (the graph section stores ids only) | **79 %** |
+| `FindWorstNonDiverse` — candidate-to-new-node similarities | 9.5 % |
+| `SelectNeighborsHeuristic` — forward selection for the new node | 8 % |
+| `PruneNeighbors` as the back-link fallback | 3 % |
 
-**Expected.** If the fallback prune is frequent, removing the duplicate arithmetic alone
-could take a third off the back-link phase, ≈ 15 % of build time; the kernel work adds to
-that. Not to be quoted until measured.
+Of 645,248 back-links onto full lists, the heuristic accepted the new node and evicted an
+old neighbour in 46 %, rejected the new node in 53 %, and fell back to `PruneNeighbors` in
+only **1.1 %**. The original hypothesis — that the fallback does the `O(M0²)` work twice —
+was therefore wrong; the duplicate arithmetic was the 64 owner-score recomputes per back-link.
+
+**Change.** An exact, in-memory **layer-0 owner → neighbour score cache**
+(`QvecDatabase.NeighborScoreCacheBytes`, default 64 MiB, `0` disables). `AddNeighborConnection`
+is the only path that rewrites a *full* list, and it refreshes the owner's entry from the
+scores it has just used; every other writer of a neighbour list (`MergeNeighborsAtLevel`,
+`RemoveNeighborReference`, `InitNeighborsAtLevel`, `InitNeighborsOnDisk`) drops the entry.
+Because neighbour lists are not symmetric, reusing a deleted slot or overwriting codes after a
+sync upsert clears the whole cache rather than hunting for owners. Entries are read and
+replaced only under the owner's `NodeLock`; the array is allocated and resized only under the
+write lock. Search-path scores are deliberately **not** reused to populate the cache so that a
+cached score is always exactly what `StoredSimilarity(owner, neighbour)` would return. Memory:
+`M0 × 4 + 32` bytes per node, so the default covers ≈ 230k nodes at `M = 32`; bulk builds of
+larger datasets can raise the budget, and once it is exhausted new owners are simply not cached.
+
+**Measured (reference machine, siftsmall, `--threads 1 --ef 40`, alternated A/B, 3 rounds,
+noisy machine).** Build 2,668 / 2,896 / 4,056 inserts/s on master vs 4,247 / 4,388 / 5,535
+with the cache: **+37–59 %**. Recall@10 99.90 % in both. The graph section of the `.qvec`
+file is **byte-identical** between master and PR 6 for the serial build, and
+`NeighborScoreCacheTests` asserts the same for growth, deletes and slot reuse with the cache
+on and off (and for a budget too small to hold the graph). Query path untouched. SIFT-1M and
+Cohere single-thread builds not re-measured yet (machine not quiet).
+
+**Not done.** The scratch-buffer and insertion-sort items from the original plan; the profile
+puts them at a few percent and they are not worth the risk of changing tie order
+(`Array.Sort` in `AddNeighborConnection` is unstable and SIFT has many tied distances).
 
 ### 4.5 Parallel build scaling — profiled, parked
 
@@ -462,8 +479,9 @@ frequent enough to matter), `Parallel.For` chunking, and `ArrayPool.Shared` cont
 
 **Profile verdict (§2.2 B).** Lock contention is at most a few percent; the visible loss is
 pool threads waiting at the boundaries of the 50k-row `AddEntries` batches. Whatever §4.4
-removes from the critical section shortens the locked regions too, so redo this profile after
-PR 6 rather than optimising the locks now. If the batch-boundary wait is confirmed, the fix is
+removed from the critical section (the owner-score recompute, §4.4) shortens the locked
+regions too, so redo this profile now that PR 6 has landed rather than optimising the locks
+blind. If the batch-boundary wait is confirmed, the fix is
 on the caller's side (larger or pipelined batches in the benchmark and README guidance), not
 in `Qvec.Core`.
 
@@ -489,7 +507,7 @@ short of a layout change helps if it is memory bandwidth on the mapped file.
 | 3 | `perf-query-scratch` | §4.1 + §4.3: query-path scratch, direct neighbour pointer; micro-benchmark before/after in §2.1 — **done**; Cohere 12-thread README re-measurement still owed | 1 |
 | 4 | `perf-kernels` | §4.2: four-accumulator kernels for every dimension, all overloads forward to one core, `fixed` removed; micro 2.4–2.7×, SIFT-1M query +7–16 % (§2.1) — **done**; main-README SIFT-1M table re-measurement owed (quiet machine) | 2 |
 | 5 | `perf-profile` | CPU profile of single-thread build and 12-thread build/query on the reference machine; `benchmarks/profile-summary.py`; findings in §2.2 — **done**: 4.4 proceeds (back-link arithmetic), 4.5 parked until after 6 | 2 |
-| 6 | `perf-insert-prune` | §4.4: remove duplicate `StoredSimilarity` work in the back-link path, then scratch/sort; graph-section comparison, recall sweep | 5 |
+| 6 | `perf-insert-prune` | §4.4: exact layer-0 owner→neighbour score cache removes the 79 % owner-score recompute; siftsmall 1-thread build +37–59 %, graph section byte-identical — **done**; SIFT-1M/Cohere 1-thread re-measurement owed | 5 |
 | 7 | `perf-parallel-build` | §4.5: re-profile after 6; batch-boundary waits first, locks only if still visible | 6 |
 
 Each PR that changes `Qvec.Core` publishes a before/after row in `benchmarks/README.md`
