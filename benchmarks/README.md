@@ -106,23 +106,34 @@ not the single-threaded default.
 
 `--dataset cohere100k --k 100`, `maxNeighbors = 32`, Snapdragon X Elite (12 cores), Windows 11,
 power-throttling exemption in place. The 1-thread and 12-thread float rows were built back to
-back on the same day; queries at `--concurrency 12` on the 12-thread graph.
+back on the same day after PR `perf-parallel-build` (kernels, query scratch and the back-link
+score cache all in); queries at `--concurrency 12 --passes 10` on the 12-thread graph, with a
+background process using ≈0.6 core throughout.
 
 | mode | build threads | build | inserts/s | file | efSearch | recall@100 | QPS 1 thread | QPS 12 threads |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| float | 1 | 371 s | 270 | 382 MiB | 100 | 97.6 % | 712 | |
-| float | 1 | | | | 180 | 99.0 % | 440 | |
-| float | 12 | 59 s | 1,707 | 382 MiB | 100 | 97.5 % | 693 | 2,991 |
-| float | 12 | | | | 180 | 99.0 % | 453 | 2,469 |
+| float | 1 | 181 s | 553 | 382 MiB | 100 | 97.6 % | 1,116 | |
+| float | 1 | | | | 180 | 99.0 % | 683 | |
+| float | 12 | 57 s | 1,752 | 382 MiB | 100 | 97.5 % | 1,047 | 2,986 |
+| float | 12 | | | | 180 | 99.0 % | 674 | 1,892 |
 | int8 † | 1 | 672 s | 149 | 164 MiB | 100 | 95.7 % | 549 | — |
 | int8 † | 1 | | | | 180 | 96.6 % | 395 | — |
 | int8 † | 1 | | | | 300 | 96.8 % | 308 | — |
 
+Before the performance programme the same two float builds took 371 s and 59 s (270 and 1,707
+inserts/s) at 712 / 440 QPS single-threaded — the single-thread build and query paths got
+2.0× and 1.5× faster, the 12-thread build did not move.
+
 † Measured before the power-throttling exemption and with the old O(M0²) prune; build time and
 QPS are not comparable to the float rows, recall is.
 
-Parallel construction ([design doc](../docs/design-insert-parallel.md)) gives 6.3× on 12 cores
-at a cost of 0.1 pp recall@100. The float rows use the incremental prune
+Parallel construction ([design doc](../docs/design-insert-parallel.md)) gives 3.2× on 12 cores
+at a cost of 0.1 pp recall@100; it was 6.3× before the single-thread path got faster. The
+parallel build is bound by random reads of the mapped vectors, not by arithmetic or locks: at
+12 threads it performs ≈7 M distance computations/s (≈21 GB/s of 3 KB reads) and a standalone
+random-read probe tops out at the same ≈20 GB/s on this machine, 8 threads already reach the
+ceiling, and the 12-thread query QPS plateaus for the same reason (see
+[design-performance.md §4.5](../docs/design-performance.md)). The float rows use the incremental prune
 ([design doc](../docs/design-insert-prune.md)); before it the same single-threaded build took
 1,696 s (59 inserts/s) and reached 97.9 % / 99.3 % at efSearch 100 / 180 — the graph is not
 byte-identical, so recall is re-measured rather than assumed. The int8 row shows the plain-int8
