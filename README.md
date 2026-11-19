@@ -20,7 +20,7 @@ Unlike client-server vector DBs, Qvec runs in-process, using **MemoryMappedFiles
 *   **Optional int8 Scalar Quantization:** Pass `quantization: VectorQuantization.Int8` to store one byte per dimension instead of four (plus 16 bytes of per-vector scale/offset). Scoring runs on the bytes with a widening SIMD integer kernel, so queries get faster as well as smaller. Float mode is untouched and byte-for-byte identical to before. See [docs/design-quantization-int8.md](docs/design-quantization-int8.md) for the accuracy trade-off.
 *   **int8 with Float Rescoring:** `VectorQuantization.Int8Rescored` builds and walks the graph on int8 but keeps the floats and re-ranks the `efSearch` candidates on them, so you get float recall and exact scores at roughly int8 speed. Costs ~1.25× float storage. See [docs/design-quantization-rescoring.md](docs/design-quantization-rescoring.md).
 *   **Reproducible Index Builds:** HNSW layer assignment is randomized by default, so two builds of the same data normally produce different graphs. Pass `indexSeed:` to pin it — necessary for benchmarks and recall regression tests to be re-derivable. (Multi-threaded `AddEntries` builds keep the seeded layers but not the link order, so they are not byte-reproducible.)
-*   **Parallel Bulk Loading:** `AddEntries` inserts a batch with every core linking nodes into the graph at once — hnswlib-style striped node locks, one write lock for the whole batch. 6.3× faster than one-by-one `AddEntry` on 12 cores at a cost of ~0.1 pp recall. See [docs/design-insert-parallel.md](docs/design-insert-parallel.md).
+*   **Parallel Bulk Loading:** `AddEntries` inserts a batch with every core linking nodes into the graph at once — hnswlib-style striped node locks, one write lock for the whole batch. 3.2× faster than one-by-one `AddEntry` on 12 cores at a cost of ~0.1 pp recall; the build is bound by random reads of the mapped vectors, so 8 threads reach the same ceiling. See [docs/design-insert-parallel.md](docs/design-insert-parallel.md) and [docs/design-performance.md §4.5](docs/design-performance.md).
 *   **Guid Document IDs:** `AddEntry` returns a stable `Guid` document identifier; external IDs can be supplied for deduplication and sync scenarios.
 *   **Update and Delete:** Supports tombstone-based delete, metadata updates, and vector updates by delete-and-reinsert. `Vacuum()` compacts the file, reuses tombstoned rows, reclaims orphaned metadata, and rebuilds the HNSW graph.
 *   **Metadata Filtering:** General metadata predicates are supported after HNSW retrieval; `[QvecIndexed]` equality filters can pre-filter via an in-memory inverted index.
@@ -119,7 +119,7 @@ float[] embedding = GetEmbedding("Hello World");
 Guid id = db.AddEntry(embedding, "{\"id\":1,\"category\":\"text\"}");
 
 // Bulk load: links the batch into the graph on every core. Same result as a
-// loop of AddEntry (ids in input order, duplicates skipped), 6× faster on 12 cores.
+// loop of AddEntry (ids in input order, duplicates skipped), ~3× faster on 12 cores.
 IReadOnlyList<Guid> ids = db.AddEntries(
     documents.Select(d => new QvecInsert(d.Embedding, d.MetadataJson, d.Id)).ToList());
 ```
@@ -425,7 +425,7 @@ Planned cloud work is tracked in design documents and the roadmap below.
 - **Full Native AOT support for the typed client** — Remove or replace reflection, expression compilation, and reflection-based JSON paths.
 - **ProjectReference analyzer flow for source generation** — Ensure the `[QvecIndexed]` generator is available when consuming `Qvec.Core.Client` through project references.
 - **Published benchmark methodology** — ✅ Done. `benchmarks/Qvec.Benchmarks` measures recall vs. QPS against the TexMex SIFT/GIST corpora and their published ground truth.
-- **Faster index construction** — Done in three steps. Removing marshalling, pool and allocation overhead took SIFT-1M from 242 to 362 inserts/s; replacing the O(M0²) re-run of the neighbour heuristic on every full back-link with an incremental O(M0) update ([design doc](docs/design-insert-prune.md)) took Cohere 100K (768 dims) from 59 to 170 inserts/s; parallel construction through `AddEntries` ([design doc](docs/design-insert-parallel.md)) gives a further 6.3× on 12 cores. Remaining lever: hub-node lock contention during back-linking (~20 % of thread time on Cohere).
+- **Faster index construction** — Done in three steps. Removing marshalling, pool and allocation overhead took SIFT-1M from 242 to 362 inserts/s; replacing the O(M0²) re-run of the neighbour heuristic on every full back-link with an incremental O(M0) update ([design doc](docs/design-insert-prune.md)) took Cohere 100K (768 dims) from 59 to 170 inserts/s; parallel construction through `AddEntries` ([design doc](docs/design-insert-parallel.md)) gives a further 3.2× on 12 cores (6.3× before the single-thread path was sped up again to 553 inserts/s by the kernel and back-link score-cache work in [design-performance.md](docs/design-performance.md)). The parallel build now sits at the machine's random-read memory ceiling (§4.5 there); the remaining lever is reading fewer bytes per distance, i.e. a quantised storage format.
 - **Multi-vector support** — Store and search multiple embeddings, such as image + text, for one logical entry.
 
 ## License

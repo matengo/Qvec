@@ -227,12 +227,10 @@ runs the kernel, so the kernel work of §4.2 helps here as much as it helps the 
 **B. 12-thread build**, full SIFT-1M (`--threads 0`, 16 sampled threads, idle-wait samples on
 pool threads included in the total): `SearchLayerNearest` 32.5 %, `Monitor` frame 26.6 %,
 `AddNeighborConnection` 6.0 %, `PruneNeighbors` 2.6 %, thread-pool waits (`LowLevelLifoSemaphore`,
-`WaitHandle`) 22 %, `GC.RunFinalizers` 6 % (finalizer thread idle). The ratio of the `Monitor`
-frame to `SearchLayerNearest` is 0.82 against 0.74 single-threaded, so real lock contention
-on the 1,024 stripes is at most a few percent of build time; the idle-wait share says the
-`Parallel.For` batches leave workers waiting at batch boundaries (50k rows per `AddEntries`
-call in the benchmark) rather than that the locks serialise them. Neither is the first thing
-to fix; §4.5 stays parked behind §4.4.
+`WaitHandle`) 22 %, `GC.RunFinalizers` 6 % (finalizer thread idle). The first reading of this
+profile — "workers idle at `AddEntries` batch boundaries" — was wrong; see §4.5 for the
+instrumented re-measurement after PR 6, which shows 99.4 % worker utilisation and a memory
+ceiling instead.
 
 **C. 12-thread query** on the index from B (`--concurrency 12 --passes 20`, ef 40 and 160;
 17,169 and 9,615 QPS under the profiler): `SearchLayerNearest` 83.9 %, `Search` 1.4 %,
@@ -471,22 +469,40 @@ Cohere single-thread builds not re-measured yet (machine not quiet).
 puts them at a few percent and they are not worth the risk of changing tie order
 (`Array.Sort` in `AddNeighborConnection` is unstable and SIFT has many tied distances).
 
-### 4.5 Parallel build scaling — profiled, parked
+### 4.5 Parallel build scaling — measured, hardware-bound
 
-**Today.** 6.3× on 12 cores (Cohere 100K). Candidates: the entry-point lock in `LinkPending`,
-1,024 striped `NodeLock`s (with 12 threads and 64 back-links per insert, collisions are
-frequent enough to matter), `Parallel.For` chunking, and `ArrayPool.Shared` contention.
+**Re-measured after PR 6** (Cohere 100K, 768-d, ef 40, reference machine, same day, with
+temporary counters in `AddEntries`/`LinkPending`/`ConnectNewNode` that were removed before the
+commit). Per-thread CPU summed over all workers:
 
-**Profile verdict (§2.2 B).** Lock contention is at most a few percent; the visible loss is
-pool threads waiting at the boundaries of the 50k-row `AddEntries` batches. Whatever §4.4
-removed from the critical section (the owner-score recompute, §4.4) shortens the locked
-regions too, so redo this profile now that PR 6 has landed rather than optimising the locks
-blind. If the batch-boundary wait is confirmed, the fix is
-on the caller's side (larger or pipelined batches in the benchmark and README guidance), not
-in `Qvec.Core`.
+| threads | build | search CPU Σ | back-link CPU Σ | lock wait Σ | speed-up |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 180.6 s | 121 s | 56 s | 0.7 s | 1.0× |
+| 4 | 66.3 s | 179 s | 80 s | 2.2 s | 2.7× |
+| 8 | 56.4 s | 302 s | 135 s | 5.0 s | 3.2× |
+| 12 | 57.1 s | 466 s | 199 s | 12 s | 3.2× |
 
-**Expected.** Unchanged: 8–10× is plausible if the remaining loss is synchronisation; nothing
-short of a layout change helps if it is memory bandwidth on the mapped file.
+Ruled out, with numbers: worker utilisation inside `Parallel.For` is 99.4 % (the §2.2 B
+"batch-boundary idle" reading was an artefact of sampling pool threads); the serial Phase A
+(code writes) is 0.3 s and the commit ~0; lock wait on the 1,024 stripes is 1.8 % of worker
+time; GC pauses total 0.4 s with server GC already on (8.1 GB allocated, ≈81 KB per insert).
+
+What *does* happen: the read-only `SearchLayerNearest` phase itself costs 3.85× more CPU per
+insert at 12 threads than at 1. A build of 100k vectors performs ≈401 M distance computations
+(≈4,000 per insert, each reading a 3 KB vector from the 300 MB mapped file), i.e. ≈7.2 M
+distances/s or ≈21 GB/s of random 3 KB reads at 12 threads. A standalone probe that only does
+random-vector dot products out of a 300 MB pool reaches 3.7 M/s on one thread and **6.5 M/s
+aggregate on 12 threads (≈20 GB/s)** — and the aggregate *falls* as threads are added
+(4 → 9.5 M/s, 8 → 7.5, 12 → 6.5), the signature of DRAM/TLB thrashing on random accesses to
+a working set far larger than the 3 × 12 MB L2 (no shared L3 on the X Elite). The same probe
+on L1-resident data scales 8.6× on 12 threads. The build is therefore at the machine's
+random-read ceiling; the 12-thread time has stayed at ≈57–59 s through PR 4 and PR 6 while the
+1-thread time halved (371 → 181 s) for exactly this reason.
+
+**Verdict.** Nothing in `Qvec.Core` is actionable without shrinking the bytes read per
+distance (quantised or reduced-precision vectors — a storage-format change, out of scope for
+this programme). Guidance: on this class of machine 8 threads ≈ 12 threads; the parallel
+speed-up to quote is **3.2×**, not the 6.3× measured before the single-thread path got faster.
 
 ### 4.6 Not on the list (and why)
 
@@ -508,7 +524,7 @@ short of a layout change helps if it is memory bandwidth on the mapped file.
 | 4 | `perf-kernels` | §4.2: four-accumulator kernels for every dimension, all overloads forward to one core, `fixed` removed; micro 2.4–2.7×, SIFT-1M query +7–16 % (§2.1) — **done**; main-README SIFT-1M table re-measurement owed (quiet machine) | 2 |
 | 5 | `perf-profile` | CPU profile of single-thread build and 12-thread build/query on the reference machine; `benchmarks/profile-summary.py`; findings in §2.2 — **done**: 4.4 proceeds (back-link arithmetic), 4.5 parked until after 6 | 2 |
 | 6 | `perf-insert-prune` | §4.4: exact layer-0 owner→neighbour score cache removes the 79 % owner-score recompute; siftsmall 1-thread build +37–59 %, graph section byte-identical — **done**; SIFT-1M/Cohere 1-thread re-measurement owed | 5 |
-| 7 | `perf-parallel-build` | §4.5: re-profile after 6; batch-boundary waits first, locks only if still visible | 6 |
+| 7 | `perf-parallel-build` | §4.5: instrumented re-measurement after 6 — utilisation 99.4 %, locks 1.8 %, GC 0.7 %; build sits at the random-read memory ceiling (probe 20 GB/s), 3.2× on 12 threads; README claims corrected — **done**, no code change | 6 |
 
 Each PR that changes `Qvec.Core` publishes a before/after row in `benchmarks/README.md`
 measured on the reference machine on the same day, with recall, per the existing convention.
