@@ -264,6 +264,16 @@ accumulators made the pointer kernels the graph walk calls 2.4–2.7× faster at
 1536 dimensions (128-d dot product 18.4 → 6.9 ns, 768-d 135.6 → 52.4 ns), which also puts them
 1.7–2.6× ahead of `TensorPrimitives` on the ARM64 reference machine.
 
+The third change is on the insert side and shows up in the dataset benchmark rather than the
+micro-benchmarks: the back-link prune used to recompute the owner's similarity to all of its
+existing neighbours on every full list (79 % of the similarity calls made during an insert,
+counted on siftsmall). An exact in-memory score cache (`QvecDatabase.NeighborScoreCacheBytes`,
+64 MiB by default, `0` disables; ≈ 230k nodes at `M = 32`, raise it for larger bulk builds)
+now keeps those scores. Alternated A/B on siftsmall, 1 thread, 3 rounds, same noisy reference
+machine: 2,668 / 2,896 / 4,056 inserts/s before vs 4,247 / 4,388 / 5,535 after (+37–59 %),
+recall@10 99.90 % both, graph section of the file byte-identical. The multi-thread SIFT-1M and
+Cohere numbers above predate this change and have not been re-measured yet.
+
 ## A/B comparison of two commits
 
 `compare.ps1` answers "did this change make it faster?" honestly on a noisy machine. It builds
